@@ -59,4 +59,17 @@ fn main() {
     let ds: List<decimal> = [1.50, 0.25]
     let fs: List<float> = [1.5, 2.0]
     io.println("{bools} {ds} {fs}")
+
+    // format specs live in interpolation too: {x:width.places}, - left-aligns;
+    // places need a float or decimal, width pads anything
+    let pi: float = 3.14159
+    let price: decimal = 19.995
+    io.println("[{pi:8.2}] [{pi:.3}] [{pi:-10.1}]")
+    io.println("[{price:10.2}] [{42:6}] [{"hi":-5}]")
+    io.println("[{xs:8}] [{some(5):-9}]")
+    var j: int = 0
+    for j < items.len() {
+        io.println("{items[j]:-10}{counts[j]:8}")
+        j += 1
+    }
 }

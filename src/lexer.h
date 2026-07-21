@@ -14,6 +14,21 @@ struct LexError {
     uint32_t col;
 };
 
+// "{expr:8.2}" — the format spec after the first top-level ':' of an
+// interpolation segment. spec := [-]width[.places]; '-' left-aligns and
+// needs a width; places apply to float/decimal only (checker-enforced).
+struct FmtSpec {
+    bool has = false;
+    bool left = false;
+    long long width = 0;   // 0 = none
+    long long places = -1; // -1 = none
+};
+// Splits a segment at the first ':' outside strings and brackets and parses
+// what follows. Returns the expr part; fills `spec` when the spec is well
+// formed, sets *err when it is not (the checker reports it — interp and
+// codegen only ever see programs that already checked).
+std::string_view split_fmt_spec(std::string_view seg, FmtSpec& spec, std::string* err);
+
 // Hand-written scanner. Owns nothing: `source` must outlive the tokens,
 // because Token::text is a slice into it.
 class Lexer {

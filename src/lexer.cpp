@@ -349,4 +349,74 @@ std::vector<Token> Lexer::scan_all() {
     return out;
 }
 
+std::string_view split_fmt_spec(std::string_view seg, FmtSpec& spec, std::string* err) {
+    int depth = 0;
+    bool in_str = false;
+    size_t colon = std::string_view::npos;
+    for (size_t i = 0; i < seg.size(); i++) {
+        char c = seg[i];
+        if (c == '\\') {
+            i++;
+            continue;
+        }
+        if (in_str) {
+            if (c == '"') in_str = false;
+            continue;
+        }
+        if (c == '"') {
+            in_str = true;
+        } else if (c == '(' || c == '[' || c == '{') {
+            depth++;
+        } else if (c == ')' || c == ']' || c == '}') {
+            depth--;
+        } else if (c == ':' && depth == 0) {
+            colon = i;
+            break;
+        }
+    }
+    if (colon == std::string_view::npos) return seg;
+    std::string_view expr = seg.substr(0, colon);
+    std::string_view s = seg.substr(colon + 1);
+    FmtSpec out;
+    size_t i = 0;
+    bool ok = true;
+    if (i < s.size() && s[i] == '-') {
+        out.left = true;
+        i++;
+    }
+    size_t wdigits = 0;
+    while (i < s.size() && s[i] >= '0' && s[i] <= '9') {
+        out.width = out.width * 10 + (s[i] - '0');
+        if (out.width > 1000000) ok = false; // an allocation, not a format
+        i++;
+        wdigits++;
+    }
+    if (i < s.size() && s[i] == '.') {
+        i++;
+        size_t pdigits = 0;
+        long long p = 0;
+        while (i < s.size() && s[i] >= '0' && s[i] <= '9') {
+            p = p * 10 + (s[i] - '0');
+            if (p > 1000) ok = false;
+            i++;
+            pdigits++;
+        }
+        if (pdigits == 0) ok = false;
+        out.places = p;
+    }
+    if (i != s.size()) ok = false;             // trailing junk
+    if (out.left && wdigits == 0) ok = false;  // '-' needs a width
+    if (wdigits == 0 && out.places < 0) ok = false; // empty spec
+    if (!ok) {
+        if (err) {
+            *err = "bad format spec ':" + std::string(s) +
+                   "' — use {x:8}, {x:-8}, {x:.2}, or {x:8.2}";
+        }
+        return expr;
+    }
+    out.has = true;
+    spec = out;
+    return expr;
+}
+
 } // namespace beans

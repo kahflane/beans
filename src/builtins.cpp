@@ -25,7 +25,10 @@ FileVal::~FileVal() {
 }
 
 MMapVal::~MMapVal() {
-    if (ptr && !closed) munmap(ptr, static_cast<size_t>(len)); // same safety net
+    if (!closed) { // same safety net
+        if (ptr) munmap(ptr, static_cast<size_t>(len));
+        if (fd >= 0) close(fd);
+    }
 }
 
 namespace {
@@ -329,6 +332,35 @@ bool dec_valid(const char* s) {
     return digits > 0;
 }
 
+// UTF-8 sequences, one string per character; a malformed lead or truncated
+// tail comes through one byte at a time — byte slicing, no validation
+Value str_chars(uint32_t, uint32_t, Value& recv, std::vector<Value>&) {
+    const std::string& s = *recv.s;
+    std::vector<std::string> out;
+    size_t i = 0;
+    while (i < s.size()) {
+        unsigned char c = static_cast<unsigned char>(s[i]);
+        size_t n = c < 0x80          ? 1
+                   : (c >> 5) == 0x6 ? 2
+                   : (c >> 4) == 0xE ? 3
+                   : (c >> 3) == 0x1E ? 4
+                                      : 1;
+        if (i + n > s.size()) {
+            n = 1;
+        } else {
+            for (size_t k = 1; k < n; k++) {
+                if ((static_cast<unsigned char>(s[i + k]) >> 6) != 0x2) {
+                    n = 1;
+                    break;
+                }
+            }
+        }
+        out.push_back(s.substr(i, n));
+        i += n;
+    }
+    return str_list(std::move(out));
+}
+
 Value str_to_decimal(uint32_t, uint32_t, Value& recv, std::vector<Value>&) {
     const std::string& s = *recv.s;
     if (!dec_valid(s.c_str())) {
@@ -627,6 +659,121 @@ Value file_unlock(uint32_t, uint32_t, Value& recv, std::vector<Value>&) {
     return res_ok(Value::of_bool(true));
 }
 
+// ---- BufReader --------------------------------------------------------------
+
+Value bufr_on_s(uint32_t, uint32_t, std::vector<Value>& args) {
+    Value v;
+    v.k = Value::K::bufr;
+    v.br = std::make_shared<BufReaderVal>();
+    v.br->file = args[0];
+    return v;
+}
+
+// a line without its '\n'; a partial line at EOF comes through, then none
+Value bufr_read_line(uint32_t, uint32_t, Value& recv, std::vector<Value>&) {
+    BufReaderVal& r = *recv.br;
+    FileVal& f = *r.file.file;
+    std::string line;
+    while (true) {
+        while (r.bpos < r.blim) {
+            uint8_t c = r.buf[r.bpos++];
+            if (c == '\n') return res_ok(opt_some(Value::of_str(std::move(line))));
+            line.push_back(static_cast<char>(c));
+        }
+        if (r.eof) break;
+        if (f.closed) return closed_err();
+        if (r.buf.empty()) r.buf.resize(8192);
+        ssize_t got = pread(f.fd, r.buf.data(), r.buf.size(),
+                            static_cast<off_t>(r.off));
+        if (got < 0) {
+            return res_err(std::string("read: ") + strerror(errno),
+                           fs_kind_of(errno));
+        }
+        if (got == 0) {
+            r.eof = true;
+            break;
+        }
+        r.off += got;
+        r.bpos = 0;
+        r.blim = static_cast<size_t>(got);
+    }
+    if (line.empty()) return res_ok(opt_none());
+    return res_ok(opt_some(Value::of_str(std::move(line))));
+}
+
+// ---- varint / crc32 ---------------------------------------------------------
+// unsigned LEB128 over the 64-bit two's-complement pattern (negatives take
+// 10 bytes); crc32 is the IEEE polynomial, table-driven — the C runtime
+// computes the identical table
+
+Value bytes_append_varint(uint32_t, uint32_t, Value& recv, std::vector<Value>& args) {
+    uint64_t v = static_cast<uint64_t>(args[0].i);
+    auto& d = recv.bytes->data;
+    while (v >= 0x80) {
+        d.push_back(static_cast<uint8_t>(v) | 0x80);
+        v >>= 7;
+    }
+    d.push_back(static_cast<uint8_t>(v));
+    return recv;
+}
+
+Value bytes_get_varint(uint32_t line, uint32_t col, Value& recv, std::vector<Value>& args) {
+    auto& d = recv.bytes->data;
+    int64_t pos = args[0].i;
+    uint64_t v = 0;
+    int shift = 0;
+    size_t i = pos < 0 ? d.size() : static_cast<size_t>(pos);
+    while (true) {
+        if (pos < 0 || i >= d.size()) {
+            bpanic(line, col, "varint read at " + std::to_string(pos) +
+                                  " out of range (len " + std::to_string(d.size()) + ")");
+        }
+        if (shift >= 64) {
+            bpanic(line, col, "varint too long at " + std::to_string(pos));
+        }
+        uint8_t b = d[i++];
+        v |= static_cast<uint64_t>(b & 0x7f) << shift;
+        if (!(b & 0x80)) break;
+        shift += 7;
+    }
+    return Value::of_int(static_cast<int64_t>(v));
+}
+
+Value bytes_varint_size_s(uint32_t, uint32_t, std::vector<Value>& args) {
+    uint64_t v = static_cast<uint64_t>(args[0].i);
+    int64_t n = 1;
+    while (v >= 0x80) {
+        v >>= 7;
+        n++;
+    }
+    return Value::of_int(n);
+}
+
+uint32_t crc_table_cpp[256];
+bool crc_ready_cpp = false;
+
+Value bytes_crc32(uint32_t line, uint32_t col, Value& recv, std::vector<Value>& args) {
+    auto& d = recv.bytes->data;
+    int64_t from = args[0].i, to = args[1].i;
+    if (from < 0 || to < from || to > static_cast<int64_t>(d.size())) {
+        bpanic(line, col, "crc32 " + std::to_string(from) + ".." + std::to_string(to) +
+                              " out of range (len " + std::to_string(d.size()) + ")");
+    }
+    if (!crc_ready_cpp) {
+        for (uint32_t i = 0; i < 256; i++) {
+            uint32_t c = i;
+            for (int k = 0; k < 8; k++) c = (c & 1) ? 0xEDB88320u ^ (c >> 1) : c >> 1;
+            crc_table_cpp[i] = c;
+        }
+        crc_ready_cpp = true;
+    }
+    uint32_t c = 0xFFFFFFFFu;
+    for (int64_t i = from; i < to; i++) {
+        c = crc_table_cpp[(c ^ d[static_cast<size_t>(i)]) & 0xFF] ^ (c >> 8);
+    }
+    return Value::of_int(static_cast<int64_t>(c ^ 0xFFFFFFFFu));
+}
+
 // ---- MMap -------------------------------------------------------------------
 // whole-file shared mapping; the fd is closed right after mapping — the
 // mapping outlives it. get/put/read/write panic on a closed or short map,
@@ -743,8 +890,36 @@ Value mmap_close(uint32_t, uint32_t, Value& recv, std::vector<Value>&) {
     MMapVal& m = *recv.mm;
     if (m.closed) return res_err("mmap already closed", "closed");
     m.closed = true;
-    if (m.ptr && munmap(m.ptr, static_cast<size_t>(m.len)) != 0) {
-        return res_err(std::string("close: ") + strerror(errno), fs_kind_of(errno));
+    bool bad = m.ptr && munmap(m.ptr, static_cast<size_t>(m.len)) != 0;
+    int e = errno;
+    if (m.fd >= 0) close(m.fd);
+    if (bad) return res_err(std::string("close: ") + strerror(e), fs_kind_of(e));
+    return res_ok(Value::of_bool(true));
+}
+
+// grow or shrink in place: truncate the file, drop the old mapping, map
+// fresh. On a mapping failure the handle stays open but empty (len 0).
+Value mmap_resize(uint32_t, uint32_t, Value& recv, std::vector<Value>& args) {
+    MMapVal& m = *recv.mm;
+    if (m.closed) return mmap_closed_res();
+    if (!m.writable) return res_err("mmap is read-only", "permission");
+    int64_t n = args[0].i;
+    if (n < 0) return res_err("negative resize", "io");
+    if (ftruncate(m.fd, static_cast<off_t>(n)) != 0) {
+        return res_err(std::string("resize: ") + strerror(errno), fs_kind_of(errno));
+    }
+    if (m.ptr) munmap(m.ptr, static_cast<size_t>(m.len));
+    m.ptr = nullptr;
+    m.len = 0;
+    if (n > 0) {
+        void* p = mmap(nullptr, static_cast<size_t>(n), PROT_READ | PROT_WRITE,
+                       MAP_SHARED, m.fd, 0);
+        if (p == MAP_FAILED) {
+            return res_err(std::string("resize: ") + strerror(errno),
+                           fs_kind_of(errno));
+        }
+        m.ptr = p;
+        m.len = n;
     }
     return res_ok(Value::of_bool(true));
 }
@@ -1009,6 +1184,103 @@ Value dir_sync_s(uint32_t, uint32_t, std::vector<Value>& args) {
     return res_ok(Value::of_bool(true));
 }
 
+// files and symlinks under root (lstat — never follows a link), paths
+// relative to root, "/"-joined, sorted at the end so readdir order is moot
+bool walk_dir(const std::string& root, const std::string& rel,
+              std::vector<std::string>& out, std::string& epath, int& eno) {
+    std::string full = rel.empty() ? root : root + "/" + rel;
+    DIR* d = opendir(full.c_str());
+    if (!d) {
+        epath = full;
+        eno = errno;
+        return false;
+    }
+    while (dirent* en = readdir(d)) {
+        std::string name = en->d_name;
+        if (name == "." || name == "..") continue;
+        std::string r2 = rel.empty() ? name : rel + "/" + name;
+        struct stat st;
+        if (lstat((root + "/" + r2).c_str(), &st) != 0) {
+            epath = root + "/" + r2;
+            eno = errno;
+            closedir(d);
+            return false;
+        }
+        if (S_ISDIR(st.st_mode)) {
+            if (!walk_dir(root, r2, out, epath, eno)) {
+                closedir(d);
+                return false;
+            }
+        } else {
+            out.push_back(r2);
+        }
+    }
+    closedir(d);
+    return true;
+}
+
+Value dir_walk_s(uint32_t, uint32_t, std::vector<Value>& args) {
+    std::vector<std::string> out;
+    std::string epath;
+    int eno = 0;
+    if (!walk_dir(*args[0].s, "", out, epath, eno)) return fs_err(epath, eno);
+    std::sort(out.begin(), out.end());
+    return res_ok(str_list(std::move(out)));
+}
+
+// ---- Path (pure string math, no fs access) ----------------------------------
+
+std::string path_base_of(const std::string& p) {
+    if (p.empty()) return "";
+    size_t end = p.size();
+    while (end > 0 && p[end - 1] == '/') end--;
+    if (end == 0) return "/";
+    size_t slash = p.rfind('/', end - 1);
+    size_t start = slash == std::string::npos ? 0 : slash + 1;
+    return p.substr(start, end - start);
+}
+
+Value path_join_s(uint32_t, uint32_t, std::vector<Value>& args) {
+    const std::string& a = *args[0].s;
+    const std::string& b = *args[1].s;
+    if (!b.empty() && b[0] == '/') return args[1]; // absolute b wins
+    if (a.empty()) return args[1];
+    if (b.empty()) return args[0];
+    size_t end = a.size();
+    while (end > 0 && a[end - 1] == '/') end--;
+    return Value::of_str(a.substr(0, end) + "/" + b);
+}
+
+Value path_parent_s(uint32_t, uint32_t, std::vector<Value>& args) {
+    const std::string& p = *args[0].s;
+    size_t end = p.size();
+    while (end > 0 && p[end - 1] == '/') end--;
+    if (end == 0) return Value::of_str(p.empty() ? "" : "/");
+    size_t slash = p.rfind('/', end - 1);
+    if (slash == std::string::npos) return Value::of_str("");
+    if (slash == 0) return Value::of_str("/");
+    return Value::of_str(p.substr(0, slash));
+}
+
+Value path_base_s(uint32_t, uint32_t, std::vector<Value>& args) {
+    return Value::of_str(path_base_of(*args[0].s));
+}
+
+// a leading dot is a dotfile, not an extension: ext(".bashrc") is ""
+Value path_ext_s(uint32_t, uint32_t, std::vector<Value>& args) {
+    std::string b = path_base_of(*args[0].s);
+    size_t dot = b.rfind('.');
+    if (dot == std::string::npos || dot == 0) return Value::of_str("");
+    return Value::of_str(b.substr(dot));
+}
+
+Value path_stem_s(uint32_t, uint32_t, std::vector<Value>& args) {
+    std::string b = path_base_of(*args[0].s);
+    size_t dot = b.rfind('.');
+    if (dot == std::string::npos || dot == 0) return Value::of_str(b);
+    return Value::of_str(b.substr(0, dot));
+}
+
 Value mmap_open_s(uint32_t, uint32_t, std::vector<Value>& args) {
     const std::string& path = *args[0].s;
     bool writable = args[1].b;
@@ -1034,7 +1306,7 @@ Value mmap_open_s(uint32_t, uint32_t, std::vector<Value>& args) {
         }
         mv->ptr = p;
     }
-    close(fd); // the mapping outlives the fd
+    mv->fd = fd; // kept: resize() needs it to ftruncate + remap
     Value v;
     v.k = Value::K::mmap;
     v.mm = std::move(mv);
@@ -1105,43 +1377,19 @@ Value io_read_all(uint32_t, uint32_t, std::vector<Value>&) {
 // pure text rendering; the C runtime mirrors each of these byte for byte
 
 Value fmt_pad_left(uint32_t, uint32_t, std::vector<Value>& args) {
-    const std::string& s = *args[0].s;
-    int64_t w = args[1].i;
-    if (w <= static_cast<int64_t>(s.size())) return args[0];
-    return Value::of_str(std::string(static_cast<size_t>(w) - s.size(), ' ') + s);
+    return Value::of_str(fmt_pad_text(*args[0].s, args[1].i, false));
 }
 
 Value fmt_pad_right(uint32_t, uint32_t, std::vector<Value>& args) {
-    const std::string& s = *args[0].s;
-    int64_t w = args[1].i;
-    if (w <= static_cast<int64_t>(s.size())) return args[0];
-    return Value::of_str(s + std::string(static_cast<size_t>(w) - s.size(), ' '));
+    return Value::of_str(fmt_pad_text(*args[0].s, args[1].i, true));
 }
 
 Value fmt_float(uint32_t, uint32_t, std::vector<Value>& args) {
-    int64_t p = args[1].i;
-    if (p < 0) p = 0;
-    if (p > 100) p = 100;
-    char buf[512];
-    std::snprintf(buf, sizeof buf, "%.*f", static_cast<int>(p), args[0].f);
-    return Value::of_str(buf);
+    return Value::of_str(fmt_float_text(args[0].f, args[1].i));
 }
 
-// exact places: round (half away from zero) when narrowing, zero-pad the
-// rendered string when widening — no coefficient blow-up on large `places`
 Value fmt_dec(uint32_t, uint32_t, std::vector<Value>& args) {
-    Decimal d = args[0].dec;
-    int64_t p = args[1].i;
-    if (p < 0) p = 0;
-    if (p > 60) p = 60;
-    if (static_cast<int32_t>(p) < d.scale) d = d.round_to(static_cast<int32_t>(p));
-    std::string s = d.to_string();
-    int64_t frac = d.scale;
-    if (p > frac) {
-        if (frac == 0) s += '.';
-        s.append(static_cast<size_t>(p - frac), '0');
-    }
-    return Value::of_str(std::move(s));
+    return Value::of_str(fmt_dec_text(args[0].dec, args[1].i));
 }
 
 Value fmt_hex(uint32_t, uint32_t, std::vector<Value>& args) {
@@ -1182,6 +1430,37 @@ Value fmt_group(uint32_t, uint32_t, std::vector<Value>& args) {
 
 } // namespace
 
+std::string fmt_pad_text(std::string s, int64_t width, bool left) {
+    if (width <= static_cast<int64_t>(s.size())) return s;
+    std::string pad(static_cast<size_t>(width) - s.size(), ' ');
+    return left ? s + pad : pad + s;
+}
+
+std::string fmt_float_text(double x, int64_t places) {
+    if (places < 0) places = 0;
+    if (places > 100) places = 100;
+    char buf[512];
+    std::snprintf(buf, sizeof buf, "%.*f", static_cast<int>(places), x);
+    return buf;
+}
+
+// exact places: round (half away from zero) when narrowing, zero-pad the
+// rendered string when widening — no coefficient blow-up on large `places`
+std::string fmt_dec_text(Decimal d, int64_t places) {
+    if (places < 0) places = 0;
+    if (places > 60) places = 60;
+    if (static_cast<int32_t>(places) < d.scale) {
+        d = d.round_to(static_cast<int32_t>(places));
+    }
+    std::string s = d.to_string();
+    int64_t frac = d.scale;
+    if (places > frac) {
+        if (frac == 0) s += '.';
+        s.append(static_cast<size_t>(places - frac), '0');
+    }
+    return s;
+}
+
 void set_program_args(std::vector<std::string> args) { g_args = std::move(args); }
 
 const std::vector<BuiltinMethod>& builtin_methods() {
@@ -1210,6 +1489,7 @@ const std::vector<BuiltinMethod>& builtin_methods() {
         {BT::str, "to_int", {}, BT::res_i64, "beans_str_to_int", false, str_to_int},
         {BT::str, "to_float", {}, BT::res_f64, "beans_str_to_float", false, str_to_float},
         {BT::str, "to_decimal", {}, BT::res_dec, "beans_str_to_decimal", false, str_to_decimal},
+        {BT::str, "chars", {}, BT::list_str, "beans_str_chars", false, str_chars},
         // Bytes
         {BT::bytes, "len", {}, BT::i64, "beans_bytes_len", false, bytes_len},
         {BT::bytes, "resize", {BT::i64}, BT::self_recv, "beans_bytes_resize", true, bytes_resize},
@@ -1231,6 +1511,9 @@ const std::vector<BuiltinMethod>& builtin_methods() {
         {BT::bytes, "append", {BT::bytes}, BT::self_recv, "beans_bytes_append", false, bytes_append},
         {BT::bytes, "append_str", {BT::str}, BT::self_recv, "beans_bytes_append_str", false, bytes_append_str},
         {BT::bytes, "to_string", {}, BT::str, "beans_bytes_to_string", false, bytes_to_string},
+        {BT::bytes, "append_varint", {BT::i64}, BT::self_recv, "beans_bytes_append_varint", false, bytes_append_varint},
+        {BT::bytes, "get_varint", {BT::i64}, BT::i64, "beans_bytes_get_varint", true, bytes_get_varint},
+        {BT::bytes, "crc32", {BT::i64, BT::i64}, BT::i64, "beans_bytes_crc32", true, bytes_crc32},
         // File — positional I/O first: that's what a database wants
         {BT::file, "read_at", {BT::i64, BT::i64}, BT::res_bytes, "beans_file_read_at", false, file_read_at},
         {BT::file, "write_at", {BT::i64, BT::bytes}, BT::res_i64, "beans_file_write_at", false, file_write_at},
@@ -1262,7 +1545,10 @@ const std::vector<BuiltinMethod>& builtin_methods() {
         {BT::mmap, "write", {BT::i64, BT::bytes}, BT::self_recv, "beans_mmap_write", true, mmap_write},
         {BT::mmap, "flush", {}, BT::res_bool, "beans_mmap_flush", false, mmap_flush},
         {BT::mmap, "flush_range", {BT::i64, BT::i64}, BT::res_bool, "beans_mmap_flush_range", false, mmap_flush_range},
+        {BT::mmap, "resize", {BT::i64}, BT::res_bool, "beans_mmap_resize", false, mmap_resize},
         {BT::mmap, "close", {}, BT::res_bool, "beans_mmap_close", false, mmap_close},
+        // BufReader — buffered lines over a File, at its own offset
+        {BT::bufr, "read_line", {}, BT::res_opt_str, "beans_bufr_read_line", false, bufr_read_line},
     };
     return table;
 }
@@ -1271,6 +1557,7 @@ const std::vector<BuiltinStatic>& builtin_statics() {
     static const std::vector<BuiltinStatic> table = {
         {"Bytes", "new", {BT::i64}, BT::bytes, "beans_bytes_new", true, bytes_new},
         {"Bytes", "from", {BT::str}, BT::bytes, "beans_bytes_from", false, bytes_from},
+        {"Bytes", "varint_size", {BT::i64}, BT::i64, "beans_bytes_varint_size", false, bytes_varint_size_s},
         {"File", "read", {BT::str}, BT::res_str, "beans_file_read_all", false, file_read_s},
         {"File", "read_bytes", {BT::str}, BT::res_bytes, "beans_file_read_all_b", false, file_read_bytes_s},
         {"File", "write", {BT::str, BT::str}, BT::res_i64, "beans_file_write_all", false, file_write_s},
@@ -1291,7 +1578,14 @@ const std::vector<BuiltinStatic>& builtin_statics() {
         {"Dir", "exists", {BT::str}, BT::boolean, "beans_dir_exists", false, dir_exists_s},
         {"Dir", "temp", {}, BT::str, "beans_dir_temp", false, dir_temp_s},
         {"Dir", "sync", {BT::str}, BT::res_bool, "beans_dir_sync", false, dir_sync_s},
+        {"Dir", "walk", {BT::str}, BT::res_list_str, "beans_dir_walk", false, dir_walk_s},
         {"MMap", "open", {BT::str, BT::boolean}, BT::res_mmap, "beans_mmap_open", false, mmap_open_s},
+        {"Path", "join", {BT::str, BT::str}, BT::str, "beans_path_join", false, path_join_s},
+        {"Path", "parent", {BT::str}, BT::str, "beans_path_parent", false, path_parent_s},
+        {"Path", "base", {BT::str}, BT::str, "beans_path_base", false, path_base_s},
+        {"Path", "ext", {BT::str}, BT::str, "beans_path_ext", false, path_ext_s},
+        {"Path", "stem", {BT::str}, BT::str, "beans_path_stem", false, path_stem_s},
+        {"BufReader", "on", {BT::file}, BT::bufr, "beans_bufr_on", false, bufr_on_s},
     };
     return table;
 }

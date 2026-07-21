@@ -21,6 +21,7 @@ enum class BT : uint8_t {
     bytes,
     file,
     mmap,
+    bufr,
     self_recv, // return: the receiver itself, borrowed — chaining mutators
     opt_i64,   // Option<...>: C side returns BOpt {val, has}
     opt_str,
@@ -33,6 +34,7 @@ enum class BT : uint8_t {
     res_bytes,
     res_file,
     res_mmap,
+    res_opt_str, // Result<Option<string>>: err set, or val 0 = none, else some
     res_list_str,
 };
 
@@ -73,6 +75,12 @@ struct BuiltinFn {
 const std::vector<BuiltinMethod>& builtin_methods();
 const std::vector<BuiltinStatic>& builtin_statics();
 const std::vector<BuiltinFn>& builtin_fns();
+
+// format-spec helpers shared with string interpolation ({x:8.2}); the
+// registry's std.fmt rows and the C runtime render identically
+std::string fmt_float_text(double x, int64_t places);
+std::string fmt_dec_text(Decimal d, int64_t places);
+std::string fmt_pad_text(std::string s, int64_t width, bool left);
 
 // `beansc run` forwards program arguments here for std.os args()
 void set_program_args(std::vector<std::string> args);

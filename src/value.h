@@ -152,12 +152,13 @@ struct AtomicVal;
 struct BytesVal;
 struct FileVal;
 struct MMapVal;
+struct BufReaderVal;
 
 struct Value {
     enum class K {
         unit, int_, float_, decimal_, bool_, string_,
         list, map, instance, enum_v, closure, fn_ref, range,
-        thread, mutex, channel, atomic, bytes, file, mmap,
+        thread, mutex, channel, atomic, bytes, file, mmap, bufr,
     };
     K k = K::unit;
 
@@ -180,6 +181,7 @@ struct Value {
     std::shared_ptr<BytesVal> bytes;
     std::shared_ptr<FileVal> file;
     std::shared_ptr<MMapVal> mm;
+    std::shared_ptr<BufReaderVal> br;
 
     static Value unit() { return {}; }
     static Value of_int(int64_t v) { Value x; x.k = K::int_; x.i = v; return x; }
@@ -318,13 +320,25 @@ struct FileVal {
 };
 
 // a memory-mapped file — the stdlib's MMap class. Same drop-closes-it net;
-// the fd is closed right after mapping, the mapping itself survives it.
+// the handle keeps its fd so resize() can ftruncate + remap.
 struct MMapVal {
     void* ptr = nullptr;
     int64_t len = 0;
+    int fd = -1;
     bool writable = false;
     bool closed = false;
     ~MMapVal();
+};
+
+// a buffered line reader over a File — reads at its own offset (pread), so
+// it never moves the file's cursor. Borrows the File; closing the File makes
+// the next read_line a closed error.
+struct BufReaderVal {
+    Value file;
+    int64_t off = 0;
+    std::vector<uint8_t> buf;
+    size_t bpos = 0, blim = 0;
+    bool eof = false;
 };
 
 // lexical scope chain — closures keep their captured chain alive

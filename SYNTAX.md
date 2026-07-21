@@ -81,6 +81,9 @@ import gitlab.com/tools/csv as csvlib
 
 - `"..."`, immutable, UTF-8.
 - Interpolation with `{}`: `"hi {name}, total {price * (qty as decimal)}"`.
+- Format specs ride after a `:` in the braces: `{x:8}` pads to width 8 (right-aligned),
+  `{x:-8}` left-aligns, `{pi:.2}` fixes decimals (float/decimal only), `{pi:8.2}` both.
+  Width pads anything printable — `{xs:12}` pads a whole list. Same rendering as `std.fmt`.
 - **There is no `+` for strings.** Building strings happens through interpolation, `std.fmt` (sprintf-style: padding, precision, alignment), or `list.join(sep)`. One way to do it, and it's the readable one.
 - Escapes: `\n \t \r \0 \\ \" \{ \}`.
 
@@ -91,7 +94,8 @@ import gitlab.com/tools/csv as csvlib
 `to_upper`/`to_lower` (ASCII), `replace(old, new)` (all occurrences; empty `old` changes nothing),
 `repeat(n)` (panics on negative), `split(sep) -> List<string>` (keeps empties; empty sep = one piece),
 `lines() -> List<string>` (a trailing newline makes no empty final line),
-`to_int`/`to_float`/`to_decimal -> Result<...>`.
+`to_int`/`to_float`/`to_decimal -> Result<...>`,
+`chars() -> List<string>` (UTF-8 characters; malformed bytes come through one at a time).
 
 ## Bytes (v0.5, implemented)
 
@@ -105,6 +109,9 @@ self, so page-building chains work: `Bytes.new(4096).put_u32(0, root).put_u64(8,
 - `slice(from, to)`, `copy_from(src, at)`, `append(other)`, `append_str(s)`
 - `to_string()` — as text, stops at an embedded NUL
 - `==` / `!=` compare by value: length, then contents
+- `append_varint(v)` / `get_varint(pos)` — unsigned LEB128 over the 64-bit pattern
+  (negatives take 10 bytes); `Bytes.varint_size(v)` says how far to advance
+- `crc32(from, to)` — IEEE crc32 of a range, panics out of range
 
 ## Files and the OS (v0.5, implemented)
 
@@ -125,7 +132,15 @@ Class-first, like everything builtin. Errors are `Result<T>`; `Error.kind` carri
   one file contend. Single-writer databases.
 - **Dir statics**: `make`, `make_all`, `list` → `Result<List<string>>` (sorted), `remove`
   (empty only), `remove_all` (recursive), `exists`, `temp`, `sync` — fsync a directory, the
-  rename-commit pattern's second half.
+  rename-commit pattern's second half; `walk(path)` → `Result<List<string>>` — recursive,
+  files and symlinks only (never follows a link), paths relative to the argument, sorted.
+- **Path statics** (pure string math, no fs access): `join(a, b)` (absolute `b` wins),
+  `parent`, `base`, `ext` (with the dot; a leading dot is a dotfile, not an extension),
+  `stem`.
+- **BufReader**: `BufReader.on(f)` then `read_line()` → `Result<Option<string>>` —
+  `ok(some(line))` without its newline, a partial last line, then `ok(none)` at EOF.
+  It reads at its own offset (pread), so the file's cursor never moves; buffered
+  data keeps serving after `f.close()`, and the closed error surfaces on the next refill.
 - **std.os**: `args()` (`beansc run f.b -- a b` passes them; the native binary uses argv),
   `env(name)` → `Option<string>`, `exit(code)`, `now_ms`, `ticks_ms`, `sleep_ms`.
 - **std.io**: `println`/`print`, `eprintln`/`eprint` (stderr), `read_line()` → `Option<string>`
@@ -145,15 +160,17 @@ durable compaction (write temp, sync, rename over, sync the parent dir).
 A shared mapping of a whole file — the page-cache path a database wants. One writer, no
 collector interaction: the mapped region is not beans heap, only the handle is.
 
-- `MMap.open(path, writable)` → `Result<MMap>` — maps the entire file (`MAP_SHARED`); the fd
-  is closed right after mapping, the mapping outlives it (and the path — unlink while mapped
-  is fine). An empty file maps with `len() == 0`.
+- `MMap.open(path, writable)` → `Result<MMap>` — maps the entire file (`MAP_SHARED`); the
+  handle keeps its fd for `resize`, and the mapping outlives the path — unlink while mapped
+  is fine. An empty file maps with `len() == 0`.
 - `len()`; `get_u8/u16/u32/u64/i64(pos)` and `put_...(pos, v)` — little-endian, bounds-checked
   panics; `put` panics on a read-only map; `put`/`write` return self for chains.
 - `read(pos, n)` → `Bytes` (copy out), `write(pos, b)` — panics out of range.
 - `flush()` / `flush_range(pos, n)` → `Result<bool>` (msync — the durability call),
   `close()` → `Result<bool>` (double close is an error; access after close panics).
-- Dropping the last reference unmaps as a safety net. Growing a file means close + reopen in v1.
+- `resize(n)` → `Result<bool>` — ftruncate + remap in place, grow or shrink; read-only
+  maps refuse with a `permission` error. On a remap failure the handle stays open but empty.
+- Dropping the last reference unmaps (and closes the fd) as a safety net.
 
 ## std.fmt (v0.5, implemented)
 
@@ -509,6 +526,7 @@ import as defer unsafe self true false
 
 ## Decided
 
+- Stdlib v0.5 phase 4 (implemented): `BufReader` line reading over positional I/O, format specs in interpolation (`{x:8.2}` — first top-level `:` in the braces; the same rendering as `std.fmt`), `chars()` for UTF-8, varint + crc32 on `Bytes`, `MMap.resize` (the handle keeps its fd), `Dir.walk` (recursive, sorted, relative), and `Path` string statics
 - Stdlib v0.5 phase 3 (implemented): the List/Map method set with **stable** sorts (`sort_by` takes a less-than closure; both backends run the identical merge), `Bytes` value `==`, advisory file locks, `MMap` (whole-file, shared, drop unmaps, grow = close + reopen), `std.fmt`, and printing widened to enums and lists — `variant(payload)` / `[a, b]` — everywhere strings interpolate; maps, class instances, and `Result` stay unprintable
 - Stdlib v0.5: the string method set, `Bytes`, `File`/`Dir`, `std.os`, and the `std.io` console set (implemented); byte semantics, panics carry positions, mutators return self for chaining, fs errors carry kind slugs
 - Modules: `beans.mod`, one folder = one package, git imports with a global cache (v0.4, implemented)

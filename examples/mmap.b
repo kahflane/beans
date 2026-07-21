@@ -28,11 +28,26 @@ fn main() {
         ok(x) => io.println("flushed?"),
         err(e) => io.println("{e.kind}: {e.msg}"),
     }
+    match r.resize(16) {
+        ok(x) => io.println("resized read-only?"),
+        err(e) => io.println("{e.kind}: {e.msg}"),
+    }
     match MMap.open("{Dir.temp()}/beans_no_such.dat", false) {
         ok(x) => io.println("opened?"),
         err(e) => io.println("kind {e.kind}"),
     }
     r.close().expect("close ro")
+
+    // resize: grow in place, patch the new tail, shrink back — the handle
+    // keeps its fd exactly for this
+    File.write_bytes(p, Bytes.new(8)).expect("seed resize")
+    let g: MMap = MMap.open(p, true).expect("open grow")
+    g.resize(32).expect("grow")
+    g.put_u64(24, 777)
+    io.println("{g.len()} {g.get_u64(24)} {File.size(p).expect("grown size")}")
+    g.resize(4).expect("shrink")
+    io.println("{g.len()} {File.size(p).expect("shrunk size")}")
+    g.close().expect("close grow")
 
     // an empty file maps to len 0; every access is out of range, flush is a no-op
     File.write(p, "").expect("truncate to empty")

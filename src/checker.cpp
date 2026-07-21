@@ -76,6 +76,7 @@ TypeId Checker::bt_type(BT t, TypeId recv) {
         case BT::bytes: return pool_.named(Type::K::class_, "Bytes");
         case BT::file: return pool_.named(Type::K::class_, "File");
         case BT::mmap: return pool_.named(Type::K::class_, "MMap");
+        case BT::bufr: return pool_.named(Type::K::class_, "BufReader");
         case BT::self_recv: return recv ? recv : t_poison();
         case BT::opt_i64: return t_option(t_int());
         case BT::opt_str: return t_option(t_str());
@@ -91,6 +92,8 @@ TypeId Checker::bt_type(BT t, TypeId recv) {
             return t_result(pool_.named(Type::K::class_, "File"), t_error_class());
         case BT::res_mmap:
             return t_result(pool_.named(Type::K::class_, "MMap"), t_error_class());
+        case BT::res_opt_str:
+            return t_result(t_option(t_str()), t_error_class());
         case BT::res_list_str:
             return t_result(pool_.named(Type::K::class_, "List", {t_str()}),
                             t_error_class());
@@ -193,7 +196,7 @@ std::string Checker::as_type_name(const Expr* e) {
         // builtins keep their plain names
         if (builtin_generic_classes_.count(n) || n == "Error" || n == "Option" ||
             n == "Result" || n == "AtomicInt" || n == "Bytes" || n == "File" ||
-            n == "Dir" || n == "MMap") {
+            n == "Dir" || n == "MMap" || n == "Path" || n == "BufReader") {
             return n;
         }
         return "";
@@ -567,6 +570,7 @@ TypeId Checker::resolve_type(const TypeRef* t) {
         if (n == "Bytes") return pool_.named(Type::K::class_, "Bytes");
         if (n == "File") return pool_.named(Type::K::class_, "File");
         if (n == "MMap") return pool_.named(Type::K::class_, "MMap");
+        if (n == "BufReader") return pool_.named(Type::K::class_, "BufReader");
     }
 
     if (n == "Option") {
@@ -1395,14 +1399,16 @@ Checker::Member Checker::builtin_member(TypeId recv, const std::string& name) {
         if (name == "round") return method({t_int()}, recv);
         return none;
     }
-    // string, Bytes, File, and MMap methods come from the builtin registry
+    // string, Bytes, File, MMap, and BufReader methods come from the registry
     if (recv->k == Type::K::string_ ||
         (recv->k == Type::K::class_ &&
-         (recv->name == "Bytes" || recv->name == "File" || recv->name == "MMap"))) {
-        BT want = recv->k == Type::K::string_ ? BT::str
-                  : recv->name == "Bytes"     ? BT::bytes
-                  : recv->name == "MMap"      ? BT::mmap
-                                              : BT::file;
+         (recv->name == "Bytes" || recv->name == "File" || recv->name == "MMap" ||
+          recv->name == "BufReader"))) {
+        BT want = recv->k == Type::K::string_  ? BT::str
+                  : recv->name == "Bytes"      ? BT::bytes
+                  : recv->name == "MMap"       ? BT::mmap
+                  : recv->name == "BufReader"  ? BT::bufr
+                                               : BT::file;
         for (const BuiltinMethod& b : builtin_methods()) {
             if (b.recv == want && name == b.name) {
                 std::vector<TypeId> ps;
@@ -1811,7 +1817,8 @@ TypeId Checker::check_call(const Expr* e, TypeId expected) {
                 for (const ExprPtr& a : e->args) check_expr(a.get(), t_int());
                 return pool_.named(Type::K::class_, "AtomicInt");
             }
-            if (n == "Bytes" || n == "File" || n == "Dir" || n == "MMap") {
+            if (n == "Bytes" || n == "File" || n == "Dir" || n == "MMap" || n == "Path" ||
+                n == "BufReader") {
                 for (const BuiltinStatic& b : builtin_statics()) {
                     if (n == b.cls && mname == b.name) {
                         std::vector<TypeId> ps;
@@ -2223,7 +2230,17 @@ void Checker::check_interpolation(const Expr* str) {
             continue;
         }
 
-        Lexer sub_lexer(segment);
+        // "{expr:8.2}" — strip a format spec before parsing the expr
+        FmtSpec spec;
+        std::string ferr;
+        std::string expr_text(split_fmt_spec(segment, spec, &ferr));
+        if (!ferr.empty()) {
+            error_at(str->line, str->col,
+                     "in string piece {" + segment + "}: " + ferr);
+            continue;
+        }
+
+        Lexer sub_lexer(expr_text);
         std::vector<Token> toks = sub_lexer.scan_all();
         Parser sub_parser(std::move(toks));
         ExprPtr seg = sub_parser.parse_standalone_expr();
@@ -2247,6 +2264,13 @@ void Checker::check_interpolation(const Expr* str) {
         if (!printable(t)) {
             error_at(str->line, str->col, "can't put a " + type_name(t) +
                                               " inside a string yet — give it a string form first");
+        }
+        if (spec.has && spec.places >= 0 &&
+            !(t->k == Type::K::f64_ || t->k == Type::K::f32 ||
+              t->k == Type::K::decimal_ || t->k == Type::K::poison)) {
+            error_at(str->line, str->col, "in string piece {" + segment +
+                                              "}: places (.N) need a float or decimal, this is " +
+                                              type_name(t));
         }
     }
 }

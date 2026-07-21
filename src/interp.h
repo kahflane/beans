@@ -7,6 +7,7 @@
 #include <vector>
 
 #include "ast.h"
+#include "lexer.h"
 #include "value.h"
 
 namespace beans {
@@ -107,6 +108,7 @@ private:
     struct StrPart {
         std::string text;    // literal piece (already unescaped)
         ExprPtr expr;        // or an expression piece
+        FmtSpec spec;        // "{x:8.2}" — applied after rendering
         std::shared_ptr<std::string> src; // owns the segment text the expr's
                                           // string_views point into
     };

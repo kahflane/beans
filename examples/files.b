@@ -29,6 +29,14 @@ fn main() {
     File.write("{base}/sub/b.txt", "b").expect("b")
     io.println(Dir.list("{base}/sub").expect("list").join(","))
 
+    // walk is recursive: relative paths, sorted, files only
+    io.println(Dir.walk(base).expect("walk"))
+
+    // Path is pure string math — join/parent/base/ext/stem
+    let deep: string = Path.join(Path.join(base, "sub"), "a.txt")
+    io.println("{Path.base(deep)} {Path.ext(deep)} {Path.stem(deep)}")
+    io.println("{Path.parent("/a/b/c")} {Path.join("a/", "/abs")} {Path.ext(".bashrc")}")
+
     // copy / rename / remove
     io.println("{File.copy(f1, "{base}/copy.txt").expect("copy")}")
     File.rename("{base}/copy.txt", "{base}/moved.txt").expect("rename")

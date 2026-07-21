@@ -45,6 +45,24 @@ fn main() {
     // round-trip
     io.println(Bytes.from("round trip").to_string())
 
+    // varints: unsigned LEB128, negatives take 10 bytes; the size of a value
+    // is derivable, so records advance without a second return value
+    var vrec: Bytes = Bytes.new(0)
+    vrec.append_varint(0).append_varint(300).append_varint(-1)
+    io.println("{vrec.len()} {Bytes.varint_size(300)} {Bytes.varint_size(-1)}")
+    var vpos: int = 0
+    var vs: List<int> = []
+    for vs.len() < 3 {
+        let v: int = vrec.get_varint(vpos)
+        vs.push(v)
+        vpos = vpos + Bytes.varint_size(v)
+    }
+    io.println(vs)
+
+    // crc32 (IEEE): the classic check vector, and an empty range
+    let chk: Bytes = Bytes.from("123456789")
+    io.println("{chk.crc32(0, chk.len())} {chk.crc32(0, 0)}")
+
     // a u32 read that hangs off the end panics with the position
     let boom: int = page.get_u32(62)
     io.println("{boom}")

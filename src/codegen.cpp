@@ -69,6 +69,7 @@ std::string clean_number(std::string_view text) {
 struct StrPiece {
     std::string text;
     ExprPtr expr;
+    FmtSpec spec;
 };
 std::vector<StrPiece> split_interp(std::string_view raw,
                                    std::vector<std::unique_ptr<std::string>>& srcs) {
@@ -115,20 +116,23 @@ std::vector<StrPiece> split_interp(std::string_view raw,
                 j += 1;
             }
             if (!cur.empty()) {
-                parts.push_back({cur, nullptr});
+                parts.push_back({cur, nullptr, {}});
                 cur.clear();
             }
-            srcs.push_back(std::make_unique<std::string>(body.substr(start, j - 1 - start)));
+            std::string seg(body.substr(start, j - 1 - start));
+            FmtSpec spec;
+            std::string expr_text(split_fmt_spec(seg, spec, nullptr));
+            srcs.push_back(std::make_unique<std::string>(std::move(expr_text)));
             Lexer lx(*srcs.back());
             Parser ps(lx.scan_all());
-            parts.push_back({"", ps.parse_standalone_expr()});
+            parts.push_back({"", ps.parse_standalone_expr(), spec});
             i = j;
             continue;
         }
         cur += c;
         i += 1;
     }
-    if (!cur.empty()) parts.push_back({cur, nullptr});
+    if (!cur.empty()) parts.push_back({cur, nullptr, {}});
     return parts;
 }
 
@@ -148,6 +152,7 @@ struct Ty {
         bytes_,
         file_,
         mmap_,
+        bufr_,
     };
     K k = K::bad_;
     std::string name;          // obj: impl/iface name, enum_: enum name
@@ -174,7 +179,7 @@ bool is_rc(const Ty* t) {
         case Ty::str_: case Ty::dec_: case Ty::obj_: case Ty::enum_:
         case Ty::list_: case Ty::map_: case Ty::fn_: case Ty::thread_:
         case Ty::mutex_: case Ty::chan_: case Ty::atomic_: case Ty::bytes_:
-        case Ty::file_: case Ty::mmap_:
+        case Ty::file_: case Ty::mmap_: case Ty::bufr_:
             return true;
         default:
             return false;
@@ -307,6 +312,7 @@ struct CG2 {
     Ty* t_bytes() { return prim(Ty::bytes_); }
     Ty* t_file() { return prim(Ty::file_); }
     Ty* t_mmap() { return prim(Ty::mmap_); }
+    Ty* t_bufr() { return prim(Ty::bufr_); }
 
     std::string mangle(Ty* t) {
         switch (t->k) {
@@ -410,6 +416,7 @@ struct CG2 {
         if (n == "Bytes") return t_bytes();
         if (n == "File") return t_file();
         if (n == "MMap") return t_mmap();
+        if (n == "BufReader") return t_bufr();
         if (n == "Option" && t->args.size() == 1)
             return t_option(resolve(t->args[0].get(), env, line, col));
         if (n == "Result") {
@@ -1512,7 +1519,30 @@ struct FnEmit {
             std::string piece;
             if (p.expr) {
                 EV v = eval(p.expr.get());
-                piece = to_str(v, p.expr.get());
+                if (p.spec.has && p.spec.places >= 0 && v.second->k == Ty::f64_) {
+                    std::string fr = reg();
+                    line(fr + " = call ptr @beans_fmt_float(double " + v.first +
+                         ", i64 " + std::to_string(p.spec.places) + ")");
+                    own(fr, cg.t_str());
+                    piece = fr;
+                } else if (p.spec.has && p.spec.places >= 0 &&
+                           v.second->k == Ty::dec_) {
+                    std::string fr = reg();
+                    line(fr + " = call ptr @beans_fmt_dec(ptr " + v.first +
+                         ", i64 " + std::to_string(p.spec.places) + ")");
+                    own(fr, cg.t_str());
+                    piece = fr;
+                } else {
+                    piece = to_str(v, p.expr.get());
+                }
+                if (p.spec.has && p.spec.width > 0) {
+                    std::string pr = reg();
+                    line(pr + " = call ptr @beans_fmt_pad_" +
+                         (p.spec.left ? "right" : "left") + "(ptr " + piece +
+                         ", i64 " + std::to_string(p.spec.width) + ")");
+                    own(pr, cg.t_str());
+                    piece = pr;
+                }
             } else {
                 piece = cg.intern_string(p.text);
             }
@@ -2263,7 +2293,8 @@ struct FnEmit {
                 own(r, cg.t_atomic());
                 return {r, cg.t_atomic()};
             }
-            if (n == "Bytes" || n == "File" || n == "Dir" || n == "MMap") {
+            if (n == "Bytes" || n == "File" || n == "Dir" || n == "MMap" || n == "Path" ||
+                n == "BufReader") {
                 for (const BuiltinStatic& b : builtin_statics()) {
                     if (n != b.cls || mname != b.name) continue;
                     std::string args;
@@ -2344,6 +2375,7 @@ struct FnEmit {
             case BT::bytes: return cg.t_bytes();
             case BT::file: return cg.t_file();
             case BT::mmap: return cg.t_mmap();
+            case BT::bufr: return cg.t_bufr();
             case BT::list_str: return cg.t_list(cg.t_str());
             default: return cg.t_i64();
         }
@@ -2397,6 +2429,56 @@ struct FnEmit {
             line(r + " = load ptr, ptr " + slot);
             own(r, cg.t_option(ok_t));
             return {r, cg.t_option(ok_t)};
+        }
+        if (ret == BT::res_opt_str) {
+            // {i64, ptr}: err set → err(e); val 0 → ok(none); else ok(some(str))
+            Ty* opt_t = cg.t_option(cg.t_str());
+            Ty* res_t = cg.t_result(opt_t, cg.t_error());
+            std::string sr = reg();
+            line(sr + " = call {i64, ptr} @" + std::string(sym) + "(" + args + ")");
+            std::string raw = reg(), errp = reg(), c = reg();
+            line(raw + " = extractvalue {i64, ptr} " + sr + ", 0");
+            line(errp + " = extractvalue {i64, ptr} " + sr + ", 1");
+            line(c + " = icmp eq ptr " + errp + ", null");
+            std::string okb = bb(), errb = bb(), endb = bb();
+            std::string slot = fresh_slot("ros", cg.t_str());
+            line("br i1 " + c + ", label %" + okb + ", label %" + errb);
+            label(okb);
+            std::string c2 = reg();
+            line(c2 + " = icmp ne i64 " + raw + ", 0");
+            std::string someb = bb(), noneb = bb();
+            line("br i1 " + c2 + ", label %" + someb + ", label %" + noneb);
+            label(someb);
+            size_t smark = temps.size();
+            std::string sv = from_slot(raw, cg.t_str());
+            own(sv, cg.t_str()); // runtime hands over its ref
+            std::string inner = box_enum(0, {{sv, cg.t_str()}});
+            std::string ob = box_enum(0, {{inner, opt_t}});
+            consume(ob);
+            line("store ptr " + ob + ", ptr " + slot);
+            flush_temps(smark);
+            line("br label %" + endb);
+            label(noneb);
+            size_t nmark = temps.size();
+            std::string ni = box_enum(1, {});
+            std::string nb = box_enum(0, {{ni, opt_t}});
+            consume(nb);
+            line("store ptr " + nb + ", ptr " + slot);
+            flush_temps(nmark);
+            line("br label %" + endb);
+            label(errb);
+            size_t emark = temps.size();
+            own(errp, cg.t_error()); // ready-made Error object, rc 1, ours
+            std::string eb = box_enum(1, {{errp, cg.t_error()}});
+            consume(eb);
+            line("store ptr " + eb + ", ptr " + slot);
+            flush_temps(emark);
+            line("br label %" + endb);
+            label(endb);
+            std::string r = reg();
+            line(r + " = load ptr, ptr " + slot);
+            own(r, res_t);
+            return {r, res_t};
         }
         switch (ret) {
             case BT::unit:
@@ -2654,6 +2736,14 @@ struct FnEmit {
             case Ty::mmap_: {
                 for (const BuiltinMethod& b : builtin_methods()) {
                     if (b.recv == BT::mmap && mname == b.name) {
+                        return emit_builtin(b, recv, e);
+                    }
+                }
+                break;
+            }
+            case Ty::bufr_: {
+                for (const BuiltinMethod& b : builtin_methods()) {
+                    if (b.recv == BT::bufr && mname == b.name) {
                         return emit_builtin(b, recv, e);
                     }
                 }
@@ -3812,7 +3902,9 @@ std::string CodeGen::generate() {
             case BT::dec: return "ptr";
             case BT::str: return "ptr";
             case BT::bytes: return "ptr";
+            case BT::file: return "ptr";
             case BT::mmap: return "ptr";
+            case BT::bufr: return "ptr";
             case BT::list_str: return "ptr";
             case BT::opt_i64:
             case BT::opt_str: return "{i64, i64}";
@@ -3824,6 +3916,7 @@ std::string CodeGen::generate() {
             case BT::res_bytes:
             case BT::res_file:
             case BT::res_mmap:
+            case BT::res_opt_str:
             case BT::res_list_str: return "{i64, ptr}";
             default: return "i64"; // i64, boolean
         }
@@ -4128,6 +4221,7 @@ typedef struct {
 typedef struct {
     char* p;
     long long len;
+    long long fd;
     long long writable;
     long long closed;
 } BMMap;
@@ -4141,7 +4235,10 @@ static void cc_free_shell(void* p, long long meta) {
     else if (kind == 6) { // OS resource — dropping the last ref is the safety
         if ((meta & CC_SHAPE) >> 3 & 1) { // shape bit 0: 0 = file, 1 = mmap
             BMMap* m = p;
-            if (!m->closed && m->p) munmap(m->p, (size_t)m->len);
+            if (!m->closed) {
+                if (m->p) munmap(m->p, (size_t)m->len);
+                if (m->fd >= 0) close((int)m->fd);
+            }
         } else {
             BFile* f = p; // net; close() / f.close() is the real API
             if (!f->closed && f->fd >= 0) close((int)f->fd);
@@ -4888,6 +4985,35 @@ char* beans_list_join(BList* l, char* sep, long long kind) {
     return out;
 }
 
+// UTF-8 sequences, one string per character; a malformed lead or truncated
+// tail comes through one byte at a time — byte slicing, no validation
+BList* beans_str_chars(char* s) {
+    long long len = beans_slen(s);
+    BList* l = beans_list_new(1);
+    long long i = 0;
+    while (i < len) {
+        unsigned char c = (unsigned char)s[i];
+        long long n = c < 0x80          ? 1
+                      : (c >> 5) == 0x6 ? 2
+                      : (c >> 4) == 0xE ? 3
+                      : (c >> 3) == 0x1E ? 4
+                                         : 1;
+        if (i + n > len) {
+            n = 1;
+        } else {
+            for (long long k = 1; k < n; k++) {
+                if (((unsigned char)s[i + k] >> 6) != 0x2) {
+                    n = 1;
+                    break;
+                }
+            }
+        }
+        beans_list_push(l, (long long)str_make(s + i, n));
+        i += n;
+    }
+    return l;
+}
+
 // ---- display through per-type show fns (emitted by the compiler) ----
 // show(slot) returns an owned string; we copy and release it per element
 static char* show_join(BList* l, const char* sep, long long sl,
@@ -4984,6 +5110,78 @@ BList* beans_bytes_from(char* s) {
 long long beans_bytes_len(BList* b) { return b->len; }
 long long beans_bytes_eq(BList* a, BList* b) {
     return a->len == b->len && memcmp(a->data, b->data, (size_t)a->len) == 0;
+}
+
+// unsigned LEB128 over the 64-bit two's-complement pattern (negatives take
+// 10 bytes); crc32 is the IEEE polynomial, table-driven — builtins.cpp
+// computes the identical table
+static void bytes_grow(BList* b, long long need);
+void beans_bytes_append_varint(BList* b, long long x) {
+    unsigned long long v = (unsigned long long)x;
+    while (v >= 0x80) {
+        bytes_grow(b, b->len + 1);
+        ((unsigned char*)b->data)[b->len++] = (unsigned char)(v | 0x80);
+        v >>= 7;
+    }
+    bytes_grow(b, b->len + 1);
+    ((unsigned char*)b->data)[b->len++] = (unsigned char)v;
+}
+long long beans_bytes_get_varint(BList* b, long long pos, long long line,
+                                 long long col) {
+    unsigned long long v = 0;
+    long long shift = 0;
+    long long i = pos < 0 ? b->len : pos;
+    while (1) {
+        if (pos < 0 || i >= b->len) {
+            char m[96];
+            snprintf(m, sizeof m, "varint read at %lld out of range (len %lld)", pos,
+                     b->len);
+            beans_panic(m, line, col);
+        }
+        if (shift >= 64) {
+            char m[96];
+            snprintf(m, sizeof m, "varint too long at %lld", pos);
+            beans_panic(m, line, col);
+        }
+        unsigned char byte = ((unsigned char*)b->data)[i++];
+        v |= (unsigned long long)(byte & 0x7f) << shift;
+        if (!(byte & 0x80)) break;
+        shift += 7;
+    }
+    return (long long)v;
+}
+long long beans_bytes_varint_size(long long x) {
+    unsigned long long v = (unsigned long long)x;
+    long long n = 1;
+    while (v >= 0x80) {
+        v >>= 7;
+        n++;
+    }
+    return n;
+}
+static unsigned int crc_table[256];
+static int crc_ready = 0;
+long long beans_bytes_crc32(BList* b, long long from, long long to, long long line,
+                            long long col) {
+    if (from < 0 || to < from || to > b->len) {
+        char m[96];
+        snprintf(m, sizeof m, "crc32 %lld..%lld out of range (len %lld)", from, to,
+                 b->len);
+        beans_panic(m, line, col);
+    }
+    if (!crc_ready) {
+        for (unsigned int i = 0; i < 256; i++) {
+            unsigned int c = i;
+            for (int k = 0; k < 8; k++) c = (c & 1) ? 0xEDB88320u ^ (c >> 1) : c >> 1;
+            crc_table[i] = c;
+        }
+        crc_ready = 1;
+    }
+    unsigned int c = 0xFFFFFFFFu;
+    for (long long i = from; i < to; i++) {
+        c = crc_table[(c ^ ((unsigned char*)b->data)[i]) & 0xFF] ^ (c >> 8);
+    }
+    return (long long)(c ^ 0xFFFFFFFFu);
 }
 static void bytes_grow(BList* b, long long need) {
     if (need <= b->cap) return;
@@ -5261,10 +5459,10 @@ BRes beans_mmap_open(char* path, long long writable) {
             return (BRes){0, fs_err_obj(path, e)};
         }
     }
-    close(fd);
     BMMap* m = beans_alloc(sizeof(BMMap), 6 | (1 << 3));
     m->p = p;
     m->len = (long long)st.st_size;
+    m->fd = fd; // kept: resize() needs it to ftruncate + remap
     m->writable = writable;
     return (BRes){(long long)m, NULL};
 }
@@ -5359,10 +5557,249 @@ BRes beans_mmap_flush_range(BMMap* m, long long pos, long long n) {
 BRes beans_mmap_close(BMMap* m) {
     if (m->closed) return (BRes){0, mk_error("mmap already closed", "closed")};
     m->closed = 1;
-    if (m->p && munmap(m->p, (size_t)m->len) != 0) {
-        return (BRes){0, op_err_obj("close", errno)};
+    int bad = m->p && munmap(m->p, (size_t)m->len) != 0;
+    int e = errno;
+    if (m->fd >= 0) close((int)m->fd);
+    if (bad) return (BRes){0, op_err_obj("close", e)};
+    return (BRes){1, NULL};
+}
+
+// grow or shrink in place: truncate the file, drop the old mapping, map
+// fresh. On a mapping failure the handle stays open but empty (len 0).
+BRes beans_mmap_resize(BMMap* m, long long n) {
+    if (m->closed) return (BRes){0, mmap_closed_err()};
+    if (!m->writable) return (BRes){0, mk_error("mmap is read-only", "permission")};
+    if (n < 0) return (BRes){0, mk_error("negative resize", "io")};
+    if (ftruncate((int)m->fd, (off_t)n) != 0) {
+        return (BRes){0, op_err_obj("resize", errno)};
+    }
+    if (m->p) munmap(m->p, (size_t)m->len);
+    m->p = NULL;
+    m->len = 0;
+    if (n > 0) {
+        char* p = mmap(NULL, (size_t)n, PROT_READ | PROT_WRITE, MAP_SHARED,
+                       (int)m->fd, 0);
+        if (p == MAP_FAILED) return (BRes){0, op_err_obj("resize", errno)};
+        m->p = p;
+        m->len = n;
     }
     return (BRes){1, NULL};
+}
+
+// ---- BufReader (kind 1 fixed: slots 0/1 are the File and the buffer — the
+// generic destructor walks them; pread at its own offset, cursor untouched) --
+typedef struct {
+    BFile* f;
+    BList* buf;
+    long long off, bpos, blim, eof;
+} BBufR;
+BBufR* beans_bufr_on(BFile* f) {
+    BBufR* r = beans_alloc(sizeof(BBufR), 1 | (3 << 3));
+    beans_retain(f); // the reader owns a ref to its file
+    r->f = f;
+    r->buf = bytes_mk(8192);
+    return r;
+}
+// a line without its '\n'; a partial line at EOF comes through, then none
+BRes beans_bufr_read_line(BBufR* r) {
+    BFile* f = r->f;
+    long long cap = 16, len = 0;
+    char* acc = malloc((size_t)cap);
+    while (1) {
+        while (r->bpos < r->blim) {
+            char c = ((char*)r->buf->data)[r->bpos++];
+            if (c == '\n') {
+                char* s = str_make(acc, len);
+                free(acc);
+                return (BRes){(long long)s, NULL};
+            }
+            if (len == cap) {
+                cap *= 2;
+                acc = realloc(acc, (size_t)cap);
+            }
+            acc[len++] = c;
+        }
+        if (r->eof) break;
+        if (f->closed) {
+            free(acc);
+            return (BRes){0, closed_err()};
+        }
+        ssize_t got = pread((int)f->fd, r->buf->data, 8192, (off_t)r->off);
+        if (got < 0) {
+            free(acc);
+            return (BRes){0, op_err_obj("read", errno)};
+        }
+        if (got == 0) {
+            r->eof = 1;
+            break;
+        }
+        r->off += got;
+        r->bpos = 0;
+        r->blim = got;
+    }
+    if (len == 0) {
+        free(acc);
+        return (BRes){0, NULL}; // ok(none)
+    }
+    char* s = str_make(acc, len);
+    free(acc);
+    return (BRes){(long long)s, NULL};
+}
+
+// ---- Dir.walk: files and symlinks under root (lstat — never follows a
+// link), paths relative to root, "/"-joined, sorted at the end ----
+typedef struct {
+    char** v;
+    long long len, cap;
+} StrVec;
+static void sv_push(StrVec* s, char* p) {
+    if (s->len == s->cap) {
+        s->cap = s->cap ? s->cap * 2 : 16;
+        s->v = realloc(s->v, (size_t)s->cap * sizeof(char*));
+    }
+    s->v[s->len++] = p;
+}
+static char* path_cat(const char* a, const char* b) {
+    size_t la = strlen(a), lb = strlen(b);
+    char* r = malloc(la + lb + 2);
+    memcpy(r, a, la);
+    r[la] = '/';
+    memcpy(r + la + 1, b, lb);
+    r[la + 1 + lb] = 0;
+    return r;
+}
+static int walk_dir(const char* root, const char* rel, StrVec* out, char** epath,
+                    int* eno) {
+    char* full = rel[0] ? path_cat(root, rel) : strdup(root);
+    DIR* d = opendir(full);
+    if (!d) {
+        *epath = full;
+        *eno = errno;
+        return 0;
+    }
+    free(full);
+    struct dirent* en;
+    while ((en = readdir(d))) {
+        if (strcmp(en->d_name, ".") == 0 || strcmp(en->d_name, "..") == 0) continue;
+        char* r2 = rel[0] ? path_cat(rel, en->d_name) : strdup(en->d_name);
+        char* abs = path_cat(root, r2);
+        struct stat st;
+        if (lstat(abs, &st) != 0) {
+            *epath = abs;
+            *eno = errno;
+            free(r2);
+            closedir(d);
+            return 0;
+        }
+        if (S_ISDIR(st.st_mode)) {
+            free(abs);
+            int ok = walk_dir(root, r2, out, epath, eno);
+            free(r2);
+            if (!ok) {
+                closedir(d);
+                return 0;
+            }
+        } else {
+            free(abs);
+            sv_push(out, r2);
+        }
+    }
+    closedir(d);
+    return 1;
+}
+static int walk_cmp(const void* a, const void* b) {
+    return strcmp(*(char* const*)a, *(char* const*)b);
+}
+BRes beans_dir_walk(char* path) {
+    StrVec out = {0, 0, 0};
+    char* epath = NULL;
+    int eno = 0;
+    if (!walk_dir(path, "", &out, &epath, &eno)) {
+        void* e = fs_err_obj(epath, eno);
+        free(epath);
+        for (long long i = 0; i < out.len; i++) free(out.v[i]);
+        free(out.v);
+        return (BRes){0, e};
+    }
+    qsort(out.v, (size_t)out.len, sizeof(char*), walk_cmp);
+    BList* l = beans_list_new(1);
+    for (long long i = 0; i < out.len; i++) {
+        beans_list_push(l, (long long)rc_strdup(out.v[i]));
+        free(out.v[i]);
+    }
+    free(out.v);
+    return (BRes){(long long)l, NULL};
+}
+
+// ---- Path (pure string math, no fs access) ----
+static long long path_base_span(char* p, long long* start) {
+    long long n = beans_slen(p);
+    long long end = n;
+    while (end > 0 && p[end - 1] == '/') end--;
+    if (end == 0) {
+        *start = 0;
+        return n ? -1 : 0; // -1: the whole thing is slashes — base is "/"
+    }
+    long long slash = -1;
+    for (long long i = end - 1; i >= 0; i--) {
+        if (p[i] == '/') {
+            slash = i;
+            break;
+        }
+    }
+    *start = slash + 1;
+    return end - (slash + 1);
+}
+char* beans_path_join(char* a, char* b) {
+    long long la = beans_slen(a), lb = beans_slen(b);
+    if (lb && b[0] == '/') return str_make(b, lb); // absolute b wins
+    if (!la) return str_make(b, lb);
+    if (!lb) return str_make(a, la);
+    long long end = la;
+    while (end > 0 && a[end - 1] == '/') end--;
+    char* r = beans_alloc(end + 1 + lb + 1, (end + 1 + lb) << 3);
+    memcpy(r, a, (size_t)end);
+    r[end] = '/';
+    memcpy(r + end + 1, b, (size_t)lb);
+    return r;
+}
+char* beans_path_parent(char* p) {
+    long long n = beans_slen(p);
+    long long end = n;
+    while (end > 0 && p[end - 1] == '/') end--;
+    if (end == 0) return str_make(n ? "/" : "", n ? 1 : 0);
+    long long slash = -1;
+    for (long long i = end - 1; i >= 0; i--) {
+        if (p[i] == '/') {
+            slash = i;
+            break;
+        }
+    }
+    if (slash < 0) return str_make("", 0);
+    if (slash == 0) return str_make("/", 1);
+    return str_make(p, slash);
+}
+char* beans_path_base(char* p) {
+    long long start, len = path_base_span(p, &start);
+    if (len < 0) return str_make("/", 1);
+    return str_make(p + start, len);
+}
+// a leading dot is a dotfile, not an extension: ext(".bashrc") is ""
+char* beans_path_ext(char* p) {
+    long long start, len = path_base_span(p, &start);
+    if (len <= 0) return str_make("", 0);
+    for (long long i = len - 1; i > 0; i--) {
+        if (p[start + i] == '.') return str_make(p + start + i, len - i);
+    }
+    return str_make("", 0);
+}
+char* beans_path_stem(char* p) {
+    long long start, len = path_base_span(p, &start);
+    if (len < 0) return str_make("/", 1);
+    for (long long i = len - 1; i > 0; i--) {
+        if (p[start + i] == '.') return str_make(p + start, i);
+    }
+    return str_make(p + start, len);
 }
 
 BRes beans_file_open(char* path, char* mode) {

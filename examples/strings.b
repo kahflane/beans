@@ -86,6 +86,10 @@ fn main() {
     let n: int = "  77  ".trim().to_int().expect("n")
     io.println("{n + 1}")
 
+    // chars() slices by UTF-8 character; len stays bytes forever
+    io.println("héllo→🌍".chars())
+    io.println("{"héllo→🌍".len()} bytes, {"héllo→🌍".chars().len()} chars")
+
     // out of range slices panic with the range in the message
     io.println(t.slice(5, 99))
 }

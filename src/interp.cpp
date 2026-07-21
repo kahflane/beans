@@ -1079,7 +1079,8 @@ Value Interp::eval_call(const Expr* e, std::shared_ptr<Env>& env, Hint hint) {
                 v.atomic->v = init.i;
                 return v;
             }
-            if (n == "Bytes" || n == "File" || n == "Dir" || n == "MMap") {
+            if (n == "Bytes" || n == "File" || n == "Dir" || n == "MMap" || n == "Path" ||
+                n == "BufReader") {
                 for (const BuiltinStatic& b : builtin_statics()) {
                     if (n == b.cls && mname == b.name) {
                         std::vector<Value> args;
@@ -1241,6 +1242,14 @@ Value Interp::eval_builtin_method(const Expr* e, Value& recv, const std::string&
         case Value::K::mmap: {
             for (const BuiltinMethod& b : builtin_methods()) {
                 if (b.recv == BT::mmap && name == b.name) {
+                    return b.run(e->line, e->col, recv, args);
+                }
+            }
+            break;
+        }
+        case Value::K::bufr: {
+            for (const BuiltinMethod& b : builtin_methods()) {
+                if (b.recv == BT::bufr && name == b.name) {
                     return b.run(e->line, e->col, recv, args);
                 }
             }
@@ -1604,9 +1613,10 @@ const std::vector<Interp::StrPart>& Interp::string_parts(const Expr* e) {
                 cur.clear();
             }
             StrPart p;
+            std::string expr_text(split_fmt_spec(segment, p.spec, nullptr));
             // the parsed expr holds string_views into the segment text,
             // so the part must own that text for as long as it lives
-            p.src = std::make_shared<std::string>(std::move(segment));
+            p.src = std::make_shared<std::string>(std::move(expr_text));
             Lexer lx(*p.src);
             Parser ps(lx.scan_all());
             p.expr = ps.parse_standalone_expr();
@@ -1639,7 +1649,19 @@ Value Interp::eval_string(const Expr* e, std::shared_ptr<Env>& env) {
     for (const StrPart& p : parts) {
         if (p.expr) {
             Value v = eval(p.expr.get(), env);
-            out += display(v);
+            std::string piece;
+            if (p.spec.has && p.spec.places >= 0 && v.k == Value::K::float_) {
+                piece = fmt_float_text(v.f, p.spec.places);
+            } else if (p.spec.has && p.spec.places >= 0 &&
+                       v.k == Value::K::decimal_) {
+                piece = fmt_dec_text(v.dec, p.spec.places);
+            } else {
+                piece = display(v);
+            }
+            if (p.spec.has && p.spec.width > 0) {
+                piece = fmt_pad_text(std::move(piece), p.spec.width, p.spec.left);
+            }
+            out += piece;
         } else {
             out += p.text;
         }
@@ -1709,6 +1731,7 @@ std::string Interp::display(const Value& v) {
         case Value::K::bytes: return "{bytes}";
         case Value::K::file: return "{file}";
         case Value::K::mmap: return "{mmap}";
+        case Value::K::bufr: return "{bufreader}";
         case Value::K::closure: return "{fn}";
         case Value::K::fn_ref: return "{fn}";
         case Value::K::range: return "{range}";
