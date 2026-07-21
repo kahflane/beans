@@ -15,7 +15,7 @@ A small OOP language: Java-style objects, Go-sized grammar, C++-level access, bu
 | parser | done |
 | type checker | done (v1) |
 | interpreter | done (v1) — `beansc run` |
-| LLVM native backend | v2 — classes, enums, match, decimal all native |
+| LLVM native backend | v3 — whole language native (closures, threads, maps, generics) |
 
 ## Build
 
@@ -32,7 +32,9 @@ make run    # parses the example files
 
 The interpreter is the reference implementation: exact `decimal` math, real OS threads for `thread.spawn`, real mutexes and blocking channels, `defer`, dynamic dispatch, and runtime panics with line numbers.
 
-The native backend emits textual LLVM IR and hands it to clang — no LLVM library dependency. v2 covers classes (vtable dispatch, inheritance, interface defaults, `override`, `as?`), monomorphized generics on classes, enums + `match`, Option/Result + `?`, exact `decimal`, lists, strings with interpolation, and all control flow. `beansc build examples/tour.b` produces byte-identical output to `beansc run`. Not yet native (clear error, interpreter still runs them): closures/fn values, threads, maps, generic functions.
+The native backend emits textual LLVM IR and hands it to clang — no LLVM library dependency. v3 covers the whole language: classes (vtable dispatch, inheritance, interface defaults, `override`, `as?`), monomorphized generics on classes *and* functions, enums + `match`, Option/Result + `?`, exact `decimal`, lists and maps, closures (lambda-lifted, captured variables live in shared heap cells — mutation works, escaping works), real pthreads for `thread.spawn`/`Mutex`/`Channel`/`AtomicInt`, `defer`, and string interpolation. Every test file produces byte-identical output under `beansc build` and `beansc run` — panics included, same message, same exit code.
+
+Known v1 memory model: native heap values are never freed. Reference counting is the next big piece.
 
 ## Benchmarks (Apple Silicon, clang 21 -O2 vs go 1.26.4)
 
