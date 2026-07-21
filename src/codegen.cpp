@@ -1336,7 +1336,10 @@ struct FnEmit {
                     line("br i1 " + c + ", label %" + okb + ", label %" + badb);
                     label(badb);
                     std::string ks = to_str(idx, e->index_expr.get());
-                    consume(ks); // branch-local, and the panic never returns
+                    // branch-local, and the panic never returns — but to_str is
+                    // identity on strings, so this can eat the key temp itself,
+                    // and then the hit path must release it in its own branch
+                    bool key_eaten = consume(ks) && ks == idx.first;
                     std::string m = reg();
                     line(m + " = call ptr @beans_concat(ptr " +
                          cg.intern_string("map key not found: ") + ", ptr " + ks + ")");
@@ -1345,6 +1348,7 @@ struct FnEmit {
                          ")");
                     line("unreachable");
                     label(okb);
+                    if (key_eaten) emit_release(idx.first);
                     return {from_slot(raw, V), V}; // borrowed from the map, like lists
                 }
                 if (obj.second->k != Ty::list_) {
