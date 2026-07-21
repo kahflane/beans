@@ -43,7 +43,9 @@ multi-package programs (packages, `pub`, cross-package inheritance, block arms).
 matching `bench/*.go` for speed comparisons.
 
 Memory is verified with Apple's `leaks` (`leaks --atExit -- ./build/<bin>`); the target is 0 leaked
-bytes on every program.
+bytes on every program. Small objects normally live inside pooled 64KB slabs, which hides individual
+leaks from the tool — hunt real leaks with `BEANS_NO_POOL=1 leaks --atExit -- ...`, which routes every
+allocation through plain calloc/free.
 
 Only `examples/` and `bench/` are tracked — `build/` is gitignored, so scratch `.b` test programs
 written there do not survive.
@@ -110,9 +112,13 @@ The single largest file. Structure, top to bottom:
 
 ### Reference counting rules (the part that is easy to break)
 
-Native binaries use ARC, no GC. Every heap value carries a 16-byte header (atomic count + `meta`
-describing its pointer layout, so one generic destructor can walk nested values). String constants are
-immortal (`BEANS_IMMORTAL`).
+Native binaries use ARC, no GC. Every heap value carries a 16-byte header (count + `meta` describing
+its pointer layout, so one generic destructor can walk nested values). String constants are immortal
+(`BEANS_IMMORTAL`). Count ops are plain until the first `thread.spawn` flips `cc_mt`, then atomic.
+The count word also carries the allocator size class in bits 48-59 (`RC_CLS_SHIFT`), so **any test of
+the count must mask with `RC_COUNT`** — a raw `h->rc == 0` is never true for a pooled object. Small
+objects come from per-thread size-class freelists over registered slabs; `BEANS_NO_POOL=1` disables
+the pool.
 
 RC is deliberately kept off hot paths — **function arguments, loop variables, and reads borrow; they
 do not retain.** Only frame-owned locals (`Var::owned`) and mid-statement temporaries (`temps`) hold

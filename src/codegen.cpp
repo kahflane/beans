@@ -3236,7 +3236,7 @@ std::string CodeGen::generate() {
 const char* CodeGen::runtime_c() {
     return R"RT(// beans native runtime — reference-counted heap + cycle collector.
 // Every heap value has a 16-byte header just before its payload:
-//   { atomic long long rc, long long meta }
+//   { long long rc, long long meta }   (rc ops turn atomic at first spawn)
 // meta bits 0-2 = kind, bits 3-60 = per-kind shape payload:
 //   0 leaf | 1 fixed (bitmask of pointer slots) | 2 list (elem_ptr)
 //   3 map (key_ptr | val_ptr<<1) | 4 chan (elem_ptr) | 5 mutex (inner_ptr)
@@ -3259,6 +3259,14 @@ const char* CodeGen::runtime_c() {
 
 #define BEANS_IMMORTAL (1LL << 62)
 
+// rc layout: bits 0-47 the count, bits 48-59 the allocation size class
+// (0 = plain malloc), bit 62 immortal. Retain/release preserve the class
+// bits by adding/subtracting 1; every test of the COUNT must mask with
+// RC_COUNT, and class 4095 * 16 bytes stays far under the immortal bit.
+#define RC_CLS_SHIFT 48
+#define RC_CLS_MAX 4095LL
+#define RC_COUNT(v) ((v) & ((1LL << RC_CLS_SHIFT) - 1))
+
 // meta layout
 #define CC_SHAPE ((1LL << 61) - 1)
 #define CC_COLOR (3LL << 61)
@@ -3269,11 +3277,17 @@ const char* CodeGen::runtime_c() {
 #define CC_BUF ((long long)(1ULL << 63))
 
 typedef struct {
-    _Atomic long long rc;
+    long long rc;
     long long meta;
 } BHead;
 
 static BHead* head_of(void* p) { return (BHead*)((char*)p - 16); }
+
+// counts are plain until the first thread spawns (cc_mt flips before
+// pthread_create, so no object is ever touched by two threads while the
+// flag is 0); after that retain/release use atomic ops. The collector
+// keeps plain ops either way — it only runs with zero workers live.
+static int cc_mt;
 static long long cc_color(BHead* h) { return h->meta & CC_COLOR; }
 static void cc_set_color(BHead* h, long long c) { h->meta = (h->meta & ~CC_COLOR) | c; }
 
@@ -3282,12 +3296,59 @@ static _Atomic int cc_pending;
 static int cc_collecting;
 static void cc_collect(void);
 
+// segregated per-thread freelists over 64KB slabs: one calloc per slab,
+// then carve; a free pushes the block on the freeing thread's list. Slabs
+// are registered globally so the leaks tool sees every allocation as
+// reachable; blocks stranded on a dead worker's freelist sit inside a
+// registered slab (wasted until exit, never a leak). BEANS_NO_POOL=1
+// routes everything through plain calloc/free so `leaks` can see
+// individual beans objects again when hunting a real leak.
+#define POOL_CLASSES 64 // pooled sizes 16..1008 bytes; bigger goes to malloc
+#define POOL_SLAB (64 << 10)
+static _Thread_local void* pool_free[POOL_CLASSES];
+static _Thread_local char* pool_cur;
+static _Thread_local char* pool_end;
+static void** pool_slabs;
+static long long pool_slab_len, pool_slab_cap;
+static pthread_mutex_t pool_mu = PTHREAD_MUTEX_INITIALIZER;
+static int pool_off;
+__attribute__((constructor)) static void pool_setup(void) {
+    pool_off = getenv("BEANS_NO_POOL") != NULL;
+}
+
 void* beans_alloc(long long size, long long meta) {
     // allocation is the one safe point: never inside a release cascade,
     // and every stored reference is already counted
     if (cc_pending && !cc_collecting && cc_threads == 0) cc_collect();
-    BHead* h = calloc(1, 16 + (size_t)size);
-    h->rc = 1;
+    size_t total = (16 + (size_t)size + 15) & ~(size_t)15;
+    long long cls = (long long)(total >> 4);
+    BHead* h;
+    if (cls < POOL_CLASSES && !pool_off) {
+        if (pool_free[cls]) {
+            h = pool_free[cls];
+            pool_free[cls] = *(void**)h;
+            memset(h, 0, total); // recycled block; callers expect zeroed slots
+        } else {
+            if (!pool_cur || pool_cur + total > pool_end) {
+                pool_cur = calloc(1, POOL_SLAB);
+                pool_end = pool_cur + POOL_SLAB;
+                pthread_mutex_lock(&pool_mu);
+                if (pool_slab_len == pool_slab_cap) {
+                    pool_slab_cap = pool_slab_cap ? pool_slab_cap * 2 : 64;
+                    pool_slabs = realloc(pool_slabs,
+                                         (size_t)pool_slab_cap * sizeof(void*));
+                }
+                pool_slabs[pool_slab_len++] = pool_cur;
+                pthread_mutex_unlock(&pool_mu);
+            }
+            h = (BHead*)pool_cur; // virgin slab memory, already zero
+            pool_cur += total;
+        }
+        h->rc = 1 | (cls << RC_CLS_SHIFT);
+    } else {
+        h = calloc(1, total);
+        h->rc = 1;
+    }
     h->meta = meta;
     return (char*)h + 16;
 }
@@ -3295,8 +3356,13 @@ void* beans_alloc(long long size, long long meta) {
 void beans_retain(void* p) {
     if (!p) return;
     BHead* h = head_of(p);
-    if (h->rc >= BEANS_IMMORTAL) return;
-    h->rc += 1;
+    if (cc_mt) {
+        if (__atomic_load_n(&h->rc, __ATOMIC_RELAXED) >= BEANS_IMMORTAL) return;
+        __atomic_add_fetch(&h->rc, 1, __ATOMIC_RELAXED);
+    } else {
+        if (h->rc >= BEANS_IMMORTAL) return;
+        h->rc += 1;
+    }
 }
 
 void beans_release(void* p);
@@ -3365,7 +3431,14 @@ static void cc_free_shell(void* p, long long meta) {
     if (kind == 2) free(((BList*)p)->data);
     else if (kind == 3) free(((BMap*)p)->data);
     else if (kind == 4) free(((BChan*)p)->q);
-    free(head_of(p));
+    BHead* h = head_of(p);
+    long long cls = (h->rc >> RC_CLS_SHIFT) & RC_CLS_MAX;
+    if (cls) {
+        *(void**)h = pool_free[cls];
+        pool_free[cls] = h;
+    } else {
+        free(h);
+    }
 }
 
 // explicit work stack, shared by release cascades and all collector phases
@@ -3415,8 +3488,11 @@ void beans_release(void* p) {
     void* cur = p;
     for (;;) {
         BHead* h = head_of(cur);
-        if (h->rc < BEANS_IMMORTAL) {
-            if (--h->rc == 0) {
+        long long rc0 = cc_mt ? __atomic_load_n(&h->rc, __ATOMIC_RELAXED) : h->rc;
+        if (rc0 < BEANS_IMMORTAL) {
+            long long nrc = cc_mt ? __atomic_sub_fetch(&h->rc, 1, __ATOMIC_ACQ_REL)
+                                  : (h->rc -= 1);
+            if (RC_COUNT(nrc) == 0) {
                 long long meta = h->meta;
                 cc_walk(cur, meta, cc_visit_push, &st);
                 if (meta & CC_BUF) {
@@ -3488,7 +3564,7 @@ static void cc_scan(void* root, CCStack* st, CCStack* aux) {
         void* p = st->v[--st->len];
         BHead* h = head_of(p);
         if (cc_color(h) != CC_GRAY) continue;
-        if (h->rc > 0) {
+        if (RC_COUNT(h->rc) > 0) {
             cc_scan_black(p, aux); // externally referenced — restore it all
         } else {
             cc_set_color(h, CC_WHITE);
@@ -3520,11 +3596,11 @@ static void cc_collect(void) {
     for (long long i = 0; i < cc_len; i++) {
         void* p = cc_roots[i];
         BHead* h = head_of(p);
-        if (cc_color(h) == CC_PURPLE && h->rc > 0) {
+        if (cc_color(h) == CC_PURPLE && RC_COUNT(h->rc) > 0) {
             cc_roots[n++] = p;
         } else {
             __atomic_and_fetch(&h->meta, ~CC_BUF, __ATOMIC_RELAXED);
-            if (h->rc == 0) {
+            if (RC_COUNT(h->rc) == 0) {
                 cc_free_shell(p, h->meta);
                 husks += 1;
             }
@@ -3741,6 +3817,7 @@ BThread* beans_thread_spawn(void* thunk, void* env) {
     BThread* t = beans_alloc(sizeof(BThread), 0);
     t->thunk = (long long (*)(void*))thunk;
     t->env = env; // ownership of the closure box moves to the thread
+    cc_mt = 1; // from here every count op is atomic, in every thread
     beans_retain(t); // one ref for the handle, one for the running thread
     cc_threads += 1;
     pthread_create(&t->th, NULL, thread_main, t);
