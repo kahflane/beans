@@ -1063,6 +1063,15 @@ Value Interp::eval_call(const Expr* e, std::shared_ptr<Env>& env, Hint hint) {
                 v.atomic->v = init.i;
                 return v;
             }
+            if (n == "Bytes") {
+                for (const BuiltinStatic& b : builtin_statics()) {
+                    if (mname == b.name) {
+                        std::vector<Value> args;
+                        for (const ExprPtr& a : e->args) args.push_back(eval(a.get(), env));
+                        return b.run(e->line, e->col, args);
+                    }
+                }
+            }
 
             if (const ClassDecl* cls = resolve_class(obj, n)) {
                 const FnDecl* m = nullptr;
@@ -1155,7 +1164,17 @@ Value Interp::eval_builtin_method(const Expr* e, Value& recv, const std::string&
         case Value::K::string_: {
             // string methods live in the builtin registry (builtins.cpp)
             for (const BuiltinMethod& b : builtin_methods()) {
-                if (b.recv == BT::str && name == b.name) return b.run(recv, args);
+                if (b.recv == BT::str && name == b.name) {
+                    return b.run(e->line, e->col, recv, args);
+                }
+            }
+            break;
+        }
+        case Value::K::bytes: {
+            for (const BuiltinMethod& b : builtin_methods()) {
+                if (b.recv == BT::bytes && name == b.name) {
+                    return b.run(e->line, e->col, recv, args);
+                }
             }
             break;
         }
@@ -1481,6 +1500,7 @@ bool Interp::value_eq(const Value& a, const Value& b) {
         }
         case Value::K::instance: return a.inst == b.inst;
         case Value::K::list: return a.list == b.list;
+        case Value::K::bytes: return a.bytes->data == b.bytes->data;
         default: return false;
     }
 }
@@ -1517,6 +1537,7 @@ std::string Interp::display(const Value& v) {
             return out + "]";
         }
         case Value::K::map: return "{map}";
+        case Value::K::bytes: return "{bytes}";
         case Value::K::closure: return "{fn}";
         case Value::K::fn_ref: return "{fn}";
         case Value::K::range: return "{range}";

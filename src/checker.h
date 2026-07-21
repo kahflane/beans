@@ -6,6 +6,7 @@
 #include <vector>
 
 #include "ast.h"
+#include "builtins.h"
 #include "types.h"
 
 namespace beans {
@@ -112,6 +113,7 @@ private:
     Member lookup_member(TypeId recv, const std::string& name,
                          uint32_t line = 0, uint32_t col = 0);
     Member builtin_member(TypeId recv, const std::string& name);
+    TypeId bt_type(BT t, TypeId recv); // registry signature type -> TypeId
     TypeId class_type_of(const ClassInfo& c); // self type incl. own params
 
     // ---- scopes ----

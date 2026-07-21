@@ -145,6 +145,7 @@ struct Ty {
         mutex_,   // args = {inner}
         chan_,    // args = {elem}
         atomic_,
+        bytes_,
     };
     K k = K::bad_;
     std::string name;          // obj: impl/iface name, enum_: enum name
@@ -170,7 +171,7 @@ bool is_rc(const Ty* t) {
     switch (t->k) {
         case Ty::str_: case Ty::dec_: case Ty::obj_: case Ty::enum_:
         case Ty::list_: case Ty::map_: case Ty::fn_: case Ty::thread_:
-        case Ty::mutex_: case Ty::chan_: case Ty::atomic_:
+        case Ty::mutex_: case Ty::chan_: case Ty::atomic_: case Ty::bytes_:
             return true;
         default:
             return false;
@@ -300,6 +301,7 @@ struct CG2 {
         return intern(std::move(t));
     }
     Ty* t_atomic() { return prim(Ty::atomic_); }
+    Ty* t_bytes() { return prim(Ty::bytes_); }
 
     std::string mangle(Ty* t) {
         switch (t->k) {
@@ -400,6 +402,7 @@ struct CG2 {
         if (n == "Channel" && t->args.size() == 1)
             return t_kind1(Ty::chan_, resolve(t->args[0].get(), env, line, col));
         if (n == "AtomicInt") return t_atomic();
+        if (n == "Bytes") return t_bytes();
         if (n == "Option" && t->args.size() == 1)
             return t_option(resolve(t->args[0].get(), env, line, col));
         if (n == "Result") {
@@ -2051,6 +2054,28 @@ struct FnEmit {
                 own(r, cg.t_atomic());
                 return {r, cg.t_atomic()};
             }
+            if (n == "Bytes") {
+                for (const BuiltinStatic& b : builtin_statics()) {
+                    if (mname != b.name) continue;
+                    std::string args;
+                    for (size_t i = 0; i < b.params.size() && i < e->args.size(); i++) {
+                        Ty* pt = bty(b.params[i]);
+                        EV a = eval(e->args[i].get(), pt);
+                        if (i) args += ", ";
+                        args += std::string(ll(pt)) + " " + a.first;
+                    }
+                    if (b.panics) {
+                        if (!args.empty()) args += ", ";
+                        args += "i64 " + std::to_string(e->line) + ", i64 " +
+                                std::to_string(e->col);
+                    }
+                    std::string r = reg();
+                    line(r + " = call ptr @" + std::string(b.sym) + "(" + args + ")");
+                    Ty* rt2 = bty(b.ret);
+                    own(r, rt2);
+                    return {r, rt2};
+                }
+            }
         }
 
         // `money.Payment.card(...)` / `money.Money.new(...)` — the receiver is
@@ -2102,13 +2127,16 @@ struct FnEmit {
 
     // table-driven builtin method (builtins.cpp): eval args per signature,
     // call the C symbol, box fallible returns from the BRes {val, msg} ABI —
-    // 16 bytes so both C and IR return it in registers; msg null = ok
+    // 16 bytes so both C and IR return it in registers; msg null = ok.
+    // Rows with `panics` pass (line, col) so the runtime's message carries
+    // the source position, exactly like the interpreter's.
     Ty* bty(BT t) {
         switch (t) {
             case BT::f64: return cg.t_f64();
             case BT::dec: return cg.t_dec();
             case BT::boolean: return cg.t_bool();
             case BT::str: return cg.t_str();
+            case BT::bytes: return cg.t_bytes();
             default: return cg.t_i64();
         }
     }
@@ -2118,6 +2146,47 @@ struct FnEmit {
             Ty* pt = bty(b.params[i]);
             EV a = eval(e->args[i].get(), pt);
             args += ", " + std::string(ll(pt)) + " " + a.first;
+        }
+        if (b.panics) {
+            args += ", i64 " + std::to_string(e->line) + ", i64 " +
+                    std::to_string(e->col);
+        }
+        if (b.ret == BT::self_recv) {
+            line("call void @" + std::string(b.sym) + "(" + args + ")");
+            return {recv.first, recv.second}; // the receiver, still borrowed
+        }
+        if (b.ret == BT::opt_i64) {
+            std::string sr = reg();
+            line(sr + " = call {i64, i64} @" + std::string(b.sym) + "(" + args + ")");
+            std::string raw = reg(), has = reg(), c = reg();
+            line(raw + " = extractvalue {i64, i64} " + sr + ", 0");
+            line(has + " = extractvalue {i64, i64} " + sr + ", 1");
+            line(c + " = icmp ne i64 " + has + ", 0");
+            std::string someb = bb(), noneb = bb(), endb = bb();
+            std::string slot = fresh_slot("bop", cg.t_str());
+            line("br i1 " + c + ", label %" + someb + ", label %" + noneb);
+            label(someb);
+            std::string sb = box_enum(0, {{raw, cg.t_i64()}});
+            consume(sb);
+            line("store ptr " + sb + ", ptr " + slot);
+            line("br label %" + endb);
+            label(noneb);
+            std::string nb = box_enum(1, {});
+            consume(nb);
+            line("store ptr " + nb + ", ptr " + slot);
+            line("br label %" + endb);
+            label(endb);
+            std::string r = reg();
+            line(r + " = load ptr, ptr " + slot);
+            own(r, cg.t_option(cg.t_i64()));
+            return {r, cg.t_option(cg.t_i64())};
+        }
+        if (b.ret == BT::list_str) {
+            std::string r = reg();
+            line(r + " = call ptr @" + std::string(b.sym) + "(" + args + ")");
+            Ty* lt = cg.t_list(cg.t_str());
+            own(r, lt);
+            return {r, lt};
         }
         switch (b.ret) {
             case BT::unit:
@@ -2322,6 +2391,14 @@ struct FnEmit {
             case Ty::str_: {
                 for (const BuiltinMethod& b : builtin_methods()) {
                     if (b.recv == BT::str && mname == b.name) {
+                        return emit_builtin(b, recv, e);
+                    }
+                }
+                break;
+            }
+            case Ty::bytes_: {
+                for (const BuiltinMethod& b : builtin_methods()) {
+                    if (b.recv == BT::bytes && mname == b.name) {
                         return emit_builtin(b, recv, e);
                     }
                 }
@@ -3279,22 +3356,36 @@ std::string CodeGen::generate() {
     out += "declare void @beans_print(ptr)\n";
     out += "declare i32 @beans_str_cmp(ptr, ptr)\n";
     // registry rows declare themselves — one row, one declare, one C symbol
+    auto irty = [](BT t) -> const char* {
+        switch (t) {
+            case BT::unit: return "void";
+            case BT::self_recv: return "void";
+            case BT::f64: return "double";
+            case BT::dec: return "ptr";
+            case BT::str: return "ptr";
+            case BT::bytes: return "ptr";
+            case BT::list_str: return "ptr";
+            case BT::opt_i64: return "{i64, i64}";
+            case BT::res_i64:
+            case BT::res_f64:
+            case BT::res_dec:
+            case BT::res_str: return "{i64, ptr}";
+            default: return "i64"; // i64, boolean
+        }
+    };
     for (const BuiltinMethod& b : builtin_methods()) {
-        auto irty = [](BT t) -> const char* {
-            switch (t) {
-                case BT::unit: return "void";
-                case BT::f64: return "double";
-                case BT::dec: return "ptr";
-                case BT::str: return "ptr";
-                case BT::res_i64:
-                case BT::res_f64:
-                case BT::res_dec:
-                case BT::res_str: return "{i64, ptr}";
-                default: return "i64"; // i64, boolean
-            }
-        };
         out += "declare " + std::string(irty(b.ret)) + " @" + b.sym + "(ptr";
         for (BT p : b.params) out += std::string(", ") + irty(p);
+        if (b.panics) out += ", i64, i64";
+        out += ")\n";
+    }
+    for (const BuiltinStatic& b : builtin_statics()) {
+        out += "declare " + std::string(irty(b.ret)) + " @" + b.sym + "(";
+        for (size_t i = 0; i < b.params.size(); i++) {
+            if (i) out += ", ";
+            out += irty(b.params[i]);
+        }
+        if (b.panics) out += std::string(b.params.empty() ? "" : ", ") + "i64, i64";
         out += ")\n";
     }
     out += "declare void @beans_panic(ptr, i64, i64)\n";
@@ -3831,6 +3922,162 @@ BRes beans_str_to_int(char* s) {
     }
     return (BRes){v, NULL};
 }
+
+BRes beans_str_to_float(char* s) {
+    char* end = NULL;
+    double d = strtod(s, &end);
+    if (end == s || *end != '\0') {
+        size_t n = strlen(s) + 32;
+        char* b = malloc(n);
+        snprintf(b, n, "can't read '%s' as float", s);
+        char* m = rc_strdup(b);
+        free(b);
+        return (BRes){0, m};
+    }
+    BRes r;
+    r.msg = NULL;
+    memcpy(&r.val, &d, 8);
+    return r;
+}
+
+// Option-shaped ABI: has 0 = none
+typedef struct {
+    long long val;
+    long long has;
+} BOpt;
+
+// explicit-length string maker; the terminator byte is already zero
+// because every allocation path hands back zeroed memory
+static char* str_make(const char* p, long long n) {
+    char* r = beans_alloc(n + 1, n << 3);
+    memcpy(r, p, (size_t)n);
+    return r;
+}
+
+long long beans_str_is_empty(char* s) { return beans_slen(s) == 0; }
+char* beans_str_first(char* s, long long n) {
+    long long len = beans_slen(s);
+    if (n < 0) n = 0;
+    if (n > len) n = len;
+    return str_make(s, n);
+}
+long long beans_str_starts_with(char* s, char* p) {
+    long long pl = beans_slen(p);
+    return pl <= beans_slen(s) && memcmp(s, p, (size_t)pl) == 0;
+}
+long long beans_str_ends_with(char* s, char* p) {
+    long long n = beans_slen(s), pl = beans_slen(p);
+    return pl <= n && memcmp(s + n - pl, p, (size_t)pl) == 0;
+}
+// empty needle: find says 0, rfind says len — the C++ side agrees
+BOpt beans_str_find(char* s, char* sub) {
+    long long n = beans_slen(s), m = beans_slen(sub);
+    if (m == 0) return (BOpt){0, 1};
+    for (long long i = 0; i + m <= n; i++) {
+        if (memcmp(s + i, sub, (size_t)m) == 0) return (BOpt){i, 1};
+    }
+    return (BOpt){0, 0};
+}
+BOpt beans_str_rfind(char* s, char* sub) {
+    long long n = beans_slen(s), m = beans_slen(sub);
+    if (m == 0) return (BOpt){n, 1};
+    for (long long i = n - m; i >= 0; i--) {
+        if (memcmp(s + i, sub, (size_t)m) == 0) return (BOpt){i, 1};
+    }
+    return (BOpt){0, 0};
+}
+char* beans_str_slice(char* s, long long from, long long to, long long line,
+                      long long col) {
+    long long n = beans_slen(s);
+    if (from < 0 || to < from || to > n) {
+        char m[96];
+        snprintf(m, sizeof m, "slice %lld..%lld out of range (len %lld)", from, to, n);
+        beans_panic(m, line, col);
+    }
+    return str_make(s + from, to - from);
+}
+long long beans_str_byte_at(char* s, long long i, long long line, long long col) {
+    long long n = beans_slen(s);
+    if (i < 0 || i >= n) {
+        char m[80];
+        snprintf(m, sizeof m, "byte index %lld out of range (len %lld)", i, n);
+        beans_panic(m, line, col);
+    }
+    return (long long)(unsigned char)s[i];
+}
+static int str_is_ws(char c) {
+    return c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\f' || c == '\v';
+}
+char* beans_str_trim(char* s) {
+    long long b = 0, e = beans_slen(s);
+    while (b < e && str_is_ws(s[b])) b++;
+    while (e > b && str_is_ws(s[e - 1])) e--;
+    return str_make(s + b, e - b);
+}
+char* beans_str_trim_start(char* s) {
+    long long b = 0, e = beans_slen(s);
+    while (b < e && str_is_ws(s[b])) b++;
+    return str_make(s + b, e - b);
+}
+char* beans_str_trim_end(char* s) {
+    long long e = beans_slen(s);
+    while (e > 0 && str_is_ws(s[e - 1])) e--;
+    return str_make(s, e);
+}
+char* beans_str_to_upper(char* s) {
+    long long n = beans_slen(s);
+    char* r = str_make(s, n);
+    for (long long i = 0; i < n; i++) {
+        if (r[i] >= 'a' && r[i] <= 'z') r[i] = (char)(r[i] - 'a' + 'A');
+    }
+    return r;
+}
+char* beans_str_to_lower(char* s) {
+    long long n = beans_slen(s);
+    char* r = str_make(s, n);
+    for (long long i = 0; i < n; i++) {
+        if (r[i] >= 'A' && r[i] <= 'Z') r[i] = (char)(r[i] - 'A' + 'a');
+    }
+    return r;
+}
+char* beans_str_replace(char* s, char* old, char* nw) {
+    long long n = beans_slen(s), m = beans_slen(old), rl = beans_slen(nw);
+    if (m == 0) return str_make(s, n); // replacing nothing changes nothing
+    long long count = 0;
+    for (long long i = 0; i + m <= n;) {
+        if (memcmp(s + i, old, (size_t)m) == 0) {
+            count++;
+            i += m;
+        } else {
+            i++;
+        }
+    }
+    long long outn = n + count * (rl - m);
+    char* out = beans_alloc(outn + 1, outn << 3);
+    char* w = out;
+    for (long long i = 0; i < n;) {
+        if (i + m <= n && memcmp(s + i, old, (size_t)m) == 0) {
+            memcpy(w, nw, (size_t)rl);
+            w += rl;
+            i += m;
+        } else {
+            *w++ = s[i++];
+        }
+    }
+    return out;
+}
+char* beans_str_repeat(char* s, long long n, long long line, long long col) {
+    if (n < 0) {
+        char m[64];
+        snprintf(m, sizeof m, "negative repeat count %lld", n);
+        beans_panic(m, line, col);
+    }
+    long long len = beans_slen(s);
+    long long outn = len * n;
+    char* out = beans_alloc(outn + 1, outn << 3);
+    for (long long i = 0; i < n; i++) memcpy(out + i * len, s, (size_t)len);
+    return out;
+}
 long long beans_f64_round(double v) { return llround(v); }
 
 // ---- lists ----
@@ -3928,6 +4175,167 @@ long long beans_map_get(BMap* m, long long key, long long kind, long long* ok) {
     long long i = map_find(m, key, kind);
     *ok = i >= 0;
     return i >= 0 ? m->data[i * 2 + 1] : 0;
+}
+
+// ---- string ops that build lists ----
+BList* beans_str_split(char* s, char* sep) {
+    BList* l = beans_list_new(1);
+    long long n = beans_slen(s), m = beans_slen(sep);
+    if (m == 0) { // no separator: the whole string, one piece
+        beans_list_push(l, (long long)str_make(s, n));
+        return l;
+    }
+    long long i = 0;
+    for (long long j = 0; j + m <= n;) {
+        if (memcmp(s + j, sep, (size_t)m) == 0) {
+            beans_list_push(l, (long long)str_make(s + i, j - i));
+            j += m;
+            i = j;
+        } else {
+            j++;
+        }
+    }
+    beans_list_push(l, (long long)str_make(s + i, n - i));
+    return l;
+}
+BList* beans_str_lines(char* s) {
+    BList* l = beans_list_new(1);
+    long long n = beans_slen(s), i = 0;
+    for (long long j = 0; j < n; j++) {
+        if (s[j] == '\n') {
+            beans_list_push(l, (long long)str_make(s + i, j - i));
+            i = j + 1;
+        }
+    }
+    // a trailing newline doesn't make an empty final line
+    if (i < n) beans_list_push(l, (long long)str_make(s + i, n - i));
+    return l;
+}
+
+// ---- Bytes: kind 2 with no element pointers — data freed, never walked ----
+static BList* bytes_mk(long long n) {
+    BList* b = beans_alloc(sizeof(BList), 2);
+    long long cap = n < 8 ? 8 : n;
+    b->data = calloc((size_t)cap, 1);
+    b->len = n;
+    b->cap = cap;
+    return b;
+}
+BList* beans_bytes_new(long long n, long long line, long long col) {
+    if (n < 0) {
+        char m[48];
+        snprintf(m, sizeof m, "negative size %lld", n);
+        beans_panic(m, line, col);
+    }
+    return bytes_mk(n);
+}
+BList* beans_bytes_from(char* s) {
+    long long n = beans_slen(s);
+    BList* b = bytes_mk(n);
+    memcpy(b->data, s, (size_t)n);
+    return b;
+}
+long long beans_bytes_len(BList* b) { return b->len; }
+static void bytes_grow(BList* b, long long need) {
+    if (need <= b->cap) return;
+    long long cap = b->cap;
+    while (cap < need) cap *= 2;
+    b->data = realloc(b->data, (size_t)cap);
+    b->cap = cap;
+}
+void beans_bytes_resize(BList* b, long long n, long long line, long long col) {
+    if (n < 0) {
+        char m[48];
+        snprintf(m, sizeof m, "negative size %lld", n);
+        beans_panic(m, line, col);
+    }
+    bytes_grow(b, n);
+    // regrown range reads as zero, like the interpreter's vector resize
+    if (n > b->len) memset((char*)b->data + b->len, 0, (size_t)(n - b->len));
+    b->len = n;
+}
+void beans_bytes_fill(BList* b, long long v) {
+    memset(b->data, (int)(v & 255), (size_t)b->len);
+}
+static void bytes_oob(long long i, long long len, long long line, long long col) {
+    char m[80];
+    snprintf(m, sizeof m, "byte index %lld out of range (len %lld)", i, len);
+    beans_panic(m, line, col);
+}
+long long beans_bytes_get(BList* b, long long i, long long line, long long col) {
+    if (i < 0 || i >= b->len) bytes_oob(i, b->len, line, col);
+    return (long long)((unsigned char*)b->data)[i];
+}
+void beans_bytes_set(BList* b, long long i, long long v, long long line, long long col) {
+    if (i < 0 || i >= b->len) bytes_oob(i, b->len, line, col);
+    ((unsigned char*)b->data)[i] = (unsigned char)(v & 255);
+}
+static void bytes_woob(const char* what, const char* op, long long pos, long long len,
+                       long long line, long long col) {
+    char m[96];
+    snprintf(m, sizeof m, "%s %s at %lld out of range (len %lld)", what, op, pos, len);
+    beans_panic(m, line, col);
+}
+static long long bytes_getw(BList* b, long long pos, long long w, const char* what,
+                            long long line, long long col) {
+    if (pos < 0 || pos + w > b->len) bytes_woob(what, "read", pos, b->len, line, col);
+    unsigned long long v = 0;
+    memcpy(&v, (char*)b->data + pos, (size_t)w); // little-endian hosts, documented
+    return (long long)v;
+}
+static void bytes_putw(BList* b, long long pos, long long w, long long val,
+                       const char* what, long long line, long long col) {
+    if (pos < 0 || pos + w > b->len) bytes_woob(what, "write", pos, b->len, line, col);
+    unsigned long long v = (unsigned long long)val;
+    memcpy((char*)b->data + pos, &v, (size_t)w);
+}
+long long beans_bytes_get_u8(BList* b, long long p, long long l, long long c) { return bytes_getw(b, p, 1, "u8", l, c); }
+long long beans_bytes_get_u16(BList* b, long long p, long long l, long long c) { return bytes_getw(b, p, 2, "u16", l, c); }
+long long beans_bytes_get_u32(BList* b, long long p, long long l, long long c) { return bytes_getw(b, p, 4, "u32", l, c); }
+long long beans_bytes_get_u64(BList* b, long long p, long long l, long long c) { return bytes_getw(b, p, 8, "u64", l, c); }
+long long beans_bytes_get_i64(BList* b, long long p, long long l, long long c) { return bytes_getw(b, p, 8, "i64", l, c); }
+void beans_bytes_put_u8(BList* b, long long p, long long v, long long l, long long c) { bytes_putw(b, p, 1, v, "u8", l, c); }
+void beans_bytes_put_u16(BList* b, long long p, long long v, long long l, long long c) { bytes_putw(b, p, 2, v, "u16", l, c); }
+void beans_bytes_put_u32(BList* b, long long p, long long v, long long l, long long c) { bytes_putw(b, p, 4, v, "u32", l, c); }
+void beans_bytes_put_u64(BList* b, long long p, long long v, long long l, long long c) { bytes_putw(b, p, 8, v, "u64", l, c); }
+void beans_bytes_put_i64(BList* b, long long p, long long v, long long l, long long c) { bytes_putw(b, p, 8, v, "i64", l, c); }
+BList* beans_bytes_slice(BList* b, long long from, long long to, long long line,
+                         long long col) {
+    if (from < 0 || to < from || to > b->len) {
+        char m[96];
+        snprintf(m, sizeof m, "slice %lld..%lld out of range (len %lld)", from, to,
+                 b->len);
+        beans_panic(m, line, col);
+    }
+    BList* r = bytes_mk(to - from);
+    memcpy(r->data, (char*)b->data + from, (size_t)(to - from));
+    return r;
+}
+void beans_bytes_copy_from(BList* b, BList* src, long long at, long long line,
+                           long long col) {
+    if (at < 0 || at + src->len > b->len) {
+        char m[96];
+        snprintf(m, sizeof m, "copy of %lld bytes at %lld out of range (len %lld)",
+                 src->len, at, b->len);
+        beans_panic(m, line, col);
+    }
+    memcpy((char*)b->data + at, src->data, (size_t)src->len);
+}
+void beans_bytes_append(BList* b, BList* o) {
+    bytes_grow(b, b->len + o->len);
+    memcpy((char*)b->data + b->len, o->data, (size_t)o->len);
+    b->len += o->len;
+}
+void beans_bytes_append_str(BList* b, char* s) {
+    long long n = beans_slen(s);
+    bytes_grow(b, b->len + n);
+    memcpy((char*)b->data + b->len, s, (size_t)n);
+    b->len += n;
+}
+char* beans_bytes_to_string(BList* b) {
+    long long n = 0;
+    while (n < b->len && ((char*)b->data)[n] != 0) n++; // strings are text
+    return str_make((char*)b->data, n);
 }
 
 // ---- threads ----
@@ -4096,6 +4504,65 @@ int beans_dec_cmp(BDec* a, BDec* b) {
     long long s;
     dec_align(a, b, &ca, &cb, &s);
     return ca < cb ? -1 : ca > cb ? 1 : 0;
+}
+// same acceptance rule as the interpreter's dec_valid: [+-]? digits with '_',
+// one optional '.', one optional e/E exponent with its own sign and a digit
+static int dec_valid_c(const char* s) {
+    size_t i = 0;
+    if (s[i] == '+' || s[i] == '-') i++;
+    int digits = 0, dot = 0;
+    for (; s[i]; i++) {
+        char c = s[i];
+        if (c >= '0' && c <= '9') { digits++; continue; }
+        if (c == '_') continue;
+        if (c == '.' && !dot) { dot = 1; continue; }
+        if ((c == 'e' || c == 'E') && digits) {
+            i++;
+            if (s[i] == '+' || s[i] == '-') i++;
+            if (!(s[i] >= '0' && s[i] <= '9')) return 0;
+            while (s[i] >= '0' && s[i] <= '9') i++;
+            return s[i] == '\0';
+        }
+        return 0;
+    }
+    return digits > 0;
+}
+// mirror of Decimal::parse — the two must compute identically
+BRes beans_str_to_decimal(char* s) {
+    if (!dec_valid_c(s)) {
+        size_t n = strlen(s) + 32;
+        char* b = malloc(n);
+        snprintf(b, n, "can't read '%s' as decimal", s);
+        char* m = rc_strdup(b);
+        free(b);
+        return (BRes){0, m};
+    }
+    __int128 coeff = 0;
+    long long scale = 0, exp = 0;
+    int neg = 0, after_dot = 0;
+    size_t i = 0;
+    if (s[i] == '-' || s[i] == '+') {
+        neg = s[i] == '-';
+        i++;
+    }
+    for (; s[i]; i++) {
+        char c = s[i];
+        if (c == '_') continue;
+        if (c == '.') { after_dot = 1; continue; }
+        if (c == 'e' || c == 'E') {
+            exp = strtol(s + i + 1, NULL, 10);
+            break;
+        }
+        coeff = coeff * 10 + (c - '0');
+        if (after_dot) scale += 1;
+    }
+    scale -= exp;
+    if (scale < 0) {
+        coeff *= pow10i(-scale);
+        scale = 0;
+    }
+    if (neg) coeff = -coeff;
+    return (BRes){(long long)dec_mk(coeff, scale), NULL};
 }
 long long beans_dec_to_int(BDec* a) { return (long long)(a->c / pow10i(a->s)); }
 double beans_dec_to_f64(BDec* a) { return (double)a->c / (double)pow10i(a->s); }

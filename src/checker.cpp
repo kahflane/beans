@@ -64,6 +64,27 @@ std::string type_name(TypeId t) {
 
 Checker::Checker(const Program& prog) : prog_(prog) {}
 
+// abstract registry type -> TypeId; recv only matters for self_recv
+TypeId Checker::bt_type(BT t, TypeId recv) {
+    switch (t) {
+        case BT::unit: return t_unit();
+        case BT::i64: return t_int();
+        case BT::f64: return t_f64();
+        case BT::dec: return t_dec();
+        case BT::boolean: return t_bool();
+        case BT::str: return t_str();
+        case BT::bytes: return pool_.named(Type::K::class_, "Bytes");
+        case BT::self_recv: return recv ? recv : t_poison();
+        case BT::opt_i64: return t_option(t_int());
+        case BT::list_str: return pool_.named(Type::K::class_, "List", {t_str()});
+        case BT::res_i64: return t_result(t_int(), t_error_class());
+        case BT::res_f64: return t_result(t_f64(), t_error_class());
+        case BT::res_dec: return t_result(t_dec(), t_error_class());
+        case BT::res_str: return t_result(t_str(), t_error_class());
+    }
+    return t_poison();
+}
+
 void Checker::error_at(uint32_t line, uint32_t col, std::string msg) {
     errors_.push_back({std::move(msg), line, col, cur_file_});
 }
@@ -158,7 +179,7 @@ std::string Checker::as_type_name(const Expr* e) {
         }
         // builtins keep their plain names
         if (builtin_generic_classes_.count(n) || n == "Error" || n == "Option" ||
-            n == "Result" || n == "AtomicInt") {
+            n == "Result" || n == "AtomicInt" || n == "Bytes") {
             return n;
         }
         return "";
@@ -529,6 +550,7 @@ TypeId Checker::resolve_type(const TypeRef* t) {
         if (n == "string") return pool_.prim(Type::K::string_);
         if (n == "Error") return t_error_class();
         if (n == "AtomicInt") return pool_.named(Type::K::class_, "AtomicInt");
+        if (n == "Bytes") return pool_.named(Type::K::class_, "Bytes");
     }
 
     if (n == "Option") {
@@ -1329,28 +1351,15 @@ Checker::Member Checker::builtin_member(TypeId recv, const std::string& name) {
         if (name == "round") return method({t_int()}, recv);
         return none;
     }
-    if (recv->k == Type::K::string_) {
-        // string methods come from the builtin registry (builtins.cpp)
-        auto bt_type = [&](BT t) -> TypeId {
-            switch (t) {
-                case BT::unit: return t_unit();
-                case BT::i64: return t_int();
-                case BT::f64: return t_f64();
-                case BT::dec: return t_dec();
-                case BT::boolean: return t_bool();
-                case BT::str: return t_str();
-                case BT::res_i64: return t_result(t_int(), t_error_class());
-                case BT::res_f64: return t_result(t_f64(), t_error_class());
-                case BT::res_dec: return t_result(t_dec(), t_error_class());
-                case BT::res_str: return t_result(t_str(), t_error_class());
-            }
-            return t_poison();
-        };
+    // string and Bytes methods come from the builtin registry (builtins.cpp)
+    if (recv->k == Type::K::string_ ||
+        (recv->k == Type::K::class_ && recv->name == "Bytes")) {
+        BT want = recv->k == Type::K::string_ ? BT::str : BT::bytes;
         for (const BuiltinMethod& b : builtin_methods()) {
-            if (b.recv == BT::str && name == b.name) {
+            if (b.recv == want && name == b.name) {
                 std::vector<TypeId> ps;
-                for (BT p : b.params) ps.push_back(bt_type(p));
-                return method(std::move(ps), bt_type(b.ret));
+                for (BT p : b.params) ps.push_back(bt_type(p, recv));
+                return method(std::move(ps), bt_type(b.ret, recv));
             }
         }
         return none;
@@ -1722,6 +1731,19 @@ TypeId Checker::check_call(const Expr* e, TypeId expected) {
             if (n == "AtomicInt" && mname == "new") {
                 for (const ExprPtr& a : e->args) check_expr(a.get(), t_int());
                 return pool_.named(Type::K::class_, "AtomicInt");
+            }
+            if (n == "Bytes") {
+                for (const BuiltinStatic& b : builtin_statics()) {
+                    if (mname == b.name) {
+                        std::vector<TypeId> ps;
+                        for (BT p : b.params) ps.push_back(bt_type(p, nullptr));
+                        return check_args_against(ps, bt_type(b.ret, nullptr),
+                                                  "'Bytes." + mname + "'");
+                    }
+                }
+                error_at(e->line, e->col, "Bytes has no static '" + mname + "'");
+                for (const ExprPtr& a : e->args) check_expr(a.get(), nullptr);
+                return t_poison();
             }
 
             // user class static

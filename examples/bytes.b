@@ -1,0 +1,51 @@
+// stdlib phase 1: Bytes — the binary workhorse. Every accessor, the builder
+// chains a database page would use, and the panic at the end.
+import std.io
+
+fn main() {
+    // construction
+    let b: Bytes = Bytes.new(16)
+    io.println("{b.len()}")
+    let hello: Bytes = Bytes.from("hello")
+    io.println("{hello.len()} {hello.get(0)} {hello.get(4)}")
+
+    // single bytes
+    b.set(0, 65).set(1, 66).set(2, 300)
+    io.println("{b.get(0)} {b.get(1)} {b.get(2)}")
+
+    // fixed widths, little-endian, chained like a page header
+    let page: Bytes = Bytes.new(64)
+    page.put_u8(0, 7).put_u16(1, 65535).put_u32(3, 123456789).put_u64(7, 99).put_i64(15, 0 - 5)
+    io.println("{page.get_u8(0)} {page.get_u16(1)} {page.get_u32(3)}")
+    io.println("{page.get_u64(7)} {page.get_i64(15)}")
+    io.println("{page.get_u64(15)}")
+
+    // resize: shrink then regrow reads zeros
+    let r: Bytes = Bytes.new(4)
+    r.fill(255)
+    io.println("{r.get(3)}")
+    r.resize(2).resize(6)
+    io.println("{r.get(0)} {r.get(2)} {r.get(5)} {r.len()}")
+
+    // slice / copy_from / append
+    let word: Bytes = Bytes.from("beans language")
+    let head: Bytes = word.slice(0, 5)
+    io.println(head.to_string())
+    let buf: Bytes = Bytes.new(5)
+    buf.copy_from(head, 0)
+    io.println(buf.to_string())
+    buf.append(Bytes.from("!")).append_str("!!")
+    io.println("{buf.to_string()} {buf.len()}")
+
+    // to_string stops at an embedded NUL — strings are text
+    let z: Bytes = Bytes.new(6)
+    z.set(0, 104).set(1, 105)
+    io.println("{z.to_string()} {z.to_string().len()}")
+
+    // round-trip
+    io.println(Bytes.from("round trip").to_string())
+
+    // a u32 read that hangs off the end panics with the position
+    let boom: int = page.get_u32(62)
+    io.println("{boom}")
+}

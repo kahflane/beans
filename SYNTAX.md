@@ -84,6 +84,27 @@ import gitlab.com/tools/csv as csvlib
 - **There is no `+` for strings.** Building strings happens through interpolation, `std.fmt` (sprintf-style: padding, precision, alignment), or `list.join(sep)`. One way to do it, and it's the readable one.
 - Escapes: `\n \t \r \0 \\ \" \{ \}`.
 
+**Methods (v0.5, implemented, byte-based — unicode arrives later as explicit `chars()`, `len` stays bytes forever):**
+`len`, `is_empty`, `first(n)`, `last(n)`, `slice(from, to)` (half-open, panics out of range),
+`byte_at(i)` (panics), `contains`, `starts_with`, `ends_with`, `find`/`rfind -> Option<int>`
+(empty needle: `find` says 0, `rfind` says len), `trim`/`trim_start`/`trim_end` (ASCII whitespace),
+`to_upper`/`to_lower` (ASCII), `replace(old, new)` (all occurrences; empty `old` changes nothing),
+`repeat(n)` (panics on negative), `split(sep) -> List<string>` (keeps empties; empty sep = one piece),
+`lines() -> List<string>` (a trailing newline makes no empty final line),
+`to_int`/`to_float`/`to_decimal -> Result<...>`.
+
+## Bytes (v0.5, implemented)
+
+The binary buffer — strings stay text; anything binary is `Bytes`. Mutating methods return
+self, so page-building chains work: `Bytes.new(4096).put_u32(0, root).put_u64(8, lsn)`.
+
+- `Bytes.new(n)` (zeroed, panics on negative), `Bytes.from(s)` (copies the text bytes)
+- `len()`, `resize(n)` (regrown range reads zero), `fill(v)`
+- `get(i)` / `set(i, v)` — one byte, panics out of range
+- `get_u8/u16/u32/u64/i64(pos)` / `put_...(pos, v)` — fixed width, little-endian, panics out of range
+- `slice(from, to)`, `copy_from(src, at)`, `append(other)`, `append_str(s)`
+- `to_string()` — as text, stops at an embedded NUL
+
 ## Variables
 
 ```
@@ -413,6 +434,7 @@ import as defer unsafe self true false
 
 ## Decided
 
+- Stdlib v0.5: the string method set and `Bytes` (implemented); byte semantics, panics carry positions, mutators return self for chaining
 - Modules: `beans.mod`, one folder = one package, git imports with a global cache (v0.4, implemented)
 - Block-bodied match arms in statement position (v0.4, implemented)
 - `pub interface` exposes its method set implicitly (v0.4)
