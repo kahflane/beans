@@ -27,9 +27,13 @@ struct TypeRef {
     Kind kind = Kind::named;
     uint32_t line = 0, col = 0;
 
-    // named: Name or Name<args>
+    // named: Name, pkg.Name, or Name<args>
     std::string name;
     std::vector<TypePtr> args;
+
+    // filled by the checker: package-qualified internal name ("util.User").
+    // Later stages (interp, codegen) use it instead of re-resolving imports.
+    mutable std::string resolved;
 
     // fn(params) -> ret
     std::vector<TypePtr> fn_params;
@@ -128,11 +132,18 @@ struct Expr {
     ExprPtr cond, then_e, else_e; // if_expr
     ExprPtr subject;              // match_expr
     std::vector<MatchArm> arms;
+
+    // filled by the checker: package-qualified target for names that cross a
+    // package line — "util.hello" on a call, "util.User" on an init,
+    // "std.io.println" on a std call. Empty = resolve locally as before.
+    mutable std::string resolved;
 };
 
 struct MatchArm {
     PatPtr pat;
-    ExprPtr value;
+    ExprPtr value;              // expression arm
+    std::vector<StmtPtr> body;  // block arm: pattern => { stmts }
+    bool is_block = false;
 };
 
 // ---- statements -----------------------------------------------------------
@@ -179,6 +190,8 @@ struct FnDecl {
     bool has_self = false;
     bool has_body = true; // false = interface signature
     std::string name;
+    std::string qualname; // package-qualified ("util.hello"); loader stamps it,
+                          // root package and single files keep the plain name
     std::vector<GenericParam> generics;
     std::vector<Param> params; // not counting self
     TypePtr ret;               // null = no return value
@@ -198,8 +211,11 @@ struct ClassDecl { // also interfaces (is_interface)
     bool is_pub = false;
     bool is_interface = false;
     std::string name;
+    std::string qualname;
     std::vector<GenericParam> generics;
     std::vector<std::string> supers;
+    // checker fills: supers as package-qualified names, same order as supers
+    mutable std::vector<std::string> supers_resolved;
     std::vector<FieldDecl> fields;
     std::vector<FnDecl> methods;
     uint32_t line = 0, col = 0;
@@ -213,6 +229,7 @@ struct EnumVariant {
 struct EnumDecl {
     bool is_pub = false;
     std::string name;
+    std::string qualname;
     std::vector<GenericParam> generics;
     std::vector<EnumVariant> variants;
     std::vector<FnDecl> methods;
@@ -234,6 +251,31 @@ struct Module {
     // original declaration order for printing: (kind, index into vector above)
     enum class DeclKind { class_, enum_, fn };
     std::vector<std::pair<DeclKind, size_t>> order;
+};
+
+// ---- whole programs (loader output) ----------------------------------------
+
+// One parsed .b file. Owns its source text — the AST's string_views point into
+// it, so PFiles live on the heap and never move.
+struct PFile {
+    std::string path;
+    std::string source;
+    Module mod;
+};
+
+// One package = one directory of .b files sharing a namespace.
+struct Package {
+    std::string prefix;      // qualifier for decls ("util"); root package = ""
+    std::string import_path; // how imports name it ("shop.util", "github.com/x/y")
+    std::string dir;
+    std::vector<std::unique_ptr<PFile>> files;
+};
+
+struct Program {
+    std::string module_name; // from beans.mod; empty = single-file mode
+    std::vector<std::unique_ptr<Package>> packages; // dependencies first, root last
+
+    const Package* root() const { return packages.back().get(); }
 };
 
 // ast_print.cpp — human-readable tree dump

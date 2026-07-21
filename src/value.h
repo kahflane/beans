@@ -214,6 +214,7 @@ struct Env;
 struct ClosureVal {
     const Expr* node = nullptr;        // Expr::Kind::closure
     std::shared_ptr<Env> captured;
+    std::string pkg;                   // package prefix where the closure was made
 };
 
 struct FnRefVal { const FnDecl* decl = nullptr; };

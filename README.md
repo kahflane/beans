@@ -10,12 +10,13 @@ A small OOP language: Java-style objects, Go-sized grammar, C++-level access, bu
 
 | piece | state |
 |---|---|
-| syntax draft | v0.3 |
+| syntax draft | v0.4 |
 | lexer | done |
 | parser | done |
-| type checker | done (v1) |
-| interpreter | done (v1) — `beansc run` |
-| LLVM native backend | v4 — whole language native + reference-counted memory |
+| module loader | done (v5) — `beans.mod`, multi-file packages, git imports |
+| type checker | done (v2) — whole-program, package-aware, `pub` enforced |
+| interpreter | done (v2) — `beansc run` |
+| LLVM native backend | v5 — whole language native + reference-counted memory |
 
 ## Build
 
@@ -30,9 +31,11 @@ make run    # parses the example files
 - `beansc run file.b` — check, then execute (reference interpreter)
 - `beansc build file.b [-o out]` — compile to a native binary via LLVM
 
+`check`/`run`/`build` load the whole program: if a `beans.mod` sits next to the file, every `.b` file in that directory joins the root package, `import shop.util` pulls `util/`, and `import github.com/owner/repo` clones the repo into `~/.beans/src` on first use (`require <path> <tag>` in beans.mod pins a git tag). No beans.mod = plain single file, as before. [examples/shop/](examples/shop/) is a working three-package program.
+
 The interpreter is the reference implementation: exact `decimal` math, real OS threads for `thread.spawn`, real mutexes and blocking channels, `defer`, dynamic dispatch, and runtime panics with line numbers.
 
-The native backend emits textual LLVM IR and hands it to clang — no LLVM library dependency. v3 covers the whole language: classes (vtable dispatch, inheritance, interface defaults, `override`, `as?`), monomorphized generics on classes *and* functions, enums + `match`, Option/Result + `?`, exact `decimal`, lists and maps, closures (lambda-lifted, captured variables live in shared heap cells — mutation works, escaping works), real pthreads for `thread.spawn`/`Mutex`/`Channel`/`AtomicInt`, `defer`, and string interpolation. Every test file produces byte-identical output under `beansc build` and `beansc run` — panics included, same message, same exit code.
+The native backend emits textual LLVM IR and hands it to clang — no LLVM library dependency. It covers the whole language: classes (vtable dispatch, inheritance, interface defaults, `override`, `as?`), monomorphized generics on classes *and* functions, enums + `match` (block-bodied arms included), Option/Result + `?`, exact `decimal`, lists and maps, closures (lambda-lifted, captured variables live in shared heap cells — mutation works, escaping works), real pthreads for `thread.spawn`/`Mutex`/`Channel`/`AtomicInt`, `defer`, string interpolation, and multi-package programs (symbols are package-qualified; cross-package calls, inheritance, generics, and interface dispatch all compile into one flat module). Every test file produces byte-identical output under `beansc build` and `beansc run` — panics included, same message, same exit code.
 
 ## Memory
 

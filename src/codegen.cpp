@@ -196,7 +196,6 @@ struct CImpl {
 // ---- codegen implementation --------------------------------------------------
 
 struct CG2 {
-    const Module& mod;
     std::vector<CGError>& errors;
 
     std::vector<std::unique_ptr<Ty>> ty_pool;
@@ -205,19 +204,57 @@ struct CG2 {
     std::map<std::string, CImpl*> impl_by_name;
     std::vector<CImpl*> impl_queue;
 
+    // keyed by package-qualified names ("util.User"; root plain)
     std::map<std::string, const ClassDecl*> class_decls; // classes + interfaces
     std::map<std::string, const EnumDecl*> enum_decls;
     std::map<std::string, const FnDecl*> fn_decls;
+
+    // package the code being emitted lives in; resolves plain names that the
+    // checker never annotated (string-interpolation segments)
+    std::string cur_pkg;
+    std::map<std::string, std::map<std::string, std::string>> pkg_imports;
+    std::map<std::string, std::string> prefix_by_path;
 
     std::map<std::string, int> selectors;
     std::string globals;
     std::string fn_text;
     int next_str = 0;
 
-    explicit CG2(const Module& m, std::vector<CGError>& errs) : mod(m), errors(errs) {
-        for (const ClassDecl& c : m.classes) class_decls[c.name] = &c;
-        for (const EnumDecl& e : m.enums) enum_decls[e.name] = &e;
-        for (const FnDecl& f : m.fns) fn_decls[f.name] = &f;
+    explicit CG2(const Program& prog, std::vector<CGError>& errs) : errors(errs) {
+        for (const auto& pkg : prog.packages) {
+            prefix_by_path[pkg->import_path] = pkg->prefix;
+            auto& bindings = pkg_imports[pkg->prefix];
+            for (const auto& pf : pkg->files) {
+                for (const ClassDecl& c : pf->mod.classes) class_decls[c.qualname] = &c;
+                for (const EnumDecl& e : pf->mod.enums) enum_decls[e.qualname] = &e;
+                for (const FnDecl& f : pf->mod.fns) fn_decls[f.qualname] = &f;
+                for (const ImportDecl& i : pf->mod.imports) {
+                    std::string bound = i.alias;
+                    if (bound.empty()) {
+                        size_t cut = i.path.find_last_of("./");
+                        bound = cut == std::string::npos ? i.path : i.path.substr(cut + 1);
+                    }
+                    bindings[bound] = i.path;
+                }
+            }
+        }
+    }
+
+    std::string qual(const std::string& n) const {
+        return cur_pkg.empty() ? n : cur_pkg + "." + n;
+    }
+    static std::string pkg_of(const std::string& qualname) {
+        size_t dot = qualname.find('.');
+        return dot == std::string::npos ? "" : qualname.substr(0, dot);
+    }
+    static const std::vector<std::string>& supers_of(const ClassDecl* c) {
+        return c->supers_resolved.empty() ? c->supers : c->supers_resolved;
+    }
+    std::string binding_path(const std::string& binding) const {
+        auto pit = pkg_imports.find(cur_pkg);
+        if (pit == pkg_imports.end()) return "";
+        auto it = pit->second.find(binding);
+        return it == pit->second.end() ? "" : it->second;
     }
 
     void err(uint32_t line, uint32_t col, const std::string& msg) {
@@ -281,7 +318,7 @@ struct CG2 {
     // ---- class instantiation ----
     CImpl* request_impl(const ClassDecl* decl, std::vector<Ty*> targs,
                         uint32_t line, uint32_t col) {
-        std::string mangled = decl->name;
+        std::string mangled = decl->qualname;
         for (Ty* a : targs) mangled += "$" + mangle(a);
         auto it = impl_by_name.find(mangled);
         if (it != impl_by_name.end()) return it->second;
@@ -298,8 +335,12 @@ struct CG2 {
         impls.push_back(std::move(up));
         impl_queue.push_back(im);
 
+        // field types resolve as the class's own code
+        std::string saved_pkg = cur_pkg;
+        cur_pkg = pkg_of(decl->qualname);
+
         // parent chain (single class parent; interfaces carry no fields)
-        for (const std::string& s : decl->supers) {
+        for (const std::string& s : supers_of(decl)) {
             auto cit = class_decls.find(s);
             if (cit != class_decls.end() && !cit->second->is_interface) {
                 im->parent = request_impl(cit->second, {}, line, col);
@@ -315,6 +356,7 @@ struct CG2 {
             fi.offset = 16 + 8 * static_cast<int>(im->fields.size());
             im->fields.push_back(std::move(fi));
         }
+        cur_pkg = saved_pkg;
         return im;
     }
 
@@ -362,22 +404,25 @@ struct CG2 {
                                         : t_error();
             return t_result(ok, e);
         }
-        auto cit = class_decls.find(n);
+        // user types: the checker pinned cross-package names; plain names come
+        // from unannotated code (interpolation segments) and mean cur_pkg
+        const std::string& key = !t->resolved.empty() ? t->resolved : qual(n);
+        auto cit = class_decls.find(key);
         if (cit != class_decls.end()) {
-            if (cit->second->is_interface) return t_obj(n, cit->second);
+            if (cit->second->is_interface) return t_obj(key, cit->second);
             std::vector<Ty*> targs;
             for (const TypePtr& a : t->args)
                 targs.push_back(resolve(a.get(), env, line, col));
             CImpl* im = request_impl(cit->second, std::move(targs), line, col);
             return t_obj(im->mangled);
         }
-        auto enit = enum_decls.find(n);
+        auto enit = enum_decls.find(key);
         if (enit != enum_decls.end()) {
             if (!t->args.empty()) {
                 err(line, col, "generic enums");
                 return t_bad();
             }
-            return t_enum(n, {});
+            return t_enum(key, {});
         }
         err(line, col, "type '" + n + "'");
         return t_bad();
@@ -436,7 +481,7 @@ struct CG2 {
         // interfaces anywhere in the chain
         std::vector<const ClassDecl*> work;
         for (CImpl* c = im; c; c = c->parent) {
-            for (const std::string& s : c->decl->supers) {
+            for (const std::string& s : supers_of(c->decl)) {
                 auto cit = class_decls.find(s);
                 if (cit != class_decls.end() && cit->second->is_interface)
                     work.push_back(cit->second);
@@ -447,10 +492,10 @@ struct CG2 {
             work.pop_back();
             for (const FnDecl& m : ic->methods) {
                 if (m.name == name && m.has_self && (!want_body || m.has_body)) {
-                    return {&m, &empty_env(), ic->name, true};
+                    return {&m, &empty_env(), ic->qualname, true};
                 }
             }
-            for (const std::string& s : ic->supers) {
+            for (const std::string& s : supers_of(ic)) {
                 auto cit = class_decls.find(s);
                 if (cit != class_decls.end()) work.push_back(cit->second);
             }
@@ -463,9 +508,9 @@ struct CG2 {
             const ClassDecl* ic = work.back();
             work.pop_back();
             for (const FnDecl& m : ic->methods) {
-                if (m.name == name && m.has_self) return {&m, &empty_env(), ic->name, true};
+                if (m.name == name && m.has_self) return {&m, &empty_env(), ic->qualname, true};
             }
-            for (const std::string& s : ic->supers) {
+            for (const std::string& s : supers_of(ic)) {
                 auto cit = class_decls.find(s);
                 if (cit != class_decls.end()) work.push_back(cit->second);
             }
@@ -507,7 +552,7 @@ struct CG2 {
     std::set<std::string> fn_emitted;
 
     std::string request_fn(const FnDecl* decl, std::map<std::string, Ty*> env) {
-        std::string sym = "@b_" + decl->name;
+        std::string sym = "@b_" + decl->qualname;
         for (const GenericParam& g : decl->generics) {
             auto it = env.find(g.name);
             sym += "$" + (it != env.end() ? mangle(it->second) : "x");
@@ -683,6 +728,7 @@ struct FreeVars {
                     std::set<std::string> save = bound;
                     pat(a.pat.get());
                     expr(a.value.get());
+                    block(a.body);
                     bound = save;
                 }
                 break;
@@ -746,7 +792,10 @@ struct ClosureScan {
         expr(e->then_e.get());
         expr(e->else_e.get());
         expr(e->subject.get());
-        for (const MatchArm& a : e->arms) expr(a.value.get());
+        for (const MatchArm& a : e->arms) {
+            expr(a.value.get());
+            block(a.body);
+        }
         for (const StmtPtr& s : e->body) stmt(s.get());
     }
 };
@@ -771,6 +820,7 @@ struct FnEmit {
     const std::vector<std::pair<std::string, Ty*>>* captured = nullptr;
 
     std::string allocas, body, entry_inits;
+    std::string pkg; // package prefix this function's source lives in
     int next_reg = 0, next_bb = 0;
     bool terminated = false;
     struct Var {
@@ -1073,9 +1123,9 @@ struct FnEmit {
                 std::string okb = bb(), badb = bb();
                 line("br i1 " + okc + ", label %" + okb + ", label %" + badb);
                 label(badb);
-                std::string msg = cg.intern_string("list index out of range");
-                line("call void @beans_panic(ptr " + msg + ", i64 " +
-                     std::to_string(e->line) + ", i64 " + std::to_string(e->col) + ")");
+                line("call void @beans_panic_index(i64 " + idx.first + ", i64 " + len +
+                     ", i64 1, i64 " + std::to_string(e->line) + ", i64 " +
+                     std::to_string(e->col) + ")");
                 line("unreachable");
                 label(okb);
                 std::string data = load_at(obj.first, 0, cg.t_str()); // ptr
@@ -1175,6 +1225,7 @@ struct FnEmit {
 
         std::string sym = "@clo" + std::to_string(cg.next_clo++);
         FnEmit fe(cg, e, sym, &caps, env);
+        fe.pkg = pkg; // closure body is code of the same package
         cg.lifted += fe.emit();
 
         std::vector<Ty*> sig;
@@ -1399,13 +1450,21 @@ struct FnEmit {
     EV eval_field(const Expr* e) {
         const Expr* obj = e->object.get();
         if (obj->kind == Expr::Kind::ident && !find_var(std::string(obj->text))) {
-            std::string n(obj->text);
             // bare enum variant value: Payment.cash
+            std::string n = obj->resolved.empty() ? cg.qual(std::string(obj->text))
+                                                  : obj->resolved;
             if (cg.enum_decls.count(n)) {
                 int tag = cg.variant_tag(n, e->name);
                 std::string b = box_enum(tag, {});
                 return {b, cg.t_enum(n, {})};
             }
+        }
+        if (obj->kind == Expr::Kind::field && !obj->resolved.empty() &&
+            cg.enum_decls.count(obj->resolved)) {
+            // qualified bare variant: util.Status.active
+            int tag = cg.variant_tag(obj->resolved, e->name);
+            std::string b = box_enum(tag, {});
+            return {b, cg.t_enum(obj->resolved, {})};
         }
         EV v = eval(obj);
         if (v.second->k == Ty::obj_) {
@@ -1468,9 +1527,9 @@ struct FnEmit {
             std::string okb = bb(), badb = bb();
             line("br i1 " + okc + ", label %" + okb + ", label %" + badb);
             label(badb);
-            std::string msg = cg.intern_string("list index out of range");
-            line("call void @beans_panic(ptr " + msg + ", i64 " +
-                 std::to_string(s->line) + ", i64 " + std::to_string(s->col) + ")");
+            line("call void @beans_panic_index(i64 " + idx.first + ", i64 " + len +
+                 ", i64 0, i64 " + std::to_string(s->line) + ", i64 " +
+                 std::to_string(s->col) + ")");
             line("unreachable");
             label(okb);
             EV v = eval(s->value.get(), elem);
@@ -1621,15 +1680,20 @@ struct FnEmit {
         }
 
         CImpl* im = nullptr;
-        if (!e->name.empty()) {
-            auto cit = cg.class_decls.find(e->name);
-            if (cit != cg.class_decls.end()) {
-                std::vector<Ty*> targs;
-                for (const TypePtr& t : e->type_args)
-                    targs.push_back(rt(t.get(), e->line, e->col));
-                im = cg.request_impl(cit->second, std::move(targs), e->line, e->col);
-            }
+        const ClassDecl* cd = nullptr;
+        if (!e->name.empty() || !e->resolved.empty()) {
+            std::string key = e->resolved.empty() ? cg.qual(e->name) : e->resolved;
+            auto cit = cg.class_decls.find(key);
+            if (cit != cg.class_decls.end()) cd = cit->second;
+        }
+        if (cd && e->type_args.size() == cd->generics.size()) {
+            // non-generic, or generic with explicit args — instantiate directly
+            std::vector<Ty*> targs;
+            for (const TypePtr& t : e->type_args)
+                targs.push_back(rt(t.get(), e->line, e->col));
+            im = cg.request_impl(cd, std::move(targs), e->line, e->col);
         } else if (hint && hint->k == Ty::obj_) {
+            // short init / generic with elided args: the declared type's impl
             auto it = cg.impl_by_name.find(hint->name);
             if (it != cg.impl_by_name.end()) im = it->second;
         }
@@ -1696,6 +1760,30 @@ struct FnEmit {
         }
         return s;
     }
+
+    // plain or monomorphized call of a top-level fn, local or from a package
+    EV call_top_fn(const Expr* e, const FnDecl* f) {
+        if (f->generics.empty()) {
+            std::vector<EV> args = eval_args(e, f->params, CG2::empty_env());
+            Ty* ret = cg.resolve(f->ret.get(), CG2::empty_env(), e->line, e->col);
+            return emit_call("@b_" + f->qualname, ret, args_text(args, ""));
+        }
+        // monomorphize: infer the generic params from the argument types
+        std::set<std::string> gens;
+        for (const GenericParam& g : f->generics) gens.insert(g.name);
+        std::vector<EV> args;
+        std::map<std::string, Ty*> fenv;
+        for (size_t i = 0; i < e->args.size(); i++) {
+            EV a = eval(e->args[i].get());
+            if (i < f->params.size()) {
+                cg.unify_tref(f->params[i].type.get(), a.second, gens, fenv);
+            }
+            args.push_back(std::move(a));
+        }
+        std::string sym = cg.request_fn(f, fenv);
+        Ty* ret = cg.resolve(f->ret.get(), fenv, e->line, e->col);
+        return emit_call(sym, ret, args_text(args, ""));
+    }
     EV emit_call(const std::string& target, Ty* ret, const std::string& args) {
         if (ret->k == Ty::unit_) {
             line("call void " + target + "(" + args + ")");
@@ -1750,29 +1838,10 @@ struct FnEmit {
                              : cg.t_i64();
                 return {b, cg.t_result(ok, pty)};
             }
-            auto fit = cg.fn_decls.find(name);
+            auto fit = cg.fn_decls.find(callee->resolved.empty() ? cg.qual(name)
+                                                                 : callee->resolved);
             if (fit != cg.fn_decls.end()) {
-                const FnDecl* f = fit->second;
-                if (f->generics.empty()) {
-                    std::vector<EV> args = eval_args(e, f->params, CG2::empty_env());
-                    Ty* ret = cg.resolve(f->ret.get(), CG2::empty_env(), e->line, e->col);
-                    return emit_call("@b_" + name, ret, args_text(args, ""));
-                }
-                // monomorphize: infer the generic params from the argument types
-                std::set<std::string> gens;
-                for (const GenericParam& g : f->generics) gens.insert(g.name);
-                std::vector<EV> args;
-                std::map<std::string, Ty*> fenv;
-                for (size_t i = 0; i < e->args.size(); i++) {
-                    EV a = eval(e->args[i].get());
-                    if (i < f->params.size()) {
-                        cg.unify_tref(f->params[i].type.get(), a.second, gens, fenv);
-                    }
-                    args.push_back(std::move(a));
-                }
-                std::string sym = cg.request_fn(f, fenv);
-                Ty* ret = cg.resolve(f->ret.get(), fenv, e->line, e->col);
-                return emit_call(sym, ret, args_text(args, ""));
+                return call_top_fn(e, fit->second);
             }
             err(e, "calling '" + name + "'");
             return {"0", cg.t_i64()};
@@ -1787,18 +1856,45 @@ struct FnEmit {
         const Expr* obj = callee->object.get();
         const std::string& mname = callee->name;
 
+        // the checker pinned this call: a std builtin or a package function
+        if (!callee->resolved.empty()) {
+            const std::string& r = callee->resolved;
+            if (r == "std.io.println" || r == "std.io.print") {
+                EV v = eval(e->args[0].get());
+                std::string s = to_str(v, e->args[0].get());
+                line("call void @beans_" + (r == "std.io.println" ? std::string("println")
+                                                                  : std::string("print")) +
+                     "(ptr " + s + ")");
+                return {"", cg.t_unit()};
+            }
+            auto rfit = cg.fn_decls.find(r);
+            if (r != "std.thread.spawn" && rfit != cg.fn_decls.end()) {
+                return call_top_fn(e, rfit->second);
+            }
+        }
+
         if (obj->kind == Expr::Kind::ident && !find_var(std::string(obj->text))) {
             std::string n(obj->text);
-            if (n == "io" && (mname == "println" || mname == "print")) {
+            std::string bpath = cg.binding_path(n);
+            if (bpath == "std.io" && (mname == "println" || mname == "print")) {
                 EV v = eval(e->args[0].get());
                 std::string s = to_str(v, e->args[0].get());
                 line("call void @beans_" + mname + "(ptr " + s + ")");
                 return {"", cg.t_unit()};
             }
+            if (!bpath.empty() && bpath != "std.io" && bpath != "std.thread") {
+                // unannotated package call (string-interpolation segments)
+                auto pfx = cg.prefix_by_path.find(bpath);
+                if (pfx != cg.prefix_by_path.end()) {
+                    auto fit = cg.fn_decls.find(pfx->second + "." + mname);
+                    if (fit != cg.fn_decls.end()) return call_top_fn(e, fit->second);
+                }
+            }
             // enum construction
-            if (cg.enum_decls.count(n)) {
-                const EnumVariant* var = cg.variant_decl(n, mname);
-                int tag = cg.variant_tag(n, mname);
+            std::string en = obj->resolved.empty() ? cg.qual(n) : obj->resolved;
+            if (cg.enum_decls.count(en)) {
+                const EnumVariant* var = cg.variant_decl(en, mname);
+                int tag = cg.variant_tag(en, mname);
                 std::vector<EV> payload;
                 for (size_t i = 0; i < e->args.size(); i++) {
                     Ty* h = var && i < var->payload.size()
@@ -1808,10 +1904,11 @@ struct FnEmit {
                     payload.push_back(eval(e->args[i].get(), h));
                 }
                 std::string b = box_enum(tag, payload);
-                return {b, cg.t_enum(n, {})};
+                return {b, cg.t_enum(en, {})};
             }
             // user class static
-            auto cit = cg.class_decls.find(n);
+            auto cit = cg.class_decls.find(obj->resolved.empty() ? cg.qual(n)
+                                                                 : obj->resolved);
             if (cit != cg.class_decls.end() && !cit->second->is_interface) {
                 CImpl* im = cg.request_impl(cit->second, {}, e->line, e->col);
                 for (const FnDecl& m : cit->second->methods) {
@@ -1823,7 +1920,9 @@ struct FnEmit {
                     }
                 }
             }
-            if (n == "thread" && mname == "spawn") {
+            if ((bpath == "std.thread" ||
+                 (!callee->resolved.empty() && callee->resolved == "std.thread.spawn")) &&
+                mname == "spawn") {
                 EV clo = eval(e->args[0].get());
                 Ty* ret = clo.second->k == Ty::fn_ && clo.second->fn_ret()
                               ? clo.second->fn_ret()
@@ -1880,6 +1979,38 @@ struct FnEmit {
                 line(r + " = call ptr @beans_atomic_new(i64 " + v.first + ")");
                 own(r, cg.t_atomic());
                 return {r, cg.t_atomic()};
+            }
+        }
+
+        // `money.Payment.card(...)` / `money.Money.new(...)` — the receiver is
+        // a field expression the checker resolved to a type
+        if (obj->kind == Expr::Kind::field && !obj->resolved.empty()) {
+            const std::string& tn = obj->resolved;
+            if (cg.enum_decls.count(tn)) {
+                const EnumVariant* var = cg.variant_decl(tn, mname);
+                int tag = cg.variant_tag(tn, mname);
+                std::vector<EV> payload;
+                for (size_t i = 0; i < e->args.size(); i++) {
+                    Ty* h = var && i < var->payload.size()
+                                ? cg.resolve(var->payload[i].type.get(), CG2::empty_env(),
+                                             e->line, e->col)
+                                : nullptr;
+                    payload.push_back(eval(e->args[i].get(), h));
+                }
+                std::string b = box_enum(tag, payload);
+                return {b, cg.t_enum(tn, {})};
+            }
+            auto cit = cg.class_decls.find(tn);
+            if (cit != cg.class_decls.end() && !cit->second->is_interface) {
+                CImpl* im = cg.request_impl(cit->second, {}, e->line, e->col);
+                for (const FnDecl& m : cit->second->methods) {
+                    if (m.name == mname && !m.has_self) {
+                        std::vector<EV> args = eval_args(e, m.params, im->env);
+                        Ty* ret = cg.resolve(m.ret.get(), im->env, e->line, e->col);
+                        return emit_call("@s_" + im->mangled + "_" + mname, ret,
+                                         args_text(args, ""));
+                    }
+                }
             }
         }
 
@@ -2398,6 +2529,18 @@ struct FnEmit {
             std::string cond = pattern_cond(arm.pat.get(), subj);
             line("br i1 " + cond + ", label %" + armb + ", label %" + nextb);
             label(armb);
+            if (arm.is_block) {
+                // statement arm: `pattern => { stmts }` — no value to merge.
+                // bindings borrow from the subject box, same as expr arms
+                scopes.emplace_back();
+                bind_pattern(arm.pat.get(), subj);
+                exec_block(arm.body);
+                scopes.pop_back();
+                unit_result = true;
+                if (!terminated) line("br label %" + endb);
+                if (ai + 1 < e->arms.size()) label(nextb);
+                continue;
+            }
             scopes.emplace_back();
             bind_pattern(arm.pat.get(), subj);
             size_t amark = temps.size();
@@ -2792,6 +2935,7 @@ struct FnEmit {
 
     // ---- whole function ----
     std::string emit() {
+        cg.cur_pkg = pkg; // plain names in this body resolve here
         ret_ty = cg.resolve(ret_ref, env, dline, dcol);
 
         // which locals do closures inside this body capture? those get heap cells
@@ -2804,8 +2948,8 @@ struct FnEmit {
         Ty* self_ty = nullptr;
         if (has_self) {
             if (self_impl) self_ty = cg.t_obj(self_impl->mangled);
-            else if (self_iface) self_ty = cg.t_obj(self_iface->name, self_iface);
-            else if (self_enum) self_ty = cg.t_enum(self_enum->name, {});
+            else if (self_iface) self_ty = cg.t_obj(self_iface->qualname, self_iface);
+            else if (self_enum) self_ty = cg.t_enum(self_enum->qualname, {});
         }
 
         std::string header = "define ";
@@ -2890,40 +3034,48 @@ struct FnEmit {
 
 // ---- CodeGen driver ---------------------------------------------------------
 
-CodeGen::CodeGen(const Module& mod) : mod_(mod) {}
+CodeGen::CodeGen(const Program& prog) : prog_(prog) {}
 
 void CodeGen::error_at(uint32_t line, uint32_t col, std::string msg) {
     errors_.push_back({std::move(msg), line, col});
 }
 
 std::string CodeGen::generate() {
-    CG2 cg(mod_, errors_);
+    CG2 cg(prog_, errors_);
 
-    // top-level functions (generic ones are emitted on demand, per call-site types)
-    for (const FnDecl& f : mod_.fns) {
-        if (!f.generics.empty()) continue;
-        FnEmit fe(cg, f, f.name == "main" ? "@main" : "@b_" + f.name, f.name == "main",
-                  nullptr, nullptr, nullptr, CG2::empty_env());
-        cg.fn_text += fe.emit();
-    }
+    for (const auto& pkg : prog_.packages) {
+        for (const auto& pf : pkg->files) {
+            // top-level functions (generic ones are emitted on demand)
+            for (const FnDecl& f : pf->mod.fns) {
+                if (!f.generics.empty()) continue;
+                bool main = f.qualname == "main";
+                FnEmit fe(cg, f, main ? "@main" : "@b_" + f.qualname, main,
+                          nullptr, nullptr, nullptr, CG2::empty_env());
+                fe.pkg = pkg->prefix;
+                cg.fn_text += fe.emit();
+            }
 
-    // enum methods
-    for (const EnumDecl& e : mod_.enums) {
-        for (const FnDecl& m : e.methods) {
-            FnEmit fe(cg, m, "@em_" + e.name + "_" + m.name, false, nullptr, nullptr, &e,
-                      CG2::empty_env());
-            cg.fn_text += fe.emit();
-        }
-    }
+            // enum methods
+            for (const EnumDecl& e : pf->mod.enums) {
+                for (const FnDecl& m : e.methods) {
+                    FnEmit fe(cg, m, "@em_" + e.qualname + "_" + m.name, false,
+                              nullptr, nullptr, &e, CG2::empty_env());
+                    fe.pkg = pkg->prefix;
+                    cg.fn_text += fe.emit();
+                }
+            }
 
-    // interface default methods (emitted once per interface)
-    for (const ClassDecl& c : mod_.classes) {
-        if (!c.is_interface) continue;
-        for (const FnDecl& m : c.methods) {
-            if (!m.has_body || !m.has_self) continue;
-            FnEmit fe(cg, m, "@m_" + c.name + "_" + m.name, false, nullptr, &c, nullptr,
-                      CG2::empty_env());
-            cg.fn_text += fe.emit();
+            // interface default methods (emitted once per interface)
+            for (const ClassDecl& c : pf->mod.classes) {
+                if (!c.is_interface) continue;
+                for (const FnDecl& m : c.methods) {
+                    if (!m.has_body || !m.has_self) continue;
+                    FnEmit fe(cg, m, "@m_" + c.qualname + "_" + m.name, false,
+                              nullptr, &c, nullptr, CG2::empty_env());
+                    fe.pkg = pkg->prefix;
+                    cg.fn_text += fe.emit();
+                }
+            }
         }
     }
 
@@ -2941,6 +3093,7 @@ std::string CodeGen::generate() {
                 if (!m.has_body) continue;
                 std::string sym = (m.has_self ? "@m_" : "@s_") + im->mangled + "_" + m.name;
                 FnEmit fe(cg, m, sym, false, im, nullptr, nullptr, im->env);
+                fe.pkg = CG2::pkg_of(im->decl->qualname);
                 cg.fn_text += fe.emit();
             }
             continue;
@@ -2956,6 +3109,7 @@ std::string CodeGen::generate() {
         std::string fsym = cg.fn_queue[fidx].symbol;
         cg.fn_emitted.insert(fsym);
         FnEmit fe(cg, *fdecl, fsym, false, nullptr, nullptr, nullptr, fenv);
+        fe.pkg = CG2::pkg_of(fdecl->qualname);
         cg.fn_text += fe.emit();
     }
 
@@ -3011,6 +3165,7 @@ std::string CodeGen::generate() {
     out += "declare i64 @beans_str_contains(ptr, ptr)\n";
     out += "declare i64 @beans_parse_int(ptr, ptr)\n";
     out += "declare void @beans_panic(ptr, i64, i64)\n";
+    out += "declare void @beans_panic_index(i64, i64, i64, i64, i64)\n";
     out += "declare i64 @beans_is_a(i64, i64)\n";
     out += "declare ptr @beans_list_new(i64)\n";
     out += "declare void @beans_list_push(ptr, i64)\n";
@@ -3163,6 +3318,14 @@ void beans_release(void* p) {
 void beans_panic(const char* msg, long long line, long long col) {
     fprintf(stderr, "runtime panic at %lld:%lld: %s\n", line, col, msg);
     exit(3);
+}
+// list bounds — message matches the interpreter's, index and length included
+void beans_panic_index(long long i, long long len, long long has_len,
+                       long long line, long long col) {
+    char b[96];
+    if (has_len) snprintf(b, sizeof b, "list index %lld out of range (len %lld)", i, len);
+    else snprintf(b, sizeof b, "list index %lld out of range", i);
+    beans_panic(b, line, col);
 }
 
 // ---- strings (leaf allocations) ----

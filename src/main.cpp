@@ -16,6 +16,7 @@
 #include "codegen.h"
 #include "interp.h"
 #include "lexer.h"
+#include "loader.h"
 #include "parser.h"
 
 namespace {
@@ -82,33 +83,40 @@ int cmd_parse(const char* path) {
     return total_errors == 0 ? 0 : 1;
 }
 
-int cmd_check(const char* path) {
-    std::string source;
-    if (!read_file(path, source)) {
-        std::fprintf(stderr, "error: can't open %s\n", path);
-        return 1;
+// load the whole program (beans.mod, packages, git imports) behind `path`.
+// prints every load/parse error; returns false if anything failed.
+bool load_program(const char* path, beans::Loader& loader) {
+    bool ok = loader.load(path);
+    for (const beans::LoadError& e : loader.errors()) {
+        if (!e.file.empty() && e.line) {
+            std::fprintf(stderr, "%s:%u:%u: error: %s\n", e.file.c_str(), e.line, e.col,
+                         e.msg.c_str());
+        } else if (!e.file.empty()) {
+            std::fprintf(stderr, "%s: error: %s\n", e.file.c_str(), e.msg.c_str());
+        } else {
+            std::fprintf(stderr, "error: %s\n", e.msg.c_str());
+        }
     }
-    beans::Lexer lexer(source);
-    std::vector<beans::Token> tokens = lexer.scan_all();
-    for (const beans::LexError& e : lexer.errors()) {
-        std::fprintf(stderr, "%s:%u:%u: error: %s\n", path, e.line, e.col, e.msg.c_str());
-    }
+    return ok;
+}
 
-    beans::Parser parser(std::move(tokens));
-    beans::Module mod = parser.parse_module();
-    for (const beans::ParseError& e : parser.errors()) {
-        std::fprintf(stderr, "%s:%u:%u: error: %s\n", path, e.line, e.col, e.msg.c_str());
+void print_check_errors(const char* path, const beans::Checker& checker) {
+    for (const beans::CheckError& e : checker.errors()) {
+        const char* f = e.file.empty() ? path : e.file.c_str();
+        std::fprintf(stderr, "%s:%u:%u: error: %s\n", f, e.line, e.col, e.msg.c_str());
     }
-    if (!lexer.errors().empty() || !parser.errors().empty()) {
+}
+
+int cmd_check(const char* path) {
+    beans::Loader loader;
+    if (!load_program(path, loader)) {
         std::fprintf(stderr, "%s: stopped before type checking\n", path);
         return 1;
     }
 
-    beans::Checker checker(mod);
+    beans::Checker checker(loader.program());
     checker.run();
-    for (const beans::CheckError& e : checker.errors()) {
-        std::fprintf(stderr, "%s:%u:%u: error: %s\n", path, e.line, e.col, e.msg.c_str());
-    }
+    print_check_errors(path, checker);
     if (checker.errors().empty()) {
         std::printf("%s: ok\n", path);
         return 0;
@@ -118,60 +126,28 @@ int cmd_check(const char* path) {
 }
 
 int cmd_run(const char* path) {
-    std::string source;
-    if (!read_file(path, source)) {
-        std::fprintf(stderr, "error: can't open %s\n", path);
-        return 1;
-    }
-    beans::Lexer lexer(source);
-    std::vector<beans::Token> tokens = lexer.scan_all();
-    for (const beans::LexError& e : lexer.errors()) {
-        std::fprintf(stderr, "%s:%u:%u: error: %s\n", path, e.line, e.col, e.msg.c_str());
-    }
-    beans::Parser parser(std::move(tokens));
-    beans::Module mod = parser.parse_module();
-    for (const beans::ParseError& e : parser.errors()) {
-        std::fprintf(stderr, "%s:%u:%u: error: %s\n", path, e.line, e.col, e.msg.c_str());
-    }
-    if (!lexer.errors().empty() || !parser.errors().empty()) return 1;
+    beans::Loader loader;
+    if (!load_program(path, loader)) return 1;
 
-    beans::Checker checker(mod);
+    beans::Checker checker(loader.program());
     checker.run();
-    for (const beans::CheckError& e : checker.errors()) {
-        std::fprintf(stderr, "%s:%u:%u: error: %s\n", path, e.line, e.col, e.msg.c_str());
-    }
+    print_check_errors(path, checker);
     if (!checker.errors().empty()) return 1;
 
-    beans::Interp interp(mod);
+    beans::Interp interp(loader.program());
     return interp.run();
 }
 
 int cmd_build(const char* path, const char* out_path) {
-    std::string source;
-    if (!read_file(path, source)) {
-        std::fprintf(stderr, "error: can't open %s\n", path);
-        return 1;
-    }
-    beans::Lexer lexer(source);
-    std::vector<beans::Token> tokens = lexer.scan_all();
-    for (const beans::LexError& e : lexer.errors()) {
-        std::fprintf(stderr, "%s:%u:%u: error: %s\n", path, e.line, e.col, e.msg.c_str());
-    }
-    beans::Parser parser(std::move(tokens));
-    beans::Module mod = parser.parse_module();
-    for (const beans::ParseError& e : parser.errors()) {
-        std::fprintf(stderr, "%s:%u:%u: error: %s\n", path, e.line, e.col, e.msg.c_str());
-    }
-    if (!lexer.errors().empty() || !parser.errors().empty()) return 1;
+    beans::Loader loader;
+    if (!load_program(path, loader)) return 1;
 
-    beans::Checker checker(mod);
+    beans::Checker checker(loader.program());
     checker.run();
-    for (const beans::CheckError& e : checker.errors()) {
-        std::fprintf(stderr, "%s:%u:%u: error: %s\n", path, e.line, e.col, e.msg.c_str());
-    }
+    print_check_errors(path, checker);
     if (!checker.errors().empty()) return 1;
 
-    beans::CodeGen cg(mod);
+    beans::CodeGen cg(loader.program());
     std::string ir = cg.generate();
     for (const beans::CGError& e : cg.errors()) {
         std::fprintf(stderr, "%s:%u:%u: error: %s\n", path, e.line, e.col, e.msg.c_str());

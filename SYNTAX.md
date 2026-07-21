@@ -1,7 +1,7 @@
-# beans syntax — draft 0.3
+# beans syntax — draft 0.4
 
 Language: **beans** · extension: **.b** · status: draft for discussion
-Toolchain status: **lexer + parser + checker + interpreter implemented** (`beansc run file.b` works)
+Toolchain status: **lexer + parser + loader + checker + interpreter + native backend implemented** — including multi-file modules and git imports
 
 ## What beans is for
 
@@ -38,23 +38,35 @@ enum Result<T, E> {
 
 Rust capitalizes `Some`/`Ok` because Rust variants are PascalCase. Beans variants are snake_case, so lowercase is the consistent choice, not an accident.
 
-## Files, modules, imports
+## Files, modules, imports (implemented, v0.4)
 
-- One folder = one package. `.b` files in it share the package.
+- One folder = one package. `.b` files in it share the package — no import needed between them.
 - Everything is private to its package unless marked `pub`.
-- Entry point: `fn main()`.
+- Entry point: `fn main()`, in the module root.
 
-Imports are Go-style — std by dot path, libraries straight from a git host:
+A module is a directory tree with a `beans.mod` at its root:
+
+```
+module shop
+require github.com/acme/http v1.2    // optional git tag pins
+```
+
+Imports are Go-style — std by dot path, local packages by module path, libraries straight from a git host:
 
 ```
 import std.io
 import std.thread
-import github.com/acme/http
+import shop.util                     // <root>/util/*.b, used as util.thing
+import shop.money.fx                 // nested: <root>/money/fx/
+import github.com/acme/http          // cloned to ~/.beans/src on first build
 import gitlab.com/tools/csv as csvlib
 ```
 
-- Last path segment is the name you use (`http.get(...)`). `as` renames.
-- Versions are pinned in `beans.mod` at the repo root (created/updated by the toolchain). First build fetches and caches globally. `beans.lock` records exact hashes.
+- Last path segment is the name you use (`http.get(...)`). `as` renames the binding.
+- Cross-package access: `util.some_fn()`, `util.User`, `util.User.new(...)`, `util.color.red` — anything `pub`. Methods of a `pub interface` travel with it (an interface is its method set).
+- A git import needs `host/owner/repo`; the repo must carry its own `beans.mod`. First build clones (`--depth 1`, `--branch` if pinned) into `$BEANS_HOME/src` (default `~/.beans/src`) and reuses the cache after.
+- No `beans.mod` above the file = single-file mode: `std.*` and git imports still work, local packages don't.
+- Two packages can't share a final name in one program (`a/json` + `b/json`) — rename one directory. `beans.lock` with exact hashes: later.
 
 ## Lexical
 
@@ -322,6 +334,20 @@ match code {
 }
 ```
 
+**Statement position** additionally allows block arms — several statements, no value (v0.4):
+
+```
+match ch.recv() {
+    some(v) => {
+        total += v
+        io.println("got {v}")
+    }
+    none => { break }
+}
+```
+
+The `{` must follow `=>` on the same line. A block arm in value position is an error — same rule as if. (Corner case: a map literal as an arm *value* needs parens, `x => ({"a": 1})`.)
+
 ## Generics
 
 Monomorphized (a real copy per type, like C++ templates — this is a speed feature):
@@ -386,6 +412,9 @@ import as defer unsafe self true false
 
 ## Decided
 
+- Modules: `beans.mod`, one folder = one package, git imports with a global cache (v0.4, implemented)
+- Block-bodied match arms in statement position (v0.4, implemented)
+- `pub interface` exposes its method set implicitly (v0.4)
 - Explicit types everywhere, no inference (v0.2) — match bindings relaxed in v0.3
 - Short init `= {}` when the left side states the type (v0.3)
 - No `+` on strings — interpolation / `std.fmt` / `join` only (v0.3)

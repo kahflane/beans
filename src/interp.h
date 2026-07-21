@@ -17,11 +17,15 @@ struct BeansPanic {
     uint32_t line = 0, col = 0;
 };
 
-// Tree-walking interpreter. Assumes the module already passed the checker —
-// it does not re-validate types, it just runs.
+// Tree-walking interpreter. Assumes the program already passed the checker —
+// it does not re-validate types, it just runs. Global tables are keyed by
+// package-qualified names; the checker's AST annotations (Expr::resolved,
+// TypeRef::resolved) carry cross-package references, and a per-thread
+// current-package prefix resolves plain names (needed for string-interpolation
+// segments, which are parsed here and never saw the checker).
 class Interp {
 public:
-    explicit Interp(const Module& mod);
+    explicit Interp(const Program& prog);
 
     // find fn main and run it. returns the process exit code.
     int run();
@@ -46,8 +50,9 @@ private:
         const TypeRef* arg(size_t i) const;
     };
 
-    // execution
-    Value call_fn(const FnDecl* fn, Value* self, std::vector<Value> args);
+    // execution; pkg = package prefix the function's body lives in
+    Value call_fn(const FnDecl* fn, Value* self, std::vector<Value> args,
+                  const std::string& pkg);
     Value call_closure(const ClosureVal& c, std::vector<Value> args);
     void exec_block(const std::vector<StmtPtr>& body, std::shared_ptr<Env> env);
     void exec_stmt(const Stmt* s, std::shared_ptr<Env>& env);
@@ -75,10 +80,19 @@ private:
     Value make_instance(const ClassDecl* cls,
                         const std::vector<InitEntry>& entries,
                         std::shared_ptr<Env>& env);
-    const FnDecl* find_method(const ClassDecl* cls, const std::string& name) const;
+    const FnDecl* find_method(const ClassDecl* cls, const std::string& name,
+                              const ClassDecl** owner = nullptr) const;
     const ClassDecl* find_class(const std::string& name) const;
     bool class_is(const ClassDecl* cls, const std::string& super) const;
     void collect_fields(const ClassDecl* cls, std::vector<const FieldDecl*>& out) const;
+
+    // package-aware resolution: annotation first, else the running package
+    std::string qual(const std::string& name) const;
+    static std::string pkg_of(const std::string& qualname);
+    const ClassDecl* resolve_class(const Expr* annotated, const std::string& name) const;
+    const EnumDecl* resolve_enum(const Expr* annotated, const std::string& name) const;
+    // import binding of the running package -> import path ("" if none)
+    std::string binding_path(const std::string& binding) const;
 
     Value coerce_arg(Value v, const TypeRef* want);
     static bool value_eq(const Value& a, const Value& b);
@@ -98,11 +112,13 @@ private:
     };
     const std::vector<StrPart>& string_parts(const Expr* e);
 
-    const Module& mod_;
+    // keyed by package-qualified names ("util.User"; root plain)
     std::map<std::string, const ClassDecl*> classes_;
     std::map<std::string, const EnumDecl*> enums_;
     std::map<std::string, const FnDecl*> fns_;
-    std::map<std::string, std::string> pkg_paths_;
+    // per package prefix: import binding -> import path (merged over its files)
+    std::map<std::string, std::map<std::string, std::string>> pkg_imports_;
+    std::map<std::string, std::string> prefix_by_path_;
 
     std::mutex str_cache_mu_;
     std::map<const Expr*, std::vector<StrPart>> str_cache_;

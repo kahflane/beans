@@ -147,11 +147,22 @@ ImportDecl Parser::parse_import() {
     d.line = kw.line;
     d.col = kw.col;
 
-    std::string path;
-    if (check(TokenKind::ident)) {
-        path.append(cur().text);
+    // one path segment; repo names like `beans-test` lex as ident-minus-ident
+    auto segment = [&](std::string& out) {
+        if (!check(TokenKind::ident)) return false;
+        out.append(cur().text);
         advance();
-    } else {
+        while (check(TokenKind::minus) && next().kind == TokenKind::ident) {
+            advance();
+            out.push_back('-');
+            out.append(cur().text);
+            advance();
+        }
+        return true;
+    };
+
+    std::string path;
+    if (!segment(path)) {
         error_at(cur(), "expected import path");
         sync_stmt();
         return d;
@@ -159,10 +170,7 @@ ImportDecl Parser::parse_import() {
     while (check(TokenKind::dot) || check(TokenKind::slash)) {
         path.push_back(check(TokenKind::dot) ? '.' : '/');
         advance();
-        if (check(TokenKind::ident)) {
-            path.append(cur().text);
-            advance();
-        } else {
+        if (!segment(path)) {
             error_at(cur(), "expected name after separator in import path");
             break;
         }
@@ -220,13 +228,21 @@ ClassDecl Parser::parse_class(bool is_pub, bool is_interface) {
     } else {
         error_at(cur(), is_interface ? "expected interface name" : "expected class name");
     }
+    c.qualname = c.name;
     if (check(TokenKind::lt)) c.generics = parse_generics();
 
     if (accept(TokenKind::colon)) {
         do {
             if (check(TokenKind::ident)) {
-                c.supers.push_back(std::string(cur().text));
+                std::string super(cur().text);
                 advance();
+                if (check(TokenKind::dot) && next().kind == TokenKind::ident) {
+                    advance();
+                    super += '.';
+                    super += std::string(cur().text);
+                    advance();
+                }
+                c.supers.push_back(std::move(super));
             } else {
                 error_at(cur(), "expected parent name after ':'");
                 break;
@@ -276,6 +292,7 @@ EnumDecl Parser::parse_enum(bool is_pub) {
     } else {
         error_at(cur(), "expected enum name");
     }
+    e.qualname = e.name;
     if (check(TokenKind::lt)) e.generics = parse_generics();
 
     expect(TokenKind::lbrace, "'{'");
@@ -337,6 +354,7 @@ FnDecl Parser::parse_fn(bool is_pub, bool is_override, bool allow_no_body) {
     } else {
         error_at(cur(), "expected function name");
     }
+    f.qualname = f.name;
     if (check(TokenKind::lt)) f.generics = parse_generics();
 
     expect(TokenKind::lparen, "'('");
@@ -439,6 +457,13 @@ TypePtr Parser::parse_type() {
     if (check(TokenKind::ident)) {
         t->name = std::string(cur().text);
         advance();
+        // package-qualified type: `util.User`
+        if (check(TokenKind::dot) && next().kind == TokenKind::ident) {
+            advance();
+            t->name += '.';
+            t->name += std::string(cur().text);
+            advance();
+        }
     } else {
         error_at(cur(), "expected type");
         return t;
@@ -803,37 +828,45 @@ ExprPtr Parser::parse_primary() {
             e->text = t.text;
             advance();
 
-            // `Name { ... }` initializer
-            if (check(TokenKind::lbrace) && allow_struct_) {
-                advance();
-                return parse_init_body(std::string(t.text), {}, t);
-            }
-
-            // `Name<T, U> { ... }` — speculative: only commit if the type
-            // args parse cleanly AND a `{` follows. otherwise `<` is less-than.
-            if (check(TokenKind::lt) && allow_struct_) {
+            if (allow_struct_) {
+                // `Name {` / `pkg.Name {` / `Name<T> {` / `pkg.Name<T> {`
+                // initializers. Speculative: rewind fully if no `{` commits,
+                // so `pkg.field` stays a field access and `<` a comparison.
                 size_t save_pos = pos_;
                 size_t save_errs = errors_.size();
-                advance(); // <
-                std::vector<TypePtr> targs;
-                bool ok = true;
-                do {
-                    if (!check(TokenKind::ident) && !check(TokenKind::kw_fn)) {
-                        ok = false;
-                        break;
-                    }
-                    targs.push_back(parse_type());
-                } while (accept(TokenKind::comma));
-                if (ok && errors_.size() == save_errs &&
-                    (check(TokenKind::gt) || check(TokenKind::shr))) {
-                    expect_close_angle();
-                    if (check(TokenKind::lbrace) && errors_.size() == save_errs) {
-                        advance();
-                        return parse_init_body(std::string(t.text),
-                                               std::move(targs), t);
+                std::string init_name(t.text);
+                if (check(TokenKind::dot) && next().kind == TokenKind::ident) {
+                    advance();
+                    init_name += '.';
+                    init_name += std::string(cur().text);
+                    advance();
+                }
+                if (check(TokenKind::lbrace)) {
+                    advance();
+                    return parse_init_body(std::move(init_name), {}, t);
+                }
+                if (check(TokenKind::lt)) {
+                    advance(); // <
+                    std::vector<TypePtr> targs;
+                    bool ok = true;
+                    do {
+                        if (!check(TokenKind::ident) && !check(TokenKind::kw_fn)) {
+                            ok = false;
+                            break;
+                        }
+                        targs.push_back(parse_type());
+                    } while (accept(TokenKind::comma));
+                    if (ok && errors_.size() == save_errs &&
+                        (check(TokenKind::gt) || check(TokenKind::shr))) {
+                        expect_close_angle();
+                        if (check(TokenKind::lbrace) && errors_.size() == save_errs) {
+                            advance();
+                            return parse_init_body(std::move(init_name),
+                                                   std::move(targs), t);
+                        }
                     }
                 }
-                // not an initializer — rewind, `<` was a comparison
+                // not an initializer
                 pos_ = save_pos;
                 errors_.resize(save_errs);
             }
@@ -932,6 +965,18 @@ ExprPtr Parser::parse_match_expr() {
         MatchArm arm;
         arm.pat = parse_pattern();
         expect(TokenKind::fat_arrow, "'=>'");
+        if (check(TokenKind::lbrace)) {
+            // block arm: `pattern => { stmts }` — statement matches only; the
+            // checker rejects it where the match must produce a value. A map
+            // literal as an arm value needs parens: `x => ({"a": 1})`.
+            arm.is_block = true;
+            arm.body = parse_block();
+            e->arms.push_back(std::move(arm));
+            skip_newlines();
+            accept(TokenKind::comma); // optional after a block
+            skip_newlines();
+            continue;
+        }
         {
             StructGuard g(*this, true);
             skip_newlines();

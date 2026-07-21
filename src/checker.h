@@ -14,6 +14,7 @@ struct CheckError {
     std::string msg;
     uint32_t line;
     uint32_t col;
+    std::string file; // which file of the program; empty in single-file runs
 };
 
 // Semantic info for a user class or interface.
@@ -36,9 +37,15 @@ struct EnumInfo {
     std::map<std::string, const FnDecl*> method_decls;
 };
 
+// Whole-program checker. Every declaration is registered under its
+// package-qualified name ("util.User"); the root package's prefix is empty, so
+// single-file programs behave exactly as before. Cross-package references are
+// resolved here once and written into the AST (Expr::resolved,
+// TypeRef::resolved, ClassDecl::supers_resolved) so the interpreter and
+// codegen never look at imports.
 class Checker {
 public:
-    explicit Checker(const Module& mod);
+    explicit Checker(const Program& prog);
 
     void run();
     const std::vector<CheckError>& errors() const { return errors_; }
@@ -48,10 +55,28 @@ private:
     void register_builtins();
     void register_decls();     // pass 1: names + signatures
     void check_bodies();       // pass 2
+    void enter_file(const Package& pkg, const PFile& file); // sets context
+
+    // ---- package-aware name resolution ----
+    // key of a plain name in the current package ("util.User" / "User")
+    std::string qual(const std::string& name) const;
+    // source name -> internal key; handles "Name" and "pkg.Name" via the
+    // current file's imports. Reports pub violations. "" = not found.
+    std::string resolve_class_key(const std::string& n, uint32_t line, uint32_t col);
+    std::string resolve_enum_key(const std::string& n, uint32_t line, uint32_t col);
+    std::string resolve_fn_key(const std::string& n);
+    // does `e` name a type (`Status`, `util.User`)? returns its key and
+    // annotates e->resolved; "" otherwise
+    std::string as_type_name(const Expr* e);
+    // import binding of the current file? returns its path ("" if not)
+    std::string import_path_of(const std::string& binding) const;
+    bool check_pub(const std::string& key, bool is_pub, uint32_t line, uint32_t col,
+                   const char* what, const std::string& shown);
 
     // ---- declarations ----
     void resolve_class_members(ClassInfo& c);
     void resolve_enum_members(EnumInfo& e);
+    void resolve_supers(ClassInfo& c);
     void check_hierarchy(ClassInfo& c);
     void check_fn_body(const FnDecl& f, ClassInfo* cls, EnumInfo* en);
 
@@ -72,7 +97,7 @@ private:
     TypeId check_call(const Expr* e, TypeId expected);
     TypeId check_init(const Expr* e, TypeId expected);
     TypeId check_field(const Expr* e, bool for_call, TypeId* self_type_out);
-    TypeId check_match(const Expr* e, TypeId expected);
+    TypeId check_match(const Expr* e, TypeId expected, bool as_stmt = false);
     TypeId check_binary(const Expr* e);
     TypeId literal_or(const Expr* e, TypeId expected, TypeId dflt);
     bool is_adaptable_literal(const Expr* e);
@@ -84,7 +109,8 @@ private:
         TypeId type = nullptr;   // field type or fn type
         bool is_static = false;
     };
-    Member lookup_member(TypeId recv, const std::string& name);
+    Member lookup_member(TypeId recv, const std::string& name,
+                         uint32_t line = 0, uint32_t col = 0);
     Member builtin_member(TypeId recv, const std::string& name);
     TypeId class_type_of(const ClassInfo& c); // self type incl. own params
 
@@ -98,20 +124,25 @@ private:
     void error_at(uint32_t line, uint32_t col, std::string msg);
 
     // ---- state ----
-    const Module& mod_;
+    const Program& prog_;
     TypePool pool_;
     std::vector<CheckError> errors_;
 
+    // keys are package-qualified names ("util.User"; root/builtins plain)
     std::map<std::string, ClassInfo> classes_;
     std::map<std::string, EnumInfo> enums_;
     std::map<std::string, TypeId> top_fns_;
     std::map<std::string, const FnDecl*> top_fn_decls_;
-    std::map<std::string, std::string> pkg_paths_; // bound name -> import path
     std::set<std::string> builtin_generic_classes_; // List, Map, Thread, Mutex, Channel
+
+    std::map<std::string, std::string> prefix_by_path_; // import path -> pkg prefix
 
     std::vector<std::map<std::string, Local>> scopes_;
 
     // current context
+    std::string cur_pkg_;  // prefix of the package being checked ("" = root)
+    std::string cur_file_;
+    std::map<std::string, std::string> pkg_paths_; // current file: binding -> import path
     ClassInfo* cur_class_ = nullptr;
     EnumInfo* cur_enum_ = nullptr;
     TypeId cur_ret_ = nullptr;

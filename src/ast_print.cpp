@@ -170,8 +170,13 @@ std::string expr_str(const Expr* e, int depth) {
         case Expr::Kind::match_expr: {
             std::string s = "match " + expr_str(e->subject.get(), depth) + " {\n";
             for (const MatchArm& a : e->arms) {
-                s += ind(depth + 1) + pattern_str(a.pat.get()) + " => " +
-                     expr_str(a.value.get(), depth + 1) + "\n";
+                s += ind(depth + 1) + pattern_str(a.pat.get()) + " => ";
+                if (a.is_block) {
+                    s += block_str(a.body, depth + 1);
+                } else {
+                    s += expr_str(a.value.get(), depth + 1);
+                }
+                s += "\n";
             }
             s += ind(depth) + "}";
             return s;

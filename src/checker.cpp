@@ -61,10 +61,132 @@ std::string type_name(TypeId t) {
 
 // ---- setup ----------------------------------------------------------------
 
-Checker::Checker(const Module& mod) : mod_(mod) {}
+Checker::Checker(const Program& prog) : prog_(prog) {}
 
 void Checker::error_at(uint32_t line, uint32_t col, std::string msg) {
-    errors_.push_back({std::move(msg), line, col});
+    errors_.push_back({std::move(msg), line, col, cur_file_});
+}
+
+// ---- package-aware name resolution -----------------------------------------
+
+std::string Checker::qual(const std::string& name) const {
+    return cur_pkg_.empty() ? name : cur_pkg_ + "." + name;
+}
+
+void Checker::enter_file(const Package& pkg, const PFile& file) {
+    cur_pkg_ = pkg.prefix;
+    cur_file_ = prog_.packages.size() > 1 || prog_.module_name.size() ? file.path : "";
+    pkg_paths_.clear();
+    for (const ImportDecl& i : file.mod.imports) {
+        std::string bound = i.alias;
+        if (bound.empty()) {
+            size_t cut = i.path.find_last_of("./");
+            bound = cut == std::string::npos ? i.path : i.path.substr(cut + 1);
+        }
+        if (pkg_paths_.count(bound)) {
+            error_at(i.line, i.col, "import name '" + bound + "' used twice");
+        }
+        pkg_paths_[bound] = i.path;
+    }
+}
+
+std::string Checker::import_path_of(const std::string& binding) const {
+    auto it = pkg_paths_.find(binding);
+    return it == pkg_paths_.end() ? "" : it->second;
+}
+
+// key "util.User" -> is it visible from the current package?
+bool Checker::check_pub(const std::string& key, bool is_pub, uint32_t line, uint32_t col,
+                        const char* what, const std::string& shown) {
+    size_t dot = key.find('.');
+    std::string owner = dot == std::string::npos ? "" : key.substr(0, dot);
+    if (owner == cur_pkg_ || is_pub) return true;
+    error_at(line, col, std::string(what) + " '" + shown + "' isn't pub in package '" +
+                            owner + "'");
+    return false;
+}
+
+std::string Checker::resolve_class_key(const std::string& n, uint32_t line, uint32_t col) {
+    size_t dot = n.find('.');
+    if (dot == std::string::npos) {
+        std::string key = qual(n);
+        return classes_.count(key) ? key : "";
+    }
+    std::string path = import_path_of(n.substr(0, dot));
+    if (path.empty()) return "";
+    auto pit = prefix_by_path_.find(path);
+    if (pit == prefix_by_path_.end()) return ""; // std.* or unresolved import
+    std::string key = pit->second + "." + n.substr(dot + 1);
+    auto it = classes_.find(key);
+    if (it == classes_.end()) return "";
+    check_pub(key, it->second.decl && it->second.decl->is_pub, line, col, "type", n);
+    return key;
+}
+
+std::string Checker::resolve_enum_key(const std::string& n, uint32_t line, uint32_t col) {
+    size_t dot = n.find('.');
+    if (dot == std::string::npos) {
+        std::string key = qual(n);
+        return enums_.count(key) ? key : "";
+    }
+    std::string path = import_path_of(n.substr(0, dot));
+    if (path.empty()) return "";
+    auto pit = prefix_by_path_.find(path);
+    if (pit == prefix_by_path_.end()) return "";
+    std::string key = pit->second + "." + n.substr(dot + 1);
+    auto it = enums_.find(key);
+    if (it == enums_.end()) return "";
+    check_pub(key, it->second.decl && it->second.decl->is_pub, line, col, "type", n);
+    return key;
+}
+
+std::string Checker::resolve_fn_key(const std::string& n) {
+    std::string key = qual(n);
+    return top_fns_.count(key) ? key : "";
+}
+
+// `Status` / `util.User` in expression position -> internal key, annotated
+std::string Checker::as_type_name(const Expr* e) {
+    if (e->kind == Expr::Kind::ident) {
+        std::string n(e->text);
+        if (find_local(n)) return "";
+        std::string key = qual(n);
+        if (classes_.count(key) || enums_.count(key)) {
+            e->resolved = key;
+            return key;
+        }
+        // builtins keep their plain names
+        if (builtin_generic_classes_.count(n) || n == "Error" || n == "Option" ||
+            n == "Result" || n == "AtomicInt") {
+            return n;
+        }
+        return "";
+    }
+    if (e->kind == Expr::Kind::field && e->object->kind == Expr::Kind::ident) {
+        std::string base(e->object->text);
+        if (find_local(base)) return "";
+        std::string path = import_path_of(base);
+        if (path.empty()) return "";
+        auto pit = prefix_by_path_.find(path);
+        if (pit == prefix_by_path_.end()) return "";
+        std::string key = pit->second + "." + e->name;
+        auto cit = classes_.find(key);
+        if (cit != classes_.end()) {
+            check_pub(key, cit->second.decl && cit->second.decl->is_pub,
+                      e->line, e->col, "type", base + "." + e->name);
+            e->resolved = key;
+            return key;
+        }
+        auto eit = enums_.find(key);
+        if (eit != enums_.end()) {
+            check_pub(key, eit->second.decl && eit->second.decl->is_pub,
+                      e->line, e->col, "type", base + "." + e->name);
+            e->resolved = key;
+            return key;
+        }
+        return "";
+    }
+    return "";
 }
 
 void Checker::register_builtins() {
@@ -90,71 +212,100 @@ void Checker::register_builtins() {
 
 void Checker::run() {
     register_builtins();
+    for (const auto& pkg : prog_.packages) {
+        prefix_by_path_[pkg->import_path] = pkg->prefix;
+    }
     register_decls();
-    for (auto& [name, c] : classes_) {
-        if (c.decl) check_hierarchy(c);
+    for (const auto& pkg : prog_.packages) {
+        for (const auto& pf : pkg->files) {
+            enter_file(*pkg, *pf);
+            for (const ClassDecl& c : pf->mod.classes) {
+                auto it = classes_.find(c.qualname);
+                if (it != classes_.end() && it->second.decl == &c) check_hierarchy(it->second);
+            }
+        }
     }
     check_bodies();
 }
 
 void Checker::register_decls() {
-    for (const ImportDecl& i : mod_.imports) {
-        std::string bound = i.alias;
-        if (bound.empty()) {
-            size_t cut = i.path.find_last_of("./");
-            bound = cut == std::string::npos ? i.path : i.path.substr(cut + 1);
+    // pass 1a: names (whole program, so cross-package references always land)
+    for (const auto& pkg : prog_.packages) {
+        for (const auto& pf : pkg->files) {
+            enter_file(*pkg, *pf);
+            for (const ClassDecl& c : pf->mod.classes) {
+                if (classes_.count(c.qualname) || enums_.count(c.qualname) ||
+                    builtin_generic_classes_.count(c.name) || c.name == "Error") {
+                    error_at(c.line, c.col, "type name '" + c.name + "' already taken");
+                    continue;
+                }
+                ClassInfo info;
+                info.decl = &c;
+                for (const GenericParam& g : c.generics) info.generic_params.push_back(g.name);
+                classes_[c.qualname] = std::move(info);
+            }
+            for (const EnumDecl& e : pf->mod.enums) {
+                if (classes_.count(e.qualname) || enums_.count(e.qualname) ||
+                    builtin_generic_classes_.count(e.name) || e.name == "Error") {
+                    error_at(e.line, e.col, "type name '" + e.name + "' already taken");
+                    continue;
+                }
+                EnumInfo info;
+                info.decl = &e;
+                for (const GenericParam& g : e.generics) info.generic_params.push_back(g.name);
+                enums_[e.qualname] = std::move(info);
+            }
         }
-        if (pkg_paths_.count(bound)) {
-            error_at(i.line, i.col, "import name '" + bound + "' used twice");
-        }
-        pkg_paths_[bound] = i.path;
     }
 
-    // pass 1a: names
-    for (const ClassDecl& c : mod_.classes) {
-        if (classes_.count(c.name) || enums_.count(c.name) ||
-            builtin_generic_classes_.count(c.name) || c.name == "Error") {
-            error_at(c.line, c.col, "type name '" + c.name + "' already taken");
-            continue;
+    // pass 1b: supers and member signatures, with each file's imports in scope
+    for (const auto& pkg : prog_.packages) {
+        for (const auto& pf : pkg->files) {
+            enter_file(*pkg, *pf);
+            for (const ClassDecl& c : pf->mod.classes) {
+                auto it = classes_.find(c.qualname);
+                if (it != classes_.end() && it->second.decl == &c) {
+                    resolve_supers(it->second);
+                    resolve_class_members(it->second);
+                }
+            }
+            for (const EnumDecl& e : pf->mod.enums) {
+                auto it = enums_.find(e.qualname);
+                if (it != enums_.end() && it->second.decl == &e) {
+                    resolve_enum_members(it->second);
+                }
+            }
+            for (const FnDecl& f : pf->mod.fns) {
+                if (top_fns_.count(f.qualname)) {
+                    error_at(f.line, f.col, "function '" + f.name + "' defined twice");
+                    continue;
+                }
+                cur_type_params_.clear();
+                for (const GenericParam& g : f.generics) cur_type_params_.insert(g.name);
+                std::vector<TypeId> params;
+                for (const Param& p : f.params) params.push_back(resolve_type(p.type.get()));
+                TypeId ret = f.ret ? resolve_type(f.ret.get()) : t_unit();
+                top_fns_[f.qualname] = pool_.fn(std::move(params), ret);
+                top_fn_decls_[f.qualname] = &f;
+                cur_type_params_.clear();
+            }
         }
-        ClassInfo info;
-        info.decl = &c;
-        for (const GenericParam& g : c.generics) info.generic_params.push_back(g.name);
-        info.supers = c.supers;
-        classes_[c.name] = std::move(info);
     }
-    for (const EnumDecl& e : mod_.enums) {
-        if (classes_.count(e.name) || enums_.count(e.name) ||
-            builtin_generic_classes_.count(e.name) || e.name == "Error") {
-            error_at(e.line, e.col, "type name '" + e.name + "' already taken");
-            continue;
-        }
-        EnumInfo info;
-        info.decl = &e;
-        for (const GenericParam& g : e.generics) info.generic_params.push_back(g.name);
-        enums_[e.name] = std::move(info);
-    }
+}
 
-    // pass 1b: member signatures
-    for (auto& [name, c] : classes_) {
-        if (c.decl) resolve_class_members(c);
-    }
-    for (auto& [name, e] : enums_) {
-        if (e.decl) resolve_enum_members(e);
-    }
-    for (const FnDecl& f : mod_.fns) {
-        if (top_fns_.count(f.name)) {
-            error_at(f.line, f.col, "function '" + f.name + "' defined twice");
+// class parents may be local names or `pkg.Name` — pin them to keys once,
+// and write them into the decl for the interpreter and codegen
+void Checker::resolve_supers(ClassInfo& c) {
+    c.supers.clear();
+    c.decl->supers_resolved.clear();
+    for (const std::string& s : c.decl->supers) {
+        std::string key = resolve_class_key(s, c.decl->line, c.decl->col);
+        if (key.empty()) {
+            error_at(c.decl->line, c.decl->col, "unknown parent '" + s + "'");
             continue;
         }
-        cur_type_params_.clear();
-        for (const GenericParam& g : f.generics) cur_type_params_.insert(g.name);
-        std::vector<TypeId> params;
-        for (const Param& p : f.params) params.push_back(resolve_type(p.type.get()));
-        TypeId ret = f.ret ? resolve_type(f.ret.get()) : t_unit();
-        top_fns_[f.name] = pool_.fn(std::move(params), ret);
-        top_fn_decls_[f.name] = &f;
-        cur_type_params_.clear();
+        c.supers.push_back(key);
+        c.decl->supers_resolved.push_back(key);
     }
 }
 
@@ -398,15 +549,19 @@ TypeId Checker::resolve_type(const TypeRef* t) {
         return pool_.named(Type::K::class_, n, resolved_args());
     }
 
-    auto cit = classes_.find(n);
-    if (cit != classes_.end()) {
+    std::string ckey = resolve_class_key(n, t->line, t->col);
+    if (!ckey.empty()) {
+        auto cit = classes_.find(ckey);
         if (!want_args(cit->second.generic_params.size())) return t_poison();
-        return pool_.named(Type::K::class_, n, resolved_args());
+        t->resolved = ckey;
+        return pool_.named(Type::K::class_, ckey, resolved_args());
     }
-    auto eit = enums_.find(n);
-    if (eit != enums_.end()) {
+    std::string ekey = resolve_enum_key(n, t->line, t->col);
+    if (!ekey.empty()) {
+        auto eit = enums_.find(ekey);
         if (!want_args(eit->second.generic_params.size())) return t_poison();
-        return pool_.named(Type::K::enum_, n, resolved_args());
+        t->resolved = ekey;
+        return pool_.named(Type::K::enum_, ekey, resolved_args());
     }
 
     error_at(t->line, t->col, "unknown type '" + n + "'");
@@ -512,40 +667,49 @@ const Checker::Local* Checker::find_local(const std::string& name) const {
 // ---- bodies ----------------------------------------------------------------
 
 void Checker::check_bodies() {
-    for (auto& [name, c] : classes_) {
-        if (!c.decl) continue;
-        for (const FnDecl& m : c.decl->methods) check_fn_body(m, &c, nullptr);
-        // field defaults
-        cur_class_ = &c;
-        cur_type_params_.clear();
-        for (const std::string& g : c.generic_params) cur_type_params_.insert(g);
-        scopes_.clear();
-        push_scope();
-        for (const FieldDecl& f : c.decl->fields) {
-            if (!f.def) continue;
-            TypeId want = c.fields.count(f.name) ? c.fields[f.name] : t_poison();
-            TypeId got = check_expr(f.def.get(), want);
-            if (!assignable(got, want)) {
-                error_at(f.line, f.col, "default value for '" + f.name + "' is " +
-                                            type_name(got) + ", field is " + type_name(want));
+    for (const auto& pkg : prog_.packages) {
+        for (const auto& pf : pkg->files) {
+            enter_file(*pkg, *pf);
+            for (const ClassDecl& cd : pf->mod.classes) {
+                auto cit = classes_.find(cd.qualname);
+                if (cit == classes_.end() || cit->second.decl != &cd) continue;
+                ClassInfo& c = cit->second;
+                for (const FnDecl& m : cd.methods) check_fn_body(m, &c, nullptr);
+                // field defaults
+                cur_class_ = &c;
+                cur_type_params_.clear();
+                for (const std::string& g : c.generic_params) cur_type_params_.insert(g);
+                scopes_.clear();
+                push_scope();
+                for (const FieldDecl& f : cd.fields) {
+                    if (!f.def) continue;
+                    TypeId want = c.fields.count(f.name) ? c.fields[f.name] : t_poison();
+                    TypeId got = check_expr(f.def.get(), want);
+                    if (!assignable(got, want)) {
+                        error_at(f.line, f.col, "default value for '" + f.name + "' is " +
+                                                    type_name(got) + ", field is " +
+                                                    type_name(want));
+                    }
+                }
+                pop_scope();
+                cur_class_ = nullptr;
+                cur_type_params_.clear();
             }
+            for (const EnumDecl& ed : pf->mod.enums) {
+                auto eit = enums_.find(ed.qualname);
+                if (eit == enums_.end() || eit->second.decl != &ed) continue;
+                for (const FnDecl& m : ed.methods) check_fn_body(m, nullptr, &eit->second);
+            }
+            for (const FnDecl& f : pf->mod.fns) check_fn_body(f, nullptr, nullptr);
         }
-        pop_scope();
-        cur_class_ = nullptr;
-        cur_type_params_.clear();
     }
-    for (auto& [name, e] : enums_) {
-        if (!e.decl) continue;
-        for (const FnDecl& m : e.decl->methods) check_fn_body(m, nullptr, &e);
-    }
-    for (const FnDecl& f : mod_.fns) check_fn_body(f, nullptr, nullptr);
 }
 
 TypeId Checker::class_type_of(const ClassInfo& c) {
     std::vector<TypeId> args;
     for (const std::string& g : c.generic_params)
         args.push_back(pool_.named(Type::K::type_param, g));
-    return pool_.named(Type::K::class_, c.decl->name, std::move(args));
+    return pool_.named(Type::K::class_, c.decl->qualname, std::move(args));
 }
 
 void Checker::check_fn_body(const FnDecl& f, ClassInfo* cls, EnumInfo* en) {
@@ -644,7 +808,12 @@ void Checker::check_stmt(const Stmt* s) {
             break;
         }
         case Stmt::Kind::expr:
-            check_expr(s->expr.get(), nullptr);
+            if (s->expr && s->expr->kind == Expr::Kind::match_expr) {
+                // statement match: arms may be blocks, values are dropped
+                check_match(s->expr.get(), nullptr, true);
+            } else {
+                check_expr(s->expr.get(), nullptr);
+            }
             break;
         case Stmt::Kind::ret: {
             if (cur_ret_ == t_unit()) {
@@ -755,7 +924,11 @@ TypeId Checker::check_expr(const Expr* e, TypeId expected) {
         case Expr::Kind::ident: {
             std::string name(e->text);
             if (const Local* l = find_local(name)) return l->type;
-            if (top_fns_.count(name)) return top_fns_[name];
+            std::string fkey = resolve_fn_key(name);
+            if (!fkey.empty()) {
+                e->resolved = fkey;
+                return top_fns_[fkey];
+            }
             if (name == "none") {
                 if (expected && expected->k == Type::K::enum_ && expected->name == "Option")
                     return expected;
@@ -763,7 +936,7 @@ TypeId Checker::check_expr(const Expr* e, TypeId expected) {
                          "can't tell which Option this 'none' is — the spot needs a declared type");
                 return t_poison();
             }
-            if (classes_.count(name) || enums_.count(name) ||
+            if (classes_.count(qual(name)) || enums_.count(qual(name)) ||
                 builtin_generic_classes_.count(name)) {
                 error_at(e->line, e->col, "'" + name + "' is a type, not a value");
                 return t_poison();
@@ -781,7 +954,7 @@ TypeId Checker::check_expr(const Expr* e, TypeId expected) {
                 std::vector<TypeId> args;
                 for (const std::string& g : cur_enum_->generic_params)
                     args.push_back(pool_.named(Type::K::type_param, g));
-                return pool_.named(Type::K::enum_, cur_enum_->decl->name, std::move(args));
+                return pool_.named(Type::K::enum_, cur_enum_->decl->qualname, std::move(args));
             }
             error_at(e->line, e->col, "self isn't available here");
             return t_poison();
@@ -1047,7 +1220,8 @@ TypeId Checker::check_binary(const Expr* e) {
 
 // member lookup on an instance ------------------------------------------------
 
-Checker::Member Checker::lookup_member(TypeId recv, const std::string& name) {
+Checker::Member Checker::lookup_member(TypeId recv, const std::string& name,
+                                       uint32_t line, uint32_t col) {
     Member none;
     if (!recv) return none;
 
@@ -1066,9 +1240,11 @@ Checker::Member Checker::lookup_member(TypeId recv, const std::string& name) {
             while (!work.empty()) {
                 const ClassInfo* c = work.back();
                 work.pop_back();
-                if (!seen.insert(c->decl->name).second) continue;
+                if (!seen.insert(c->decl->qualname).second) continue;
                 auto fit = c->fields.find(name);
                 if (fit != c->fields.end()) {
+                    check_pub(c->decl->qualname, c->field_decls.at(name)->is_pub,
+                              line, col, "field", recv->name + "." + name);
                     Member m;
                     m.kind = Member::Kind::field;
                     m.type = first ? subst(fit->second, env) : fit->second;
@@ -1076,6 +1252,12 @@ Checker::Member Checker::lookup_member(TypeId recv, const std::string& name) {
                 }
                 auto mit = c->methods.find(name);
                 if (mit != c->methods.end()) {
+                    // a pub interface's methods travel with it — the interface
+                    // IS its method set, hiding them would make it useless
+                    bool open = c->method_decls.at(name)->is_pub ||
+                                (c->decl->is_interface && c->decl->is_pub);
+                    check_pub(c->decl->qualname, open, line, col, "method",
+                              recv->name + "." + name);
                     Member m;
                     m.kind = Member::Kind::method;
                     m.type = first ? subst(mit->second, env) : mit->second;
@@ -1102,6 +1284,8 @@ Checker::Member Checker::lookup_member(TypeId recv, const std::string& name) {
             }
             auto mit = it->second.methods.find(name);
             if (mit != it->second.methods.end()) {
+                check_pub(it->second.decl->qualname, it->second.method_decls.at(name)->is_pub,
+                          line, col, "method", recv->name + "." + name);
                 Member m;
                 m.kind = Member::Kind::method;
                 m.type = subst(mit->second, env);
@@ -1224,10 +1408,16 @@ Checker::Member Checker::builtin_member(TypeId recv, const std::string& name) {
 TypeId Checker::check_field(const Expr* e, bool /*for_call*/, TypeId* /*self_type_out*/) {
     const Expr* obj = e->object.get();
 
+    // the whole expression names a type (`util.User` as a value)?
+    if (std::string self_tn = as_type_name(e); !self_tn.empty()) {
+        error_at(e->line, e->col, "'" + self_tn + "' is a type, not a value");
+        return t_poison();
+    }
+
     // Type-name and package receivers only make sense in calls; handle values here.
-    if (obj->kind == Expr::Kind::ident && !find_local(std::string(obj->text))) {
-        std::string n(obj->text);
-        if (auto eit = enums_.find(n); eit != enums_.end()) {
+    std::string tn = as_type_name(obj);
+    if (!tn.empty()) {
+        if (auto eit = enums_.find(tn); eit != enums_.end()) {
             // bare variant without payload as a value: Status.active
             auto vit = eit->second.variants.find(e->name);
             if (vit != eit->second.variants.end()) {
@@ -1239,25 +1429,25 @@ TypeId Checker::check_field(const Expr* e, bool /*for_call*/, TypeId* /*self_typ
                     error_at(e->line, e->col, "can't use a generic enum variant bare here");
                     return t_poison();
                 }
-                return pool_.named(Type::K::enum_, n);
+                return pool_.named(Type::K::enum_, tn);
             }
-            error_at(e->line, e->col, "enum " + n + " has no variant '" + e->name + "'");
+            error_at(e->line, e->col, "enum " + tn + " has no variant '" + e->name + "'");
             return t_poison();
         }
-        if (classes_.count(n) || builtin_generic_classes_.count(n) || n == "Error") {
-            error_at(e->line, e->col,
-                     "'" + n + "." + e->name + "' is a static — call it with (...)");
-            return t_poison();
-        }
-        if (pkg_paths_.count(n)) {
-            error_at(e->line, e->col, "package members must be called: " + n + "." + e->name + "(...)");
-            return t_poison();
-        }
+        error_at(e->line, e->col,
+                 "'" + tn + "." + e->name + "' is a static — call it with (...)");
+        return t_poison();
+    }
+    if (obj->kind == Expr::Kind::ident && !find_local(std::string(obj->text)) &&
+        pkg_paths_.count(std::string(obj->text))) {
+        error_at(e->line, e->col, "package members must be called: " +
+                                      std::string(obj->text) + "." + e->name + "(...)");
+        return t_poison();
     }
 
     TypeId t = check_expr(obj, nullptr);
     if (t->k == Type::K::poison) return t;
-    Member m = lookup_member(t, e->name);
+    Member m = lookup_member(t, e->name, e->line, e->col);
     if (m.kind == Member::Kind::field) return m.type;
     if (m.kind == Member::Kind::method) {
         error_at(e->line, e->col, "'" + e->name + "' is a method — call it with (...)");
@@ -1413,6 +1603,7 @@ TypeId Checker::check_call(const Expr* e, TypeId expected) {
             if (pit != pkg_paths_.end()) {
                 const std::string& path = pit->second;
                 if (path == "std.io" && (mname == "println" || mname == "print")) {
+                    callee->resolved = "std.io." + mname;
                     if (e->args.size() != 1) {
                         error_at(e->line, e->col, "io." + mname + " takes 1 argument");
                     }
@@ -1426,6 +1617,7 @@ TypeId Checker::check_call(const Expr* e, TypeId expected) {
                     return t_unit();
                 }
                 if (path == "std.thread" && mname == "spawn") {
+                    callee->resolved = "std.thread.spawn";
                     if (e->args.size() != 1) {
                         error_at(e->line, e->col, "thread.spawn takes 1 closure");
                         return t_poison();
@@ -1438,13 +1630,32 @@ TypeId Checker::check_call(const Expr* e, TypeId expected) {
                     }
                     return pool_.named(Type::K::class_, "Thread", {f->fn_ret});
                 }
-                error_at(e->line, e->col, "package '" + n + "' (" + path + ") has no '" +
-                                              mname + "' — external packages aren't linked yet");
+                // a real package: pub fn call across the package line
+                auto pfx = prefix_by_path_.find(path);
+                if (pfx != prefix_by_path_.end()) {
+                    std::string key = pfx->second + "." + mname;
+                    auto fit = top_fns_.find(key);
+                    if (fit != top_fns_.end()) {
+                        check_pub(key, top_fn_decls_[key]->is_pub, e->line, e->col,
+                                  "function", n + "." + mname);
+                        callee->resolved = key;
+                        return call_generic_fn(top_fn_decls_[key], fit->second,
+                                               "'" + n + "." + mname + "'");
+                    }
+                }
+                error_at(e->line, e->col,
+                         "package '" + n + "' (" + path + ") has no function '" + mname + "'");
                 for (const ExprPtr& a : e->args) check_expr(a.get(), nullptr);
                 return t_poison();
             }
+        }
 
-            // enum variant construction: Payment.transfer(...)
+        // type-name receiver: enum variant construction or a static call,
+        // local (`Payment.transfer`) or imported (`util.Payment.transfer`)
+        std::string tn = as_type_name(obj);
+        if (!tn.empty()) {
+            std::string n = tn;
+
             auto eit = enums_.find(n);
             if (eit != enums_.end()) {
                 auto vit = eit->second.variants.find(mname);
@@ -1505,6 +1716,7 @@ TypeId Checker::check_call(const Expr* e, TypeId expected) {
                     error_at(e->line, e->col, "'" + mname + "' is an instance method — call it on a " + n + " value");
                     return t_poison();
                 }
+                check_pub(n, md->is_pub, e->line, e->col, "static", n + "." + mname);
                 if (!cit->second.generic_params.empty()) {
                     error_at(e->line, e->col,
                              "statics on generic classes aren't supported yet — use an initializer");
@@ -1521,7 +1733,7 @@ TypeId Checker::check_call(const Expr* e, TypeId expected) {
             for (const ExprPtr& a : e->args) check_expr(a.get(), nullptr);
             return t_poison();
         }
-        Member m = lookup_member(t, mname);
+        Member m = lookup_member(t, mname, e->line, e->col);
         if (m.kind == Member::Kind::method) {
             if (m.is_static) {
                 error_at(e->line, e->col, "'" + mname + "' is a static — call it on the type name");
@@ -1590,14 +1802,24 @@ TypeId Checker::check_init(const Expr* e, TypeId expected) {
             return expected;
         }
         if (expected->k == Type::K::class_ && classes_.count(expected->name)) {
-            cname = expected->name;
+            cname = expected->name; // already a qualified key from the type pool
             targs = expected->args;
         } else {
             error_at(e->line, e->col, "can't build a " + type_name(expected) + " with { }");
             for (const InitEntry& en : e->entries) check_expr(en.value.get(), nullptr);
             return t_poison();
         }
+    } else {
+        // source name (`User` or `util.User`) -> qualified key
+        std::string key = resolve_class_key(cname, e->line, e->col);
+        if (key.empty()) {
+            error_at(e->line, e->col, "unknown type '" + cname + "' in initializer");
+            for (const InitEntry& en : e->entries) check_expr(en.value.get(), nullptr);
+            return t_poison();
+        }
+        cname = key;
     }
+    e->resolved = cname; // interp and codegen build straight from this
 
     auto cit = classes_.find(cname);
     if (cit == classes_.end()) {
@@ -1680,7 +1902,7 @@ TypeId Checker::check_init(const Expr* e, TypeId expected) {
 
 // match -----------------------------------------------------------------------
 
-TypeId Checker::check_match(const Expr* e, TypeId expected) {
+TypeId Checker::check_match(const Expr* e, TypeId expected, bool as_stmt) {
     TypeId subj = check_expr(e->subject.get(), nullptr);
 
     const EnumInfo* einfo = nullptr;
@@ -1768,8 +1990,19 @@ TypeId Checker::check_match(const Expr* e, TypeId expected) {
     for (const MatchArm& arm : e->arms) {
         push_scope();
         check_pat(arm.pat.get());
-        TypeId at = check_expr(arm.value.get(), result);
+        if (arm.is_block) {
+            if (!as_stmt) {
+                error_at(arm.pat->line, arm.pat->col,
+                         "a block arm doesn't produce a value — this match is used as one. "
+                         "use `pattern => expression` arms here");
+            }
+            check_block(arm.body);
+            pop_scope();
+            continue;
+        }
+        TypeId at = check_expr(arm.value.get(), as_stmt ? nullptr : result);
         pop_scope();
+        if (as_stmt) continue; // value is dropped, arms may differ
         if (!result) {
             result = at;
         } else if (assignable(at, result)) {

@@ -68,18 +68,57 @@ const TypeRef* Interp::Hint::arg(size_t i) const {
 
 // ---- setup -----------------------------------------------------------------
 
-Interp::Interp(const Module& mod) : mod_(mod) {
-    for (const ClassDecl& c : mod.classes) classes_[c.name] = &c;
-    for (const EnumDecl& e : mod.enums) enums_[e.name] = &e;
-    for (const FnDecl& f : mod.fns) fns_[f.name] = &f;
-    for (const ImportDecl& i : mod.imports) {
-        std::string bound = i.alias;
-        if (bound.empty()) {
-            size_t cut = i.path.find_last_of("./");
-            bound = cut == std::string::npos ? i.path : i.path.substr(cut + 1);
+// which package's code this thread is currently running (parallel to g_frames)
+thread_local std::string g_pkg;
+
+Interp::Interp(const Program& prog) {
+    for (const auto& pkg : prog.packages) {
+        prefix_by_path_[pkg->import_path] = pkg->prefix;
+        auto& bindings = pkg_imports_[pkg->prefix];
+        for (const auto& pf : pkg->files) {
+            for (const ClassDecl& c : pf->mod.classes) classes_[c.qualname] = &c;
+            for (const EnumDecl& e : pf->mod.enums) enums_[e.qualname] = &e;
+            for (const FnDecl& f : pf->mod.fns) fns_[f.qualname] = &f;
+            for (const ImportDecl& i : pf->mod.imports) {
+                std::string bound = i.alias;
+                if (bound.empty()) {
+                    size_t cut = i.path.find_last_of("./");
+                    bound = cut == std::string::npos ? i.path : i.path.substr(cut + 1);
+                }
+                bindings[bound] = i.path;
+            }
         }
-        pkg_paths_[bound] = i.path;
     }
+}
+
+std::string Interp::qual(const std::string& name) const {
+    return g_pkg.empty() ? name : g_pkg + "." + name;
+}
+
+std::string Interp::pkg_of(const std::string& qualname) {
+    size_t dot = qualname.find('.');
+    return dot == std::string::npos ? "" : qualname.substr(0, dot);
+}
+
+const ClassDecl* Interp::resolve_class(const Expr* annotated, const std::string& name) const {
+    if (annotated && !annotated->resolved.empty()) return find_class(annotated->resolved);
+    if (const ClassDecl* c = find_class(qual(name))) return c;
+    return nullptr;
+}
+
+const EnumDecl* Interp::resolve_enum(const Expr* annotated, const std::string& name) const {
+    const std::string& key = annotated && !annotated->resolved.empty()
+                                 ? annotated->resolved
+                                 : qual(name);
+    auto it = enums_.find(key);
+    return it == enums_.end() ? nullptr : it->second;
+}
+
+std::string Interp::binding_path(const std::string& binding) const {
+    auto pit = pkg_imports_.find(g_pkg);
+    if (pit == pkg_imports_.end()) return "";
+    auto it = pit->second.find(binding);
+    return it == pit->second.end() ? "" : it->second;
 }
 
 int Interp::run() {
@@ -89,7 +128,7 @@ int Interp::run() {
         return 2;
     }
     try {
-        call_fn(it->second, nullptr, {});
+        call_fn(it->second, nullptr, {}, "");
     } catch (const BeansPanic& p) {
         std::fprintf(stderr, "runtime panic at %u:%u: %s\n", p.line, p.col, p.msg.c_str());
         return 3;
@@ -137,7 +176,13 @@ const ClassDecl* Interp::find_class(const std::string& name) const {
     return it == classes_.end() ? nullptr : it->second;
 }
 
-const FnDecl* Interp::find_method(const ClassDecl* cls, const std::string& name) const {
+// parents as qualified keys (the checker pinned them); raw names as fallback
+static const std::vector<std::string>& supers_of(const ClassDecl* c) {
+    return c->supers_resolved.empty() ? c->supers : c->supers_resolved;
+}
+
+const FnDecl* Interp::find_method(const ClassDecl* cls, const std::string& name,
+                                  const ClassDecl** owner) const {
     std::vector<const ClassDecl*> work = {cls};
     std::vector<const ClassDecl*> seen;
     while (!work.empty()) {
@@ -149,17 +194,20 @@ const FnDecl* Interp::find_method(const ClassDecl* cls, const std::string& name)
         if (dup) continue;
         seen.push_back(c);
         for (const FnDecl& m : c->methods) {
-            if (m.name == name && m.has_body) return &m;
+            if (m.name == name && m.has_body) {
+                if (owner) *owner = c; // inherited code runs as its own package
+                return &m;
+            }
         }
-        for (const std::string& s : c->supers) work.push_back(find_class(s));
+        for (const std::string& s : supers_of(c)) work.push_back(find_class(s));
     }
     return nullptr;
 }
 
 bool Interp::class_is(const ClassDecl* cls, const std::string& super) const {
     if (!cls) return false;
-    if (cls->name == super) return true;
-    for (const std::string& s : cls->supers) {
+    if (cls->qualname == super) return true;
+    for (const std::string& s : supers_of(cls)) {
         if (class_is(find_class(s), super)) return true;
     }
     return false;
@@ -167,7 +215,7 @@ bool Interp::class_is(const ClassDecl* cls, const std::string& super) const {
 
 void Interp::collect_fields(const ClassDecl* cls, std::vector<const FieldDecl*>& out) const {
     if (!cls) return;
-    for (const std::string& s : cls->supers) collect_fields(find_class(s), out);
+    for (const std::string& s : supers_of(cls)) collect_fields(find_class(s), out);
     for (const FieldDecl& f : cls->fields) {
         bool have = false;
         for (const FieldDecl* g : out) have |= g->name == f.name;
@@ -185,6 +233,8 @@ Value Interp::make_instance(const ClassDecl* cls,
 
     std::vector<const FieldDecl*> fields;
     collect_fields(cls, fields);
+    std::string saved_pkg = g_pkg;
+    g_pkg = pkg_of(cls->qualname); // defaults are the class's own code
     for (const FieldDecl* f : fields) {
         Value init = Value::unit();
         if (f->def) {
@@ -193,6 +243,7 @@ Value Interp::make_instance(const ClassDecl* cls,
         }
         v.inst->fields.emplace_back(f->name, std::move(init));
     }
+    g_pkg = saved_pkg;
     for (const InitEntry& en : entries) {
         const FieldDecl* fd = nullptr;
         for (const FieldDecl* f : fields) {
@@ -206,13 +257,16 @@ Value Interp::make_instance(const ClassDecl* cls,
 
 // ---- calls -----------------------------------------------------------------
 
-Value Interp::call_fn(const FnDecl* fn, Value* self, std::vector<Value> args) {
+Value Interp::call_fn(const FnDecl* fn, Value* self, std::vector<Value> args,
+                      const std::string& pkg) {
     auto env = std::make_shared<Env>();
     if (self) env->declare("self", *self);
     for (size_t i = 0; i < fn->params.size() && i < args.size(); i++) {
         env->declare(fn->params[i].name, std::move(args[i]));
     }
 
+    std::string saved_pkg = g_pkg;
+    g_pkg = pkg;
     g_frames.push_back({});
     g_frames.back().ret = fn->ret.get();
     Value result = Value::unit();
@@ -226,6 +280,7 @@ Value Interp::call_fn(const FnDecl* fn, Value* self, std::vector<Value> args) {
         for (auto it = defers.rbegin(); it != defers.rend(); ++it) {
             try { eval(it->first, it->second); } catch (...) {}
         }
+        g_pkg = saved_pkg;
         throw;
     }
     auto defers = std::move(g_frames.back().defers);
@@ -237,6 +292,7 @@ Value Interp::call_fn(const FnDecl* fn, Value* self, std::vector<Value> args) {
             std::fprintf(stderr, "panic in defer (ignored): %s\n", p.msg.c_str());
         } catch (...) {}
     }
+    g_pkg = saved_pkg;
     return result;
 }
 
@@ -248,6 +304,8 @@ Value Interp::call_closure(const ClosureVal& c, std::vector<Value> args) {
         env->declare(node->params[i].name, std::move(args[i]));
     }
 
+    std::string saved_pkg = g_pkg;
+    g_pkg = c.pkg; // the closure runs as code of the package that wrote it
     g_frames.push_back({});
     g_frames.back().ret = node->type.get();
     Value result = Value::unit();
@@ -257,6 +315,7 @@ Value Interp::call_closure(const ClosureVal& c, std::vector<Value> args) {
         result = std::move(r.v);
     } catch (...) {
         g_frames.pop_back();
+        g_pkg = saved_pkg;
         throw;
     }
     auto defers = std::move(g_frames.back().defers);
@@ -264,6 +323,7 @@ Value Interp::call_closure(const ClosureVal& c, std::vector<Value> args) {
     for (auto it = defers.rbegin(); it != defers.rend(); ++it) {
         try { eval(it->first, it->second); } catch (...) {}
     }
+    g_pkg = saved_pkg;
     return result;
 }
 
@@ -489,7 +549,7 @@ Value Interp::eval(const Expr* e, std::shared_ptr<Env>& env, Hint hint) {
             std::string name(e->text);
             if (Value* v = env->find(name)) return *v;
             if (name == "none") return none();
-            auto fit = fns_.find(name);
+            auto fit = fns_.find(e->resolved.empty() ? qual(name) : e->resolved);
             if (fit != fns_.end()) {
                 Value v;
                 v.k = Value::K::fn_ref;
@@ -540,12 +600,22 @@ Value Interp::eval(const Expr* e, std::shared_ptr<Env>& env, Hint hint) {
             const Expr* obj = e->object.get();
             if (obj->kind == Expr::Kind::ident && !env->find(std::string(obj->text))) {
                 std::string n(obj->text);
-                auto eit = enums_.find(n);
-                if (eit != enums_.end()) {
+                if (const EnumDecl* ed = resolve_enum(obj, n)) {
                     Value v;
                     v.k = Value::K::enum_v;
                     v.en = std::make_shared<EnumVal>();
-                    v.en->enum_name = n;
+                    v.en->enum_name = ed->qualname;
+                    v.en->variant = e->name;
+                    return v;
+                }
+            }
+            if (obj->kind == Expr::Kind::field && !obj->resolved.empty()) {
+                // `util.Status.active` — the checker pinned the enum
+                if (const EnumDecl* ed = resolve_enum(obj, "")) {
+                    Value v;
+                    v.k = Value::K::enum_v;
+                    v.en = std::make_shared<EnumVal>();
+                    v.en->enum_name = ed->qualname;
                     v.en->variant = e->name;
                     return v;
                 }
@@ -591,8 +661,11 @@ Value Interp::eval(const Expr* e, std::shared_ptr<Env>& env, Hint hint) {
         case Expr::Kind::cast: {
             Value v = eval(e->object.get(), env);
             const TypeRef* t = e->type.get();
-            const std::string& tn = t ? t->name : "";
+            std::string tn = t ? (t->resolved.empty() ? t->name : t->resolved) : "";
             if (e->checked) {
+                // as? targets are always user classes — fall back to the
+                // running package's name for unchecked ASTs
+                if (t && t->resolved.empty()) tn = qual(t->name);
                 if (v.k == Value::K::instance && class_is(v.inst->cls, tn)) return some(v);
                 return none();
             }
@@ -642,6 +715,7 @@ Value Interp::eval(const Expr* e, std::shared_ptr<Env>& env, Hint hint) {
             v.clo = std::make_shared<ClosureVal>();
             v.clo->node = e;
             v.clo->captured = env;
+            v.clo->pkg = g_pkg;
             return v;
         }
         case Expr::Kind::if_expr: {
@@ -758,7 +832,8 @@ Value Interp::eval_binary(const Expr* e, std::shared_ptr<Env>& env) {
 }
 
 Value Interp::eval_init(const Expr* e, std::shared_ptr<Env>& env, Hint hint) {
-    std::string cname = e->name;
+    std::string cname = e->resolved.empty() ? e->name : e->resolved;
+    bool pinned = !e->resolved.empty();
     if (cname.empty() && hint.tref && hint.tref->kind == TypeRef::Kind::named) {
         if (hint.tref->name == "Map") {
             Value v;
@@ -774,10 +849,21 @@ Value Interp::eval_init(const Expr* e, std::shared_ptr<Env>& env, Hint hint) {
             }
             return v;
         }
-        cname = hint.tref->name;
+        if (!hint.tref->resolved.empty()) {
+            cname = hint.tref->resolved;
+            pinned = true;
+        } else {
+            cname = hint.tref->name;
+        }
     }
     if (const ClassDecl* cls = find_class(cname)) {
         return make_instance(cls, e->entries, env);
+    }
+    if (!pinned && !cname.empty()) {
+        // plain name in a dep package's own code (interpolation segments)
+        if (const ClassDecl* cls = find_class(qual(cname))) {
+            return make_instance(cls, e->entries, env);
+        }
     }
     // map literal with string keys, no hint needed at runtime
     if (cname.empty() || cname == "Map") {
@@ -813,7 +899,9 @@ Value Interp::eval_call(const Expr* e, std::shared_ptr<Env>& env, Hint hint) {
     };
     auto call_value = [&](Value& f, std::vector<Value> args) -> Value {
         if (f.k == Value::K::closure) return call_closure(*f.clo, std::move(args));
-        if (f.k == Value::K::fn_ref) return call_fn(f.fnr->decl, nullptr, std::move(args));
+        if (f.k == Value::K::fn_ref)
+            return call_fn(f.fnr->decl, nullptr, std::move(args),
+                           pkg_of(f.fnr->decl->qualname));
         panic(e, "not callable");
     };
 
@@ -855,9 +943,10 @@ Value Interp::eval_call(const Expr* e, std::shared_ptr<Env>& env, Hint hint) {
             return x;
         }
 
-        auto fit = fns_.find(name);
+        auto fit = fns_.find(callee->resolved.empty() ? qual(name) : callee->resolved);
         if (fit != fns_.end()) {
-            return call_fn(fit->second, nullptr, eval_args_hinted(fit->second->params));
+            return call_fn(fit->second, nullptr, eval_args_hinted(fit->second->params),
+                           pkg_of(fit->second->qualname));
         }
         panic(e, "unknown function '" + name + "'");
     }
@@ -866,52 +955,78 @@ Value Interp::eval_call(const Expr* e, std::shared_ptr<Env>& env, Hint hint) {
         const Expr* obj = callee->object.get();
         const std::string& mname = callee->name;
 
+        auto do_println = [&](bool newline) {
+            Value v = eval(e->args[0].get(), env);
+            std::string out = display(v);
+            if (newline) out += "\n";
+            std::fwrite(out.data(), 1, out.size(), stdout);
+            return Value::unit();
+        };
+        auto do_spawn = [&]() {
+            Value f = eval(e->args[0].get(), env);
+            Value tv;
+            tv.k = Value::K::thread;
+            tv.thread = std::make_shared<ThreadVal>();
+            tv.thread->result = std::make_shared<Value>();
+            tv.thread->panic = std::make_shared<std::string>();
+            auto result = tv.thread->result;
+            auto panic_slot = tv.thread->panic;
+            ClosureVal clo = *f.clo;
+            tv.thread->th = std::thread([this, clo, result, panic_slot]() {
+                try {
+                    *result = call_closure(clo, {});
+                } catch (const BeansPanic& p) {
+                    *panic_slot = p.msg.empty() ? "panic" : p.msg;
+                } catch (...) {
+                    *panic_slot = "unknown panic";
+                }
+            });
+            return tv;
+        };
+
+        // the checker pinned this call: a std builtin or a package function
+        if (!callee->resolved.empty()) {
+            const std::string& r = callee->resolved;
+            if (r == "std.io.println") return do_println(true);
+            if (r == "std.io.print") return do_println(false);
+            if (r == "std.thread.spawn") return do_spawn();
+            auto fit = fns_.find(r);
+            if (fit != fns_.end()) {
+                return call_fn(fit->second, nullptr, eval_args_hinted(fit->second->params),
+                               pkg_of(fit->second->qualname));
+            }
+        }
+
         if (obj->kind == Expr::Kind::ident && !env->find(std::string(obj->text))) {
             std::string n(obj->text);
 
-            auto pit = pkg_paths_.find(n);
-            if (pit != pkg_paths_.end()) {
-                const std::string& path = pit->second;
+            // unannotated package call (string-interpolation segments)
+            std::string path = binding_path(n);
+            if (!path.empty()) {
                 if (path == "std.io" && (mname == "println" || mname == "print")) {
-                    Value v = eval(e->args[0].get(), env);
-                    std::string out = display(v);
-                    if (mname == "println") out += "\n";
-                    std::fwrite(out.data(), 1, out.size(), stdout);
-                    return Value::unit();
+                    return do_println(mname == "println");
                 }
-                if (path == "std.thread" && mname == "spawn") {
-                    Value f = eval(e->args[0].get(), env);
-                    Value tv;
-                    tv.k = Value::K::thread;
-                    tv.thread = std::make_shared<ThreadVal>();
-                    tv.thread->result = std::make_shared<Value>();
-                    tv.thread->panic = std::make_shared<std::string>();
-                    auto result = tv.thread->result;
-                    auto panic_slot = tv.thread->panic;
-                    ClosureVal clo = *f.clo;
-                    tv.thread->th = std::thread([this, clo, result, panic_slot]() {
-                        try {
-                            *result = call_closure(clo, {});
-                        } catch (const BeansPanic& p) {
-                            *panic_slot = p.msg.empty() ? "panic" : p.msg;
-                        } catch (...) {
-                            *panic_slot = "unknown panic";
-                        }
-                    });
-                    return tv;
+                if (path == "std.thread" && mname == "spawn") return do_spawn();
+                auto pfx = prefix_by_path_.find(path);
+                if (pfx != prefix_by_path_.end()) {
+                    auto fit = fns_.find(pfx->second + "." + mname);
+                    if (fit != fns_.end()) {
+                        return call_fn(fit->second, nullptr,
+                                       eval_args_hinted(fit->second->params),
+                                       pkg_of(fit->second->qualname));
+                    }
                 }
                 panic(e, "package '" + n + "' has nothing runnable named '" + mname + "'");
             }
 
-            auto eit = enums_.find(n);
-            if (eit != enums_.end()) {
+            if (const EnumDecl* ed = resolve_enum(obj, n)) {
                 Value x;
                 x.k = Value::K::enum_v;
                 x.en = std::make_shared<EnumVal>();
-                x.en->enum_name = n;
+                x.en->enum_name = ed->qualname;
                 x.en->variant = mname;
                 const EnumVariant* var = nullptr;
-                for (const EnumVariant& v : eit->second->variants) {
+                for (const EnumVariant& v : ed->variants) {
                     if (v.name == mname) var = &v;
                 }
                 for (size_t i = 0; i < e->args.size(); i++) {
@@ -948,21 +1063,56 @@ Value Interp::eval_call(const Expr* e, std::shared_ptr<Env>& env, Hint hint) {
                 return v;
             }
 
-            if (const ClassDecl* cls = find_class(n)) {
+            if (const ClassDecl* cls = resolve_class(obj, n)) {
                 const FnDecl* m = nullptr;
                 for (const FnDecl& f : cls->methods) {
                     if (f.name == mname && !f.has_self) m = &f;
                 }
                 if (!m) panic(e, n + " has no static '" + mname + "'");
-                return call_fn(m, nullptr, eval_args_hinted(m->params));
+                return call_fn(m, nullptr, eval_args_hinted(m->params),
+                               pkg_of(cls->qualname));
+            }
+        }
+
+        // `util.Payment.card(...)` / `util.User.new(...)` — the receiver is a
+        // field expression the checker resolved to a type
+        if (obj->kind == Expr::Kind::field && !obj->resolved.empty()) {
+            if (const EnumDecl* ed = resolve_enum(obj, "")) {
+                Value x;
+                x.k = Value::K::enum_v;
+                x.en = std::make_shared<EnumVal>();
+                x.en->enum_name = ed->qualname;
+                x.en->variant = mname;
+                const EnumVariant* var = nullptr;
+                for (const EnumVariant& v : ed->variants) {
+                    if (v.name == mname) var = &v;
+                }
+                for (size_t i = 0; i < e->args.size(); i++) {
+                    Hint h = var && i < var->payload.size()
+                                 ? Hint::of(var->payload[i].type.get())
+                                 : Hint();
+                    x.en->payload.push_back(eval(e->args[i].get(), env, h));
+                }
+                return x;
+            }
+            if (const ClassDecl* cls = find_class(obj->resolved)) {
+                const FnDecl* m = nullptr;
+                for (const FnDecl& f : cls->methods) {
+                    if (f.name == mname && !f.has_self) m = &f;
+                }
+                if (!m) panic(e, obj->resolved + " has no static '" + mname + "'");
+                return call_fn(m, nullptr, eval_args_hinted(m->params),
+                               pkg_of(cls->qualname));
             }
         }
 
         // instance call
         Value recv = eval(obj, env);
         if (recv.k == Value::K::instance && recv.inst->cls) {
-            if (const FnDecl* m = find_method(recv.inst->cls, mname)) {
-                return call_fn(m, &recv, eval_args_hinted(m->params));
+            const ClassDecl* owner = recv.inst->cls;
+            if (const FnDecl* m = find_method(recv.inst->cls, mname, &owner)) {
+                return call_fn(m, &recv, eval_args_hinted(m->params),
+                               pkg_of(owner->qualname));
             }
         }
         if (recv.k == Value::K::enum_v) {
@@ -970,7 +1120,8 @@ Value Interp::eval_call(const Expr* e, std::shared_ptr<Env>& env, Hint hint) {
             if (eit != enums_.end()) {
                 for (const FnDecl& m : eit->second->methods) {
                     if (m.name == mname) {
-                        return call_fn(&m, &recv, eval_args_hinted(m.params));
+                        return call_fn(&m, &recv, eval_args_hinted(m.params),
+                                       pkg_of(eit->second->qualname));
                     }
                 }
             }
@@ -1220,6 +1371,10 @@ Value Interp::eval_match(const Expr* e, std::shared_ptr<Env>& env, Hint hint) {
         auto arm_env = std::make_shared<Env>();
         arm_env->parent = env;
         if (match_pattern(arm.pat.get(), subj, *arm_env, env)) {
+            if (arm.is_block) {
+                exec_block(arm.body, arm_env);
+                return Value::unit();
+            }
             return eval(arm.value.get(), arm_env, hint);
         }
     }

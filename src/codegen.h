@@ -13,15 +13,12 @@ struct CGError {
     uint32_t col;
 };
 
-// Native backend: emits textual LLVM IR, compiled by clang.
-// v2 covers classes (vtable dispatch, inheritance, statics, interface
-// defaults), enums + match, Option/Result + ?, decimal, lists, strings with
-// interpolation, and all control flow. Not yet native: closures/fn values,
-// threads, maps, generic functions — those report a clear error and keep
-// working under `beansc run`.
+// Native backend: emits textual LLVM IR, compiled by clang. Covers the whole
+// language; symbols and class instantiations are keyed by package-qualified
+// names, so multi-package programs link into one flat module.
 class CodeGen {
 public:
-    explicit CodeGen(const Module& mod);
+    explicit CodeGen(const Program& prog);
 
     // returns the .ll text; empty on failure
     std::string generate();
@@ -31,7 +28,7 @@ public:
     static const char* runtime_c();
 
 private:
-    const Module& mod_;
+    const Program& prog_;
     std::vector<CGError> errors_;
 
     void error_at(uint32_t line, uint32_t col, std::string msg);
