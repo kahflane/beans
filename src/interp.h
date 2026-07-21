@@ -7,6 +7,7 @@
 #include <vector>
 
 #include "ast.h"
+#include "builtins.h"
 #include "lexer.h"
 #include "value.h"
 
@@ -17,6 +18,14 @@ struct BeansPanic {
     std::string msg;
     uint32_t line = 0, col = 0;
 };
+
+// live worker-thread count (parallel to the native runtime's cc_threads). A
+// File/MMap closed while any worker runs defers its real fd/munmap release
+// until the handle's last ref drops, so the fd number is never reused for a
+// different file mid-op on another thread.
+void beans_threads_inc();
+void beans_threads_dec();
+bool beans_threads_live();
 
 // Tree-walking interpreter. Assumes the program already passed the checker —
 // it does not re-validate types, it just runs. Global tables are keyed by
@@ -68,6 +77,11 @@ private:
     Value eval_match(const Expr* e, std::shared_ptr<Env>& env, Hint hint);
     Value eval_builtin_method(const Expr* e, Value& recv, const std::string& name,
                               std::vector<Value>& args);
+    std::vector<Value> eval_method_args(const Expr* e, std::shared_ptr<Env>& env,
+                                        const Value& recv, const std::string& name);
+    static Hint hint_of_bt(BT p);
+    static Hint map_key_hint(const MapVal& m);
+    static std::string display_scalar(const Value& v);
     Value eval_string(const Expr* e, std::shared_ptr<Env>& env);
 
     bool match_pattern(const Pattern* p, const Value& v, Env& bind_env,
@@ -97,6 +111,14 @@ private:
 
     Value coerce_arg(Value v, const TypeRef* want);
     static bool value_eq(const Value& a, const Value& b);
+    // map index plumbing — hashing must agree with value_eq exactly
+    static uint64_t value_hash(const Value& v);
+    static size_t map_find(MapVal& m, const Value& key, uint64_t& h,
+                           size_t* slot_out = nullptr);
+    static void map_append(MapVal& m, uint64_t h, Value key, Value val);
+    static void map_set(MapVal& m, Value key, Value val);
+    static bool map_remove_key(MapVal& m, const Value& key);
+    static void map_reindex(MapVal& m);
     static std::string display(const Value& v);
     [[noreturn]] void panic(const Expr* e, std::string msg);
 

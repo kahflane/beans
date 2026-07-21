@@ -245,7 +245,10 @@ merge, so the order matches even under a predicate that isn't a proper ordering.
 
 **Map methods (v0.5, implemented):** `get` → `Option<V>`, `set` (also `m[k] = v` sugar),
 `len`, `contains`, `remove(k) -> bool`, `keys` → `List<K>`, `values` → `List<V>`, `clear`.
-Maps keep insertion order — `keys`/`values` walk it, `remove` preserves it.
+Maps keep insertion order — `keys`/`values` walk it, `remove` preserves it. Lookup is
+hash-indexed (O(1)) in both backends, and `remove` is amortized O(1): an indexed map
+leaves a hole where the entry was and compacts once holes outnumber live entries.
+The index and the holes are invisible, iteration order never depends on them.
 
 Everything has methods:
 
@@ -526,7 +529,16 @@ hits.add(1)
 
 ## Misc
 
-- `defer f.close()` — runs when the function exits, any path. (Go's best idea.)
+- A `File` or `MMap` closed while worker threads are live keeps its OS fd/mapping open until
+  the handle's last reference drops, then releases it. This stops a racing op on another thread
+  from hitting an fd number that `close()` freed and the OS reused for a different file. The
+  logical `closed` flag flips immediately, so same-thread `close()` semantics are unchanged; only
+  the OS-level release is deferred, and only while threads run.
+- `defer f.close()` — runs when the function exits normally, newest first. Must sit at the
+  top level of the function body (not inside `if`/`for`/blocks — it is a function-exit hook,
+  and nested registration would need runtime capture the native backend does not do). A panic
+  exits the process without running defers, and a panic inside a defer is itself fatal.
+  (Go's best idea, minus unwinding.)
 - `unsafe { }` — reserved for the low-level layer: raw pointers, manual memory, C/C++ interop, syscalls. This is the databases/OS story. Separate doc later.
 
 ## Keywords (23)

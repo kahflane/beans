@@ -1,5 +1,6 @@
 #include "interp.h"
 
+#include <atomic>
 #include <cinttypes>
 #include <cmath>
 #include <cstdio>
@@ -11,6 +12,11 @@
 #include "parser.h"
 
 namespace beans {
+
+static std::atomic<int> g_live_threads{0};
+void beans_threads_inc() { g_live_threads.fetch_add(1, std::memory_order_relaxed); }
+void beans_threads_dec() { g_live_threads.fetch_sub(1, std::memory_order_relaxed); }
+bool beans_threads_live() { return g_live_threads.load(std::memory_order_relaxed) > 0; }
 
 namespace {
 
@@ -131,7 +137,17 @@ int Interp::run() {
     try {
         call_fn(it->second, nullptr, {}, "");
     } catch (const BeansPanic& p) {
+        std::fflush(stdout); // buffered stdout before the stderr panic line
         std::fprintf(stderr, "runtime panic at %u:%u: %s\n", p.line, p.col, p.msg.c_str());
+        return 3;
+    } catch (const std::bad_alloc&) {
+        // same bytes the native runtime prints when calloc gives up
+        std::fflush(stdout);
+        std::fprintf(stderr, "runtime panic at 0:0: out of memory\n");
+        return 3;
+    } catch (const std::length_error&) {
+        std::fflush(stdout);
+        std::fprintf(stderr, "runtime panic at 0:0: out of memory\n");
         return 3;
     }
     return 0;
@@ -276,22 +292,16 @@ Value Interp::call_fn(const FnDecl* fn, Value* self, std::vector<Value> args,
     } catch (ReturnSignal& r) {
         result = std::move(r.v);
     } catch (...) {
-        auto defers = std::move(g_frames.back().defers);
+        // a panic is fatal: defers do not run — matching the native backend,
+        // where a panic exits the process without unwinding
         g_frames.pop_back();
-        for (auto it = defers.rbegin(); it != defers.rend(); ++it) {
-            try { eval(it->first, it->second); } catch (...) {}
-        }
         g_pkg = saved_pkg;
         throw;
     }
     auto defers = std::move(g_frames.back().defers);
     g_frames.pop_back();
     for (auto it = defers.rbegin(); it != defers.rend(); ++it) {
-        try {
-            eval(it->first, it->second);
-        } catch (const BeansPanic& p) {
-            std::fprintf(stderr, "panic in defer (ignored): %s\n", p.msg.c_str());
-        } catch (...) {}
+        eval(it->first, it->second); // a panic inside a defer is a real panic
     }
     g_pkg = saved_pkg;
     return result;
@@ -322,7 +332,7 @@ Value Interp::call_closure(const ClosureVal& c, std::vector<Value> args) {
     auto defers = std::move(g_frames.back().defers);
     g_frames.pop_back();
     for (auto it = defers.rbegin(); it != defers.rend(); ++it) {
-        try { eval(it->first, it->second); } catch (...) {}
+        eval(it->first, it->second); // a panic inside a defer is a real panic
     }
     g_pkg = saved_pkg;
     return result;
@@ -505,7 +515,8 @@ Value* Interp::lvalue_slot(const Expr* target, std::shared_ptr<Env>& env) {
     }
     if (target->kind == Expr::Kind::index) {
         Value obj = eval(target->object.get(), env);
-        Value idx = eval(target->index_expr.get(), env);
+        Value idx = eval(target->index_expr.get(), env,
+                         obj.k == Value::K::map ? map_key_hint(*obj.map) : Hint{});
         if (obj.k == Value::K::list) {
             int64_t i = idx.i;
             if (i < 0 || static_cast<size_t>(i) >= obj.list->items.size()) {
@@ -514,10 +525,10 @@ Value* Interp::lvalue_slot(const Expr* target, std::shared_ptr<Env>& env) {
             return &obj.list->items[static_cast<size_t>(i)];
         }
         if (obj.k == Value::K::map) {
-            for (auto& [k, v] : obj.map->entries) {
-                if (value_eq(k, idx)) return &v;
-            }
-            obj.map->entries.emplace_back(idx, Value::unit());
+            uint64_t h = 0;
+            size_t i = map_find(*obj.map, idx, h);
+            if (i != SIZE_MAX) return &obj.map->entries[i].second;
+            map_append(*obj.map, h, idx, Value::unit());
             return &obj.map->entries.back().second;
         }
     }
@@ -533,13 +544,17 @@ void Interp::assign_to(const Expr* target, Value v, std::shared_ptr<Env>& env) {
 Value Interp::eval(const Expr* e, std::shared_ptr<Env>& env, Hint hint) {
     switch (e->kind) {
         case Expr::Kind::int_lit: {
-            if (hint.wants_dec()) return Value::of_dec(Decimal::parse(clean_number(e->text)));
-            if (hint.wants_float())
+            // the checker's stamp wins; runtime hints only decide literals in
+            // re-parsed interpolation segments (numk == 0)
+            if (e->numk == 3 || (e->numk == 0 && hint.wants_dec()))
+                return Value::of_dec(Decimal::parse(clean_number(e->text)));
+            if (e->numk == 2 || (e->numk == 0 && hint.wants_float()))
                 return Value::of_float(std::strtod(clean_number(e->text).c_str(), nullptr));
             return Value::of_int(parse_int_text(e->text));
         }
         case Expr::Kind::float_lit: {
-            if (hint.wants_dec()) return Value::of_dec(Decimal::parse(clean_number(e->text)));
+            if (e->numk == 3 || (e->numk == 0 && hint.wants_dec()))
+                return Value::of_dec(Decimal::parse(clean_number(e->text)));
             return Value::of_float(std::strtod(clean_number(e->text).c_str(), nullptr));
         }
         case Expr::Kind::string_lit:
@@ -630,7 +645,8 @@ Value Interp::eval(const Expr* e, std::shared_ptr<Env>& env, Hint hint) {
         }
         case Expr::Kind::index: {
             Value obj = eval(e->object.get(), env);
-            Value idx = eval(e->index_expr.get(), env);
+            Value idx = eval(e->index_expr.get(), env,
+                             obj.k == Value::K::map ? map_key_hint(*obj.map) : Hint{});
             if (obj.k == Value::K::list) {
                 int64_t i = idx.i;
                 if (i < 0 || static_cast<size_t>(i) >= obj.list->items.size()) {
@@ -640,9 +656,9 @@ Value Interp::eval(const Expr* e, std::shared_ptr<Env>& env, Hint hint) {
                 return obj.list->items[static_cast<size_t>(i)];
             }
             if (obj.k == Value::K::map) {
-                for (auto& [k, v] : obj.map->entries) {
-                    if (value_eq(k, idx)) return v;
-                }
+                uint64_t h = 0;
+                size_t i = map_find(*obj.map, idx, h);
+                if (i != SIZE_MAX) return obj.map->entries[i].second;
                 panic(e, "map key not found: " + display(idx));
             }
             panic(e, "can't index this value");
@@ -847,7 +863,8 @@ Value Interp::eval_init(const Expr* e, std::shared_ptr<Env>& env, Hint hint) {
                 Value key = en.key ? eval(en.key.get(), env, kh)
                                    : Value::of_str(en.name);
                 Value val = eval(en.value.get(), env, vh);
-                v.map->entries.emplace_back(std::move(key), std::move(val));
+                // set, not push: a duplicate literal key overwrites, like native
+                map_set(*v.map, std::move(key), std::move(val));
             }
             return v;
         }
@@ -874,7 +891,7 @@ Value Interp::eval_init(const Expr* e, std::shared_ptr<Env>& env, Hint hint) {
         v.map = std::make_shared<MapVal>();
         for (const InitEntry& en : e->entries) {
             Value key = en.key ? eval(en.key.get(), env) : Value::of_str(en.name);
-            v.map->entries.emplace_back(std::move(key), eval(en.value.get(), env));
+            map_set(*v.map, std::move(key), eval(en.value.get(), env));
         }
         return v;
     }
@@ -966,7 +983,10 @@ Value Interp::eval_call(const Expr* e, std::shared_ptr<Env>& env, Hint hint) {
         };
         auto do_builtin_fn = [&](const BuiltinFn& b) {
             std::vector<Value> args;
-            for (const ExprPtr& a : e->args) args.push_back(eval(a.get(), env));
+            for (size_t i = 0; i < e->args.size(); i++) {
+                args.push_back(eval(e->args[i].get(), env,
+                                    i < b.params.size() ? hint_of_bt(b.params[i]) : Hint()));
+            }
             return b.run(e->line, e->col, args);
         };
         auto do_spawn = [&]() {
@@ -979,6 +999,8 @@ Value Interp::eval_call(const Expr* e, std::shared_ptr<Env>& env, Hint hint) {
             auto result = tv.thread->result;
             auto panic_slot = tv.thread->panic;
             ClosureVal clo = *f.clo;
+            beans_threads_inc(); // a File closed on another thread now defers
+                                 // its real fd close until its handle drops
             tv.thread->th = std::thread([this, clo, result, panic_slot]() {
                 try {
                     *result = call_closure(clo, {});
@@ -987,6 +1009,7 @@ Value Interp::eval_call(const Expr* e, std::shared_ptr<Env>& env, Hint hint) {
                 } catch (...) {
                     *panic_slot = "unknown panic";
                 }
+                beans_threads_dec();
             });
             return tv;
         };
@@ -1084,7 +1107,11 @@ Value Interp::eval_call(const Expr* e, std::shared_ptr<Env>& env, Hint hint) {
                 for (const BuiltinStatic& b : builtin_statics()) {
                     if (n == b.cls && mname == b.name) {
                         std::vector<Value> args;
-                        for (const ExprPtr& a : e->args) args.push_back(eval(a.get(), env));
+                        for (size_t i = 0; i < e->args.size(); i++) {
+                            args.push_back(
+                                eval(e->args[i].get(), env,
+                                     i < b.params.size() ? hint_of_bt(b.params[i]) : Hint()));
+                        }
                         return b.run(e->line, e->col, args);
                     }
                 }
@@ -1153,7 +1180,7 @@ Value Interp::eval_call(const Expr* e, std::shared_ptr<Env>& env, Hint hint) {
                 }
             }
         }
-        std::vector<Value> args = eval_args_plain();
+        std::vector<Value> args = eval_method_args(e, env, recv, mname);
         return eval_builtin_method(e, recv, mname, args);
     }
 
@@ -1197,6 +1224,77 @@ static void stable_merge(std::vector<Value>& v, Less less) {
             for (size_t k = lo; k < hi; k++) v[k] = std::move(buf[k]);
         }
     }
+}
+
+// registry rows carry BT kinds, not TypeRefs — a numeric hint is all that is
+// needed for a literal argument to build the Value the row expects
+Interp::Hint Interp::hint_of_bt(BT p) {
+    if (p == BT::dec) return Hint::decimal();
+    if (p == BT::f64) return Hint::floating();
+    return Hint();
+}
+
+// Evaluate builtin/container method arguments with type hints. Checked code
+// already carries checker numk stamps on its number literals; these hints only
+// decide literals inside re-parsed interpolation segments, which never met the
+// checker. Container element hints come from the receiver's runtime values —
+// best effort by design: an empty container gives no sample, and stamps cover
+// every checked call anyway.
+std::vector<Value> Interp::eval_method_args(const Expr* e, std::shared_ptr<Env>& env,
+                                            const Value& recv, const std::string& name) {
+    size_t n = e->args.size();
+    std::vector<Hint> hs(n);
+    auto sample = [](const Value& v) {
+        if (v.k == Value::K::decimal_) return Hint::decimal();
+        if (v.k == Value::K::float_) return Hint::floating();
+        return Hint();
+    };
+    auto row_hints = [&](BT want) {
+        for (const BuiltinMethod& b : builtin_methods()) {
+            if (b.recv == want && name == b.name) {
+                for (size_t i = 0; i < n && i < b.params.size(); i++) {
+                    hs[i] = hint_of_bt(b.params[i]);
+                }
+                return;
+            }
+        }
+    };
+    switch (recv.k) {
+        case Value::K::string_: row_hints(BT::str); break;
+        case Value::K::bytes: row_hints(BT::bytes); break;
+        case Value::K::file: row_hints(BT::file); break;
+        case Value::K::mmap: row_hints(BT::mmap); break;
+        case Value::K::bufr: row_hints(BT::bufr); break;
+        case Value::K::list: {
+            const auto& items = recv.list->items;
+            if (!items.empty() && n >= 1) {
+                Hint eh = sample(items[0]);
+                if (name == "push" || name == "contains" || name == "index_of") hs[0] = eh;
+                if (name == "insert" && n >= 2) hs[1] = eh;
+            }
+            break;
+        }
+        case Value::K::map: {
+            const MapVal& mv = *recv.map;
+            const auto& es = mv.entries;
+            size_t f = 0; // first live entry — holes hold unit, not a real key
+            while (f < es.size() && mv.is_dead(f)) f++;
+            if (f < es.size() && n >= 1) {
+                Hint kh = sample(es[f].first);
+                if (name == "get" || name == "contains" || name == "remove") hs[0] = kh;
+                if (name == "set") {
+                    hs[0] = kh;
+                    if (n >= 2) hs[1] = sample(es[f].second);
+                }
+            }
+            break;
+        }
+        default: break;
+    }
+    std::vector<Value> out;
+    out.reserve(n);
+    for (size_t i = 0; i < n; i++) out.push_back(eval(e->args[i].get(), env, hs[i]));
+    return out;
 }
 
 Value Interp::eval_builtin_method(const Expr* e, Value& recv, const std::string& name,
@@ -1379,47 +1477,43 @@ Value Interp::eval_builtin_method(const Expr* e, Value& recv, const std::string&
             break;
         }
         case Value::K::map: {
-            auto& entries = recv.map->entries;
+            MapVal& mv = *recv.map;
+            auto& entries = mv.entries;
             if (name == "get") {
-                for (auto& [k, v] : entries) {
-                    if (value_eq(k, args[0])) return some(v);
-                }
+                uint64_t h = 0;
+                size_t i = map_find(mv, args[0], h);
+                if (i != SIZE_MAX) return some(entries[i].second);
                 return none();
             }
             if (name == "set") {
-                for (auto& [k, v] : entries) {
-                    if (value_eq(k, args[0])) { v = args[1]; return Value::unit(); }
-                }
-                entries.emplace_back(args[0], args[1]);
+                map_set(mv, args[0], args[1]);
                 return Value::unit();
             }
-            if (name == "len") return Value::of_int(static_cast<int64_t>(entries.size()));
+            if (name == "len") return Value::of_int(static_cast<int64_t>(mv.live()));
             if (name == "contains") {
-                for (auto& [k, v] : entries) {
-                    if (value_eq(k, args[0])) return Value::of_bool(true);
-                }
-                return Value::of_bool(false);
+                uint64_t h = 0;
+                return Value::of_bool(map_find(mv, args[0], h) != SIZE_MAX);
             }
             if (name == "remove") {
-                for (size_t i = 0; i < entries.size(); i++) {
-                    if (value_eq(entries[i].first, args[0])) {
-                        entries.erase(entries.begin() + i);
-                        return Value::of_bool(true);
-                    }
-                }
-                return Value::of_bool(false);
+                return Value::of_bool(map_remove_key(mv, args[0]));
             }
             if (name == "keys" || name == "values") {
                 Value out;
                 out.k = Value::K::list;
                 out.list = std::make_shared<ListVal>();
-                for (auto& [k, v] : entries) {
-                    out.list->items.push_back(name == "keys" ? k : v);
+                for (size_t i = 0; i < entries.size(); i++) {
+                    if (mv.is_dead(i)) continue;
+                    out.list->items.push_back(name == "keys" ? entries[i].first
+                                                             : entries[i].second);
                 }
                 return out;
             }
             if (name == "clear") {
                 entries.clear();
+                mv.index.clear();
+                mv.tombs = 0;
+                mv.dead.clear();
+                mv.holes = 0;
                 return Value::unit();
             }
             break;
@@ -1696,8 +1790,259 @@ bool Interp::value_eq(const Value& a, const Value& b) {
     }
 }
 
-std::string Interp::display(const Value& v) {
+// ---- map index ---------------------------------------------------------------
+// Entries stay a flat insertion-ordered vector (keys()/values()/printing walk
+// it); the index vector only maps hash -> position. Small maps skip the index
+// and scan, exactly the old behaviour.
+
+static constexpr size_t MAP_LINEAR_MAX = 8;
+static constexpr uint64_t IDX_POS = 0xffffffffull;     // low 32: pos+2, 1 = tomb
+static constexpr uint64_t IDX_FRAG = ~IDX_POS;         // high 32: hash fragment
+
+static uint64_t mix64(uint64_t x) {
+    x ^= x >> 33;
+    x *= 0xff51afd7ed558ccdull;
+    x ^= x >> 33;
+    x *= 0xc4ceb9fe1a85ec53ull;
+    x ^= x >> 33;
+    return x;
+}
+
+static uint64_t fnv_hash(const void* p, size_t n) {
+    const unsigned char* s = static_cast<const unsigned char*>(p);
+    uint64_t h = 1469598103934665603ull;
+    for (size_t i = 0; i < n; i++) {
+        h ^= s[i];
+        h *= 1099511628211ull;
+    }
+    return mix64(h);
+}
+
+// must agree with value_eq arm for arm: whatever compares equal must hash
+// equal, or the index misses keys the old linear scan found
+uint64_t Interp::value_hash(const Value& v) {
     switch (v.k) {
+        case Value::K::unit: return 0;
+        case Value::K::int_: return mix64(static_cast<uint64_t>(v.i));
+        case Value::K::bool_: return mix64(v.b ? 1 : 0);
+        case Value::K::float_: {
+            double d = v.f == 0.0 ? 0.0 : v.f; // -0.0 == 0.0, so same hash
+            uint64_t bits;
+            std::memcpy(&bits, &d, 8);
+            return mix64(bits);
+        }
+        case Value::K::string_: return fnv_hash(v.s->data(), v.s->size());
+        case Value::K::decimal_: {
+            // cmp() aligns scales, so 2.50 == 2.5 — hash the canonical form
+            __int128 c = v.dec.coeff;
+            int32_t s = v.dec.scale;
+            while (s > 0 && c % 10 == 0) {
+                c /= 10;
+                s -= 1;
+            }
+            uint64_t lo = static_cast<uint64_t>(static_cast<unsigned __int128>(c));
+            uint64_t hi = static_cast<uint64_t>(static_cast<unsigned __int128>(c) >> 64);
+            return mix64(lo ^ mix64(hi ^ static_cast<uint32_t>(s)));
+        }
+        case Value::K::enum_v: {
+            uint64_t h = fnv_hash(v.en->enum_name.data(), v.en->enum_name.size());
+            h = mix64(h ^ fnv_hash(v.en->variant.data(), v.en->variant.size()));
+            for (const Value& p : v.en->payload) h = mix64(h ^ value_hash(p));
+            return h;
+        }
+        case Value::K::instance:
+            return mix64(reinterpret_cast<uintptr_t>(v.inst.get()));
+        case Value::K::list:
+            return mix64(reinterpret_cast<uintptr_t>(v.list.get()));
+        case Value::K::bytes:
+            return fnv_hash(v.bytes->data.data(), v.bytes->data.size());
+        default: return 0; // value_eq's never-equal arm: any hash is consistent
+    }
+}
+
+// position of key in m.entries, or SIZE_MAX. h is filled in iff the index is
+// active, so map_append can reuse it without hashing twice; *slot_out gets
+// the hit's index slot so remove can tombstone it O(1).
+size_t Interp::map_find(MapVal& m, const Value& key, uint64_t& h,
+                        size_t* slot_out) {
+    if (m.index.empty()) {
+        for (size_t i = 0; i < m.entries.size(); i++) {
+            if (value_eq(m.entries[i].first, key)) return i;
+        }
+        return SIZE_MAX;
+    }
+    h = value_hash(key);
+    uint64_t mask = m.index.size() - 1;
+    uint64_t frag = h & IDX_FRAG;
+    for (uint64_t i = h & mask;; i = (i + 1) & mask) {
+        uint64_t w = m.index[i];
+        uint64_t st = w & IDX_POS;
+        if (st == 0) return SIZE_MAX;
+        if (st >= 2 && (w & IDX_FRAG) == frag) {
+            size_t pos = static_cast<size_t>(st) - 2;
+            if (value_eq(m.entries[pos].first, key)) {
+                if (slot_out) *slot_out = static_cast<size_t>(i);
+                return pos;
+            }
+        }
+    }
+}
+
+// (re)build the index sized for the current entry count, dropping tombstones
+// and compacting holes
+void Interp::map_reindex(MapVal& m) {
+    if (!m.dead.empty()) {
+        size_t w = 0;
+        for (size_t p = 0; p < m.entries.size(); p++) {
+            if (m.dead[p]) continue;
+            if (w != p) m.entries[w] = std::move(m.entries[p]);
+            w += 1;
+        }
+        m.entries.resize(w);
+        m.dead.clear();
+        m.holes = 0;
+    }
+    size_t cap = 16;
+    while (m.entries.size() * 3 >= cap * 2) cap <<= 1;
+    m.index.assign(cap, 0);
+    m.tombs = 0;
+    uint64_t mask = cap - 1;
+    for (size_t pos = 0; pos < m.entries.size(); pos++) {
+        uint64_t h = value_hash(m.entries[pos].first);
+        uint64_t i = h & mask;
+        while (m.index[i] & IDX_POS) i = (i + 1) & mask;
+        m.index[i] = (h & IDX_FRAG) | static_cast<uint64_t>(pos + 2);
+    }
+}
+
+// append an entry whose key is known absent (h from the map_find that missed)
+void Interp::map_append(MapVal& m, uint64_t h, Value key, Value val) {
+    m.entries.emplace_back(std::move(key), std::move(val));
+    if (!m.dead.empty()) m.dead.push_back(0);
+    if (m.index.empty()) {
+        if (m.entries.size() > MAP_LINEAR_MAX) map_reindex(m);
+        return;
+    }
+    if ((m.entries.size() + m.tombs) * 3 >= m.index.size() * 2) {
+        map_reindex(m);
+        return;
+    }
+    uint64_t mask = m.index.size() - 1;
+    uint64_t i = h & mask;
+    while ((m.index[i] & IDX_POS) >= 2) i = (i + 1) & mask;
+    if ((m.index[i] & IDX_POS) == 1) m.tombs -= 1;
+    m.index[i] = (h & IDX_FRAG) | static_cast<uint64_t>(m.entries.size() + 1);
+}
+
+void Interp::map_set(MapVal& m, Value key, Value val) {
+    uint64_t h = 0;
+    size_t i = map_find(m, key, h);
+    if (i != SIZE_MAX) {
+        m.entries[i].second = std::move(val); // key kept, duplicate dropped
+        return;
+    }
+    map_append(m, h, std::move(key), std::move(val));
+}
+
+// number-literal keys inside re-parsed interpolation segments never met the
+// checker (its numk stamps cover every checked read); build them as the map's
+// key kind, sampled from the first live entry
+Interp::Hint Interp::map_key_hint(const MapVal& m) {
+    for (size_t i = 0; i < m.entries.size(); i++) {
+        if (m.is_dead(i)) continue;
+        if (m.entries[i].first.k == Value::K::decimal_) return Hint::decimal();
+        if (m.entries[i].first.k == Value::K::float_) return Hint::floating();
+        break;
+    }
+    return {};
+}
+
+bool Interp::map_remove_key(MapVal& m, const Value& key) {
+    uint64_t h = 0;
+    size_t slot = 0;
+    size_t i = map_find(m, key, h, &slot);
+    if (i == SIZE_MAX) return false;
+    if (m.index.empty()) { // small map: slide, exactly the old behaviour
+        m.entries.erase(m.entries.begin() + static_cast<ptrdiff_t>(i));
+        return true;
+    }
+    // indexed: reset the pair into a hole — no entry moves, so no index
+    // position needs fixing and delete is O(1). Reindex compacts once
+    // holes outnumber live entries, so the cost is amortized.
+    m.entries[i] = {Value(), Value()};
+    if (m.dead.empty()) m.dead.assign(m.entries.size(), 0);
+    m.dead[i] = 1;
+    m.holes += 1;
+    m.index[slot] = 1; // map_find landed on the hit's slot
+    m.tombs += 1;
+    if (m.entries.size() > m.live() * 2) map_reindex(m);
+    return true;
+}
+
+std::string Interp::display(const Value& v) {
+    // iterative with an explicit work stack: enums and lists nest to data
+    // depth (a 400k-link chain), and a recursive printer smashed the C++
+    // stack. Teardown is already iterative; the printer must be too.
+    struct Item {
+        const Value* val; // null = emit text
+        const char* text;
+        size_t tlen;
+    };
+    std::string out;
+    std::vector<Item> work;
+    work.push_back({&v, nullptr, 0});
+    while (!work.empty()) {
+        Item it = work.back();
+        work.pop_back();
+        if (!it.val) {
+            out.append(it.text, it.tlen);
+            continue;
+        }
+        const Value& x = *it.val;
+        switch (x.k) {
+            case Value::K::enum_v: {
+                const auto& pay = x.en->payload;
+                if (pay.empty()) {
+                    out += x.en->variant;
+                    break;
+                }
+                out += x.en->variant;
+                out += '(';
+                // push ")" then payloads in reverse so they pop in order
+                work.push_back({nullptr, ")", 1});
+                for (size_t i = pay.size(); i-- > 1;) {
+                    work.push_back({&pay[i], nullptr, 0});
+                    work.push_back({nullptr, ", ", 2});
+                }
+                work.push_back({&pay[0], nullptr, 0});
+                break;
+            }
+            case Value::K::list: {
+                const auto& items = x.list->items;
+                out += '[';
+                work.push_back({nullptr, "]", 1});
+                if (!items.empty()) {
+                    for (size_t i = items.size(); i-- > 1;) {
+                        work.push_back({&items[i], nullptr, 0});
+                        work.push_back({nullptr, ", ", 2});
+                    }
+                    work.push_back({&items[0], nullptr, 0});
+                }
+                break;
+            }
+            default:
+                out += display_scalar(x);
+                break;
+        }
+    }
+    return out;
+}
+
+std::string Interp::display_scalar(const Value& v) { // static
+    switch (v.k) {
+        case Value::K::enum_v:
+        case Value::K::list:
+            return "?"; // handled iteratively in display(); never reached
         case Value::K::unit: return "()";
         case Value::K::int_: return std::to_string(v.i);
         case Value::K::float_: {
@@ -1708,25 +2053,8 @@ std::string Interp::display(const Value& v) {
         case Value::K::decimal_: return v.dec.to_string();
         case Value::K::bool_: return v.b ? "true" : "false";
         case Value::K::string_: return *v.s;
-        case Value::K::enum_v: {
-            if (v.en->payload.empty()) return v.en->variant;
-            std::string out = v.en->variant + "(";
-            for (size_t i = 0; i < v.en->payload.size(); i++) {
-                if (i) out += ", ";
-                out += display(v.en->payload[i]);
-            }
-            return out + ")";
-        }
         case Value::K::instance:
             return v.inst->cls ? v.inst->cls->name : "Error";
-        case Value::K::list: {
-            std::string out = "[";
-            for (size_t i = 0; i < v.list->items.size(); i++) {
-                if (i) out += ", ";
-                out += display(v.list->items[i]);
-            }
-            return out + "]";
-        }
         case Value::K::map: return "{map}";
         case Value::K::bytes: return "{bytes}";
         case Value::K::file: return "{file}";

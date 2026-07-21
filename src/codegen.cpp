@@ -474,6 +474,23 @@ struct CG2 {
         return "getelementptr (i8, ptr " + name + ", i64 16)";
     }
 
+    // payload-less enum values (none, error tags, bare variants) are
+    // immutable and carry only their tag: one immortal box per tag number,
+    // shared program-wide like string constants. Spares tree-shaped data
+    // an allocation and a release per empty child.
+    std::map<int, std::string> enum_tag_consts;
+    std::string intern_enum_tag(int tag) {
+        auto it = enum_tag_consts.find(tag);
+        if (it != enum_tag_consts.end()) return it->second;
+        std::string name = "@.etag" + std::to_string(tag);
+        globals += name + " = private unnamed_addr constant {i64, i64, i64} "
+                   "{i64 4611686018427387904, i64 1, i64 " + // immortal, kind 1
+                   std::to_string(tag) + "}\n";
+        std::string ref = "getelementptr (i8, ptr " + name + ", i64 16)";
+        enum_tag_consts[tag] = ref;
+        return ref;
+    }
+
     int selector(const std::string& name) {
         auto it = selectors.find(name);
         if (it != selectors.end()) return it->second;
@@ -636,6 +653,71 @@ struct CG2 {
                 break;
             }
             case Ty::enum_: {
+                // enums can nest to data depth (Chain.link(Chain...)) — render
+                // through the iterative driver so printing never recurses
+                std::string st = request_step(t);
+                b += "  %r = call ptr @beans_show_run(ptr " + st + ", i64 %v)\n"
+                     "  ret ptr %r\n";
+                break;
+            }
+            default:
+                b += "  ret ptr " + intern_string("?") + "\n";
+                break;
+        }
+        b += "}\n";
+        lifted += b;
+        return sym;
+    }
+
+    // iterative show steps: `void @bstepN(ptr ctx, i64 v)` appends this
+    // value's own text and PUSHES child work onto the driver's stack instead
+    // of calling other shows — beans_show_run drains it, so printing never
+    // recurses on data depth. Output bytes match the interpreter's display()
+    // exactly. Memoized before the body is built so recursive enums close
+    // over themselves.
+    std::map<Ty*, std::string> step_fns;
+    std::string request_step(Ty* t) {
+        auto it = step_fns.find(t);
+        if (it != step_fns.end()) return it->second;
+        std::string sym = "@bstep" + std::to_string(step_fns.size());
+        step_fns[t] = sym;
+        std::string b = "define internal void " + sym + "(ptr %c, i64 %v) {\n";
+        switch (t->k) {
+            case Ty::i64_:
+                b += "  %s = call ptr @beans_from_int(i64 %v)\n"
+                     "  call void @beans_show_append(ptr %c, ptr %s)\n"
+                     "  call void @beans_release(ptr %s)\n  ret void\n";
+                break;
+            case Ty::f64_:
+                b += "  %f = bitcast i64 %v to double\n"
+                     "  %s = call ptr @beans_from_float(double %f)\n"
+                     "  call void @beans_show_append(ptr %c, ptr %s)\n"
+                     "  call void @beans_release(ptr %s)\n  ret void\n";
+                break;
+            case Ty::i1_:
+                b += "  %t = trunc i64 %v to i1\n  %z = zext i1 %t to i32\n"
+                     "  %s = call ptr @beans_from_bool(i32 %z)\n"
+                     "  call void @beans_show_append(ptr %c, ptr %s)\n"
+                     "  call void @beans_release(ptr %s)\n  ret void\n";
+                break;
+            case Ty::dec_:
+                b += "  %p = inttoptr i64 %v to ptr\n"
+                     "  %s = call ptr @beans_dec_str(ptr %p)\n"
+                     "  call void @beans_show_append(ptr %c, ptr %s)\n"
+                     "  call void @beans_release(ptr %s)\n  ret void\n";
+                break;
+            case Ty::str_:
+                b += "  %p = inttoptr i64 %v to ptr\n"
+                     "  call void @beans_show_append(ptr %c, ptr %p)\n  ret void\n";
+                break;
+            case Ty::list_: {
+                std::string es = request_step(t->args[0]);
+                b += "  %p = inttoptr i64 %v to ptr\n"
+                     "  call void @beans_show_list_iter(ptr %c, ptr %p, ptr " + es +
+                     ")\n  ret void\n";
+                break;
+            }
+            case Ty::enum_: {
                 struct VarInfo {
                     std::string name;
                     std::vector<Ty*> pays;
@@ -670,48 +752,261 @@ struct CG2 {
                     const VarInfo& vi = vars[i];
                     b += "v" + std::to_string(i) + ":\n";
                     if (vi.pays.empty() || !vi.pays[0]) {
-                        b += "  ret ptr " + intern_string(vi.name) + "\n";
+                        b += "  call void @beans_show_append(ptr %c, ptr " +
+                             intern_string(vi.name) + ")\n  ret void\n";
                         continue;
                     }
-                    // "name(" ++ p0 ++ ", " ++ p1 ++ ... ++ ")"
-                    std::string acc = intern_string(vi.name + "(");
-                    bool acc_owned = false;
-                    for (size_t pi = 0; pi < vi.pays.size(); pi++) {
-                        if (pi) {
-                            std::string a2 = "%r" + std::to_string(r++);
-                            b += "  " + a2 + " = call ptr @beans_concat(ptr " + acc +
-                                 ", ptr " + intern_string(", ") + ")\n";
-                            if (acc_owned) b += "  call void @beans_release(ptr " + acc + ")\n";
-                            acc = a2;
-                            acc_owned = true;
-                        }
-                        std::string ps = request_show(vi.pays[pi]);
+                    // append "name(" now; push ")" then payloads in reverse so
+                    // they pop as p0, ", ", p1, ..., ")"
+                    b += "  call void @beans_show_append(ptr %c, ptr " +
+                         intern_string(vi.name + "(") + ")\n";
+                    b += "  call void @beans_show_push_lit(ptr %c, ptr " +
+                         intern_string(")") + ")\n";
+                    for (size_t pi = vi.pays.size(); pi-- > 1;) {
+                        std::string ps = request_step(vi.pays[pi]);
                         std::string pl = "%r" + std::to_string(r++);
-                        std::string sh = "%r" + std::to_string(r++);
-                        std::string a2 = "%r" + std::to_string(r++);
+                        std::string ld = "%r" + std::to_string(r++);
                         b += "  " + pl + " = getelementptr i8, ptr %e, i64 " +
                              std::to_string(8 + 8 * pi) + "\n";
-                        std::string ld = "%r" + std::to_string(r++);
                         b += "  " + ld + " = load i64, ptr " + pl + "\n";
-                        b += "  " + sh + " = call ptr " + ps + "(i64 " + ld + ")\n";
-                        b += "  " + a2 + " = call ptr @beans_concat(ptr " + acc +
-                             ", ptr " + sh + ")\n";
-                        b += "  call void @beans_release(ptr " + sh + ")\n";
-                        if (acc_owned) b += "  call void @beans_release(ptr " + acc + ")\n";
-                        acc = a2;
-                        acc_owned = true;
+                        b += "  call void @beans_show_push_val(ptr %c, ptr " + ps +
+                             ", i64 " + ld + ")\n";
+                        b += "  call void @beans_show_push_lit(ptr %c, ptr " +
+                             intern_string(", ") + ")\n";
                     }
-                    std::string fin = "%r" + std::to_string(r++);
-                    b += "  " + fin + " = call ptr @beans_concat(ptr " + acc +
-                         ", ptr " + intern_string(")") + ")\n";
-                    if (acc_owned) b += "  call void @beans_release(ptr " + acc + ")\n";
-                    b += "  ret ptr " + fin + "\n";
+                    std::string ps0 = request_step(vi.pays[0]);
+                    std::string pl0 = "%r" + std::to_string(r++);
+                    std::string ld0 = "%r" + std::to_string(r++);
+                    b += "  " + pl0 + " = getelementptr i8, ptr %e, i64 8\n";
+                    b += "  " + ld0 + " = load i64, ptr " + pl0 + "\n";
+                    b += "  call void @beans_show_push_val(ptr %c, ptr " + ps0 +
+                         ", i64 " + ld0 + ")\n  ret void\n";
                 }
-                b += "vend:\n  ret ptr " + intern_string("?") + "\n";
+                b += "vend:\n  call void @beans_show_append(ptr %c, ptr " +
+                     intern_string("?") + ")\n  ret void\n";
                 break;
             }
             default:
-                b += "  ret ptr " + intern_string("?") + "\n";
+                b += "  call void @beans_show_append(ptr %c, ptr " +
+                     intern_string("?") + ")\n  ret void\n";
+                break;
+        }
+        b += "}\n";
+        lifted += b;
+        return sym;
+    }
+
+    // structural equality: one `i64 @beqN(i64 a, i64 b)` per type, returning
+    // 0/1 and matching the interpreter's value_eq arm for arm — floats by IEEE
+    // value (NaN equals nothing, -0.0 equals 0.0), decimals by value, strings
+    // and Bytes by content, enums deep over payloads, lists/objects by
+    // identity, maps and resource handles never equal (value_eq's default).
+    // Plain i64 signature so the C runtime's list/map helpers can call through
+    // a fn pointer; memoized before the body is built so recursive enums close
+    // over themselves. No pointer-equality shortcut: some(nan) must not equal
+    // itself, exactly like the interpreter.
+    std::map<Ty*, std::string> eq_fns;
+    std::string request_eq(Ty* t) {
+        auto it = eq_fns.find(t);
+        if (it != eq_fns.end()) return it->second;
+        std::string sym = "@beq" + std::to_string(eq_fns.size());
+        eq_fns[t] = sym;
+        std::string b = "define internal i64 " + sym + "(i64 %a, i64 %b) {\n";
+        switch (t->k) {
+            case Ty::i64_:
+            case Ty::i1_:
+            case Ty::unit_:
+            case Ty::list_:
+            case Ty::obj_: // lists/objects: identity, like value_eq
+                b += "  %c = icmp eq i64 %a, %b\n  %z = zext i1 %c to i64\n"
+                     "  ret i64 %z\n";
+                break;
+            case Ty::f64_:
+                b += "  %x = bitcast i64 %a to double\n"
+                     "  %y = bitcast i64 %b to double\n"
+                     "  %c = fcmp oeq double %x, %y\n"
+                     "  %z = zext i1 %c to i64\n  ret i64 %z\n";
+                break;
+            case Ty::str_:
+                b += "  %p = inttoptr i64 %a to ptr\n  %q = inttoptr i64 %b to ptr\n"
+                     "  %c = call i64 @beans_str_eq(ptr %p, ptr %q)\n  ret i64 %c\n";
+                break;
+            case Ty::dec_:
+                b += "  %p = inttoptr i64 %a to ptr\n  %q = inttoptr i64 %b to ptr\n"
+                     "  %c = call i32 @beans_dec_cmp(ptr %p, ptr %q)\n"
+                     "  %e = icmp eq i32 %c, 0\n  %z = zext i1 %e to i64\n"
+                     "  ret i64 %z\n";
+                break;
+            case Ty::bytes_:
+                b += "  %p = inttoptr i64 %a to ptr\n  %q = inttoptr i64 %b to ptr\n"
+                     "  %c = call i64 @beans_bytes_eq(ptr %p, ptr %q)\n  ret i64 %c\n";
+                break;
+            case Ty::enum_: {
+                std::vector<std::vector<Ty*>> pays; // per variant tag
+                if (t->name == "Option") {
+                    pays.push_back(t->args.empty() ? std::vector<Ty*>{}
+                                                   : std::vector<Ty*>{t->args[0]});
+                    pays.push_back({});
+                } else if (const EnumDecl* d = enum_decls.count(t->name)
+                                                   ? enum_decls[t->name]
+                                                   : nullptr) {
+                    std::map<std::string, Ty*> env;
+                    for (size_t i = 0; i < d->generics.size() && i < t->args.size(); i++) {
+                        env[d->generics[i].name] = t->args[i];
+                    }
+                    for (const EnumVariant& v : d->variants) {
+                        std::vector<Ty*> ps;
+                        for (const Param& p : v.payload) {
+                            ps.push_back(resolve(p.type.get(), env, 0, 0));
+                        }
+                        pays.push_back(std::move(ps));
+                    }
+                }
+                b += "  %ea = inttoptr i64 %a to ptr\n"
+                     "  %eb = inttoptr i64 %b to ptr\n"
+                     "  %ta = load i64, ptr %ea\n  %tb = load i64, ptr %eb\n"
+                     "  %tc = icmp eq i64 %ta, %tb\n"
+                     "  br i1 %tc, label %sw, label %no\nsw:\n";
+                b += "  switch i64 %ta, label %yes [";
+                for (size_t i = 0; i < pays.size(); i++) {
+                    if (!pays[i].empty()) {
+                        b += " i64 " + std::to_string(i) + ", label %v" +
+                             std::to_string(i);
+                    }
+                }
+                b += " ]\n";
+                int r = 0;
+                for (size_t i = 0; i < pays.size(); i++) {
+                    if (pays[i].empty()) continue;
+                    b += "v" + std::to_string(i) + ":\n";
+                    for (size_t pi = 0; pi < pays[i].size(); pi++) {
+                        std::string ps = request_eq(pays[i][pi]);
+                        std::string pa = "%r" + std::to_string(r++);
+                        std::string la = "%r" + std::to_string(r++);
+                        std::string pb = "%r" + std::to_string(r++);
+                        std::string lb = "%r" + std::to_string(r++);
+                        std::string c = "%r" + std::to_string(r++);
+                        std::string cc = "%r" + std::to_string(r++);
+                        std::string off = std::to_string(8 + 8 * pi);
+                        b += "  " + pa + " = getelementptr i8, ptr %ea, i64 " + off + "\n";
+                        b += "  " + la + " = load i64, ptr " + pa + "\n";
+                        b += "  " + pb + " = getelementptr i8, ptr %eb, i64 " + off + "\n";
+                        b += "  " + lb + " = load i64, ptr " + pb + "\n";
+                        b += "  " + c + " = call i64 " + ps + "(i64 " + la + ", i64 " +
+                             lb + ")\n";
+                        b += "  " + cc + " = icmp ne i64 " + c + ", 0\n";
+                        bool last = pi + 1 == pays[i].size();
+                        std::string next = last ? "yes"
+                                                : "v" + std::to_string(i) + "_" +
+                                                      std::to_string(pi + 1);
+                        b += "  br i1 " + cc + ", label %" + next + ", label %no\n";
+                        if (!last) b += next + ":\n";
+                    }
+                }
+                b += "no:\n  ret i64 0\nyes:\n  ret i64 1\n";
+                break;
+            }
+            default: // maps, files, threads, closures: value_eq's false arm
+                b += "  ret i64 0\n";
+                break;
+        }
+        b += "}\n";
+        lifted += b;
+        return sym;
+    }
+
+    // structural hash mirroring request_eq arm for arm: whatever @beqN calls
+    // equal must hash equal, or the map index misses keys the linear scan
+    // found. Memoized before the body so recursive enums close over themselves.
+    std::map<Ty*, std::string> hash_fns;
+    std::string request_hash(Ty* t) {
+        auto it = hash_fns.find(t);
+        if (it != hash_fns.end()) return it->second;
+        std::string sym = "@bhash" + std::to_string(hash_fns.size());
+        hash_fns[t] = sym;
+        std::string b = "define internal i64 " + sym + "(i64 %a) {\n";
+        switch (t->k) {
+            case Ty::i64_:
+            case Ty::i1_:
+            case Ty::unit_:
+            case Ty::list_:
+            case Ty::obj_: // identity kinds hash the slot bits
+                b += "  %h = call i64 @beans_slot_mix(i64 %a)\n  ret i64 %h\n";
+                break;
+            case Ty::f64_:
+                b += "  %h = call i64 @beans_f64_hash(i64 %a)\n  ret i64 %h\n";
+                break;
+            case Ty::str_:
+                b += "  %p = inttoptr i64 %a to ptr\n"
+                     "  %h = call i64 @beans_str_hash(ptr %p)\n  ret i64 %h\n";
+                break;
+            case Ty::dec_:
+                b += "  %p = inttoptr i64 %a to ptr\n"
+                     "  %h = call i64 @beans_dec_hash(ptr %p)\n  ret i64 %h\n";
+                break;
+            case Ty::bytes_:
+                b += "  %p = inttoptr i64 %a to ptr\n"
+                     "  %h = call i64 @beans_bytes_hash(ptr %p)\n  ret i64 %h\n";
+                break;
+            case Ty::enum_: {
+                std::vector<std::vector<Ty*>> pays; // per variant tag
+                if (t->name == "Option") {
+                    pays.push_back(t->args.empty() ? std::vector<Ty*>{}
+                                                   : std::vector<Ty*>{t->args[0]});
+                    pays.push_back({});
+                } else if (const EnumDecl* d = enum_decls.count(t->name)
+                                                   ? enum_decls[t->name]
+                                                   : nullptr) {
+                    std::map<std::string, Ty*> env;
+                    for (size_t i = 0; i < d->generics.size() && i < t->args.size(); i++) {
+                        env[d->generics[i].name] = t->args[i];
+                    }
+                    for (const EnumVariant& v : d->variants) {
+                        std::vector<Ty*> ps;
+                        for (const Param& p : v.payload) {
+                            ps.push_back(resolve(p.type.get(), env, 0, 0));
+                        }
+                        pays.push_back(std::move(ps));
+                    }
+                }
+                b += "  %ea = inttoptr i64 %a to ptr\n"
+                     "  %t = load i64, ptr %ea\n"
+                     "  %h0 = call i64 @beans_slot_mix(i64 %t)\n";
+                b += "  switch i64 %t, label %done [";
+                for (size_t i = 0; i < pays.size(); i++) {
+                    if (!pays[i].empty()) {
+                        b += " i64 " + std::to_string(i) + ", label %v" +
+                             std::to_string(i);
+                    }
+                }
+                b += " ]\n";
+                int r = 0;
+                for (size_t i = 0; i < pays.size(); i++) {
+                    if (pays[i].empty()) continue;
+                    b += "v" + std::to_string(i) + ":\n";
+                    std::string acc = "%h0";
+                    for (size_t pi = 0; pi < pays[i].size(); pi++) {
+                        std::string ps = request_hash(pays[i][pi]);
+                        std::string pa = "%r" + std::to_string(r++);
+                        std::string la = "%r" + std::to_string(r++);
+                        std::string fh = "%r" + std::to_string(r++);
+                        std::string mu = "%r" + std::to_string(r++);
+                        std::string nx = "%r" + std::to_string(r++);
+                        std::string off = std::to_string(8 + 8 * pi);
+                        b += "  " + pa + " = getelementptr i8, ptr %ea, i64 " + off + "\n";
+                        b += "  " + la + " = load i64, ptr " + pa + "\n";
+                        b += "  " + fh + " = call i64 " + ps + "(i64 " + la + ")\n";
+                        b += "  " + mu + " = mul i64 " + acc + ", 1099511628211\n";
+                        b += "  " + nx + " = xor i64 " + mu + ", " + fh + "\n";
+                        acc = nx;
+                    }
+                    b += "  ret i64 " + acc + "\n";
+                }
+                b += "done:\n  ret i64 %h0\n";
+                break;
+            }
+            default: // never-equal kinds: any hash is consistent with eq
+                b += "  ret i64 0\n";
                 break;
         }
         b += "}\n";
@@ -1122,6 +1417,12 @@ struct FnEmit {
         }
         return false;
     }
+    bool is_temp(const std::string& val) const {
+        for (const std::string& t : temps) {
+            if (t == val) return true;
+        }
+        return false;
+    }
     void emit_retain(const std::string& val) {
         line("call void @beans_retain(ptr " + val + ")");
     }
@@ -1175,6 +1476,73 @@ struct FnEmit {
 
     using EV = std::pair<std::string, Ty*>;
 
+    // Reads borrow — that is the discipline — but a borrow handed into a call
+    // (argument, method receiver, match subject) can outlive its owner: the
+    // callee may overwrite the container slot or object field it came from,
+    // releasing the value while the caller still holds the raw pointer. Pin
+    // exactly that shape: container/field reads get one retain and die with
+    // the statement's temps. Idents, literals, and already-owned results are
+    // skipped, so nothing lands on paths that did not need it.
+    void pin_borrow(const Expr* a, const EV& v) {
+        if (!a || !is_rc(v.second)) return;
+        if (a->kind != Expr::Kind::index && a->kind != Expr::Kind::field) return;
+        if (is_temp(v.first)) return;
+        emit_retain(v.first);
+        own(v.first, v.second);
+    }
+
+    // equality kind for the C helpers (slot_eq/map_find), mirroring the
+    // interpreter's value_eq: 0 raw slot (ints, bools, unit, pointer-identity
+    // lists/objects), 1 f64 by IEEE value, 2 string content, 3 decimal value,
+    // 4 generated structural thunk (enums, Bytes), 5 never equal (maps and
+    // resource handles — value_eq's default arm)
+    int eq_kind(Ty* t) {
+        switch (t->k) {
+            case Ty::f64_: return 1;
+            case Ty::str_: return 2;
+            case Ty::dec_: return 3;
+            case Ty::enum_:
+            case Ty::bytes_: return 4;
+            case Ty::i64_:
+            case Ty::i1_:
+            case Ty::unit_:
+            case Ty::list_:
+            case Ty::obj_: return 0;
+            default: return 5;
+        }
+    }
+    std::string eq_thunk(Ty* t, int kind) { return kind == 4 ? cg.request_eq(t) : "null"; }
+    // map index hash for thunk-compared keys; other kinds hash in the runtime
+    std::string hash_thunk(Ty* t, int kind) { return kind == 4 ? cg.request_hash(t) : "null"; }
+    // interp panics on integer divide/modulo by zero; a bare sdiv would give 0
+    // silently on arm64 (and trap on x86) — emit the same panic on both paths
+    void guard_div_zero(const std::string& rhs, bool is_mod, uint32_t ln, uint32_t cl) {
+        std::string c = reg();
+        line(c + " = icmp eq i64 " + rhs + ", 0");
+        std::string bad = bb(), ok = bb();
+        line("br i1 " + c + ", label %" + bad + ", label %" + ok);
+        label(bad);
+        line("call void @beans_panic(ptr " +
+             cg.intern_string(is_mod ? "modulo by zero" : "divide by zero") +
+             ", i64 " + std::to_string(ln) + ", i64 " + std::to_string(cl) + ")");
+        line("unreachable");
+        label(ok);
+    }
+    // ordering kind for sort/min/max — non-ordered element types (reachable
+    // through generic instantiation) get kind 4: slot_cmp answers "equal", so
+    // sort keeps the original order and min/max return the first element,
+    // exactly like the interpreter's value_less returning false
+    int order_kind(Ty* t) {
+        switch (t->k) {
+            case Ty::f64_: return 1;
+            case Ty::str_: return 2;
+            case Ty::dec_: return 3;
+            case Ty::i64_:
+            case Ty::i1_: return 0;
+            default: return 4;
+        }
+    }
+
     // value is about to be stored somewhere that owns it: transfer or +1
     void transfer_in(const EV& v) {
         if (!is_rc(v.second)) return;
@@ -1204,6 +1572,7 @@ struct FnEmit {
     }
     // enum boxes own their payload refs; the box itself is an owned temp
     std::string box_enum(int tag, const std::vector<EV>& payload) {
+        if (payload.empty()) return cg.intern_enum_tag(tag); // immortal singleton
         long long mask = 0;
         for (size_t i = 0; i < payload.size(); i++) {
             if (is_rc(payload[i].second)) mask |= 1LL << (i + 1);
@@ -1317,17 +1686,23 @@ struct FnEmit {
                 return eval_field(e);
             case Expr::Kind::index: {
                 EV obj = eval(e->object.get());
-                EV idx = eval(e->index_expr.get());
+                // the key must be built as the map's key type — a bare 1.5 on
+                // a Map<decimal,_> read has to become a BDec, not float bits
+                Ty* ih = obj.second->k == Ty::map_    ? obj.second->args[0]
+                         : obj.second->k == Ty::list_ ? cg.t_i64()
+                                                      : nullptr;
+                EV idx = eval(e->index_expr.get(), ih);
                 if (obj.second->k == Ty::map_) {
                     // map read: the value, or a panic naming the missing key —
                     // message byte-identical to the interpreter's
                     Ty* K = obj.second->args[0];
                     Ty* V = obj.second->args[1];
-                    int kind = K->k == Ty::str_ ? 1 : 0;
+                    int kind = eq_kind(K);
                     std::string okf = fresh_slot("mgok", cg.t_i64());
                     std::string raw = reg();
                     line(raw + " = call i64 @beans_map_get(ptr " + obj.first + ", i64 " +
                          to_slot(idx) + ", i64 " + std::to_string(kind) + ", ptr " + okf +
+                         ", ptr " + eq_thunk(K, kind) + ", ptr " + hash_thunk(K, kind) +
                          ")");
                     std::string okv = reg(), c = reg();
                     line(okv + " = load i64, ptr " + okf);
@@ -1673,8 +2048,16 @@ struct FnEmit {
                                      : op == TokenKind::minus ? "sub"
                                      : op == TokenKind::star  ? "mul"
                                                               : "div";
-                    line(r + " = call ptr @beans_dec_" + fn + "(ptr " + l.first +
-                         ", ptr " + r2.first + ")");
+                    if (op == TokenKind::slash) {
+                        // div panics on zero; it needs the source position so
+                        // the message matches the interpreter's
+                        line(r + " = call ptr @beans_dec_div(ptr " + l.first +
+                             ", ptr " + r2.first + ", i64 " + std::to_string(e->line) +
+                             ", i64 " + std::to_string(e->col) + ")");
+                    } else {
+                        line(r + " = call ptr @beans_dec_" + fn + "(ptr " + l.first +
+                             ", ptr " + r2.first + ")");
+                    }
                     own(r, cg.t_dec());
                     return {r, cg.t_dec()};
                 }
@@ -1687,11 +2070,31 @@ struct FnEmit {
             }
         }
         if (l.second->k == Ty::enum_) {
-            // payload-free enum equality: compare tags
-            std::string ta = load_at(l.first, 0, cg.t_i64());
-            std::string tb = load_at(r2.first, 0, cg.t_i64());
-            line(r + " = icmp " + (op == TokenKind::eq ? "eq" : "ne") + " i64 " + ta +
-                 ", " + tb);
+            // structural equality like the interpreter's value_eq: tags first,
+            // then payload fields, deep. Payload-free enums keep the plain tag
+            // compare — same answer, no call.
+            bool payload = false;
+            if (l.second->name == "Option") {
+                payload = true;
+            } else if (const EnumDecl* d = cg.enum_decls.count(l.second->name)
+                                               ? cg.enum_decls[l.second->name]
+                                               : nullptr) {
+                for (const EnumVariant& v : d->variants) payload |= !v.payload.empty();
+            }
+            if (!payload) {
+                std::string ta = load_at(l.first, 0, cg.t_i64());
+                std::string tb = load_at(r2.first, 0, cg.t_i64());
+                line(r + " = icmp " + (op == TokenKind::eq ? "eq" : "ne") + " i64 " +
+                     ta + ", " + tb);
+                return {r, cg.t_bool()};
+            }
+            std::string sym = cg.request_eq(l.second);
+            std::string pa = reg(), pb = reg(), c = reg();
+            line(pa + " = ptrtoint ptr " + l.first + " to i64");
+            line(pb + " = ptrtoint ptr " + r2.first + " to i64");
+            line(c + " = call i64 " + sym + "(i64 " + pa + ", i64 " + pb + ")");
+            line(r + " = icmp " + (op == TokenKind::eq ? "ne" : "eq") + " i64 " + c +
+                 ", 0");
             return {r, cg.t_bool()};
         }
 
@@ -1712,8 +2115,12 @@ struct FnEmit {
             case TokenKind::plus: return arith("add", "fadd");
             case TokenKind::minus: return arith("sub", "fsub");
             case TokenKind::star: return arith("mul", "fmul");
-            case TokenKind::slash: return arith("sdiv", "fdiv");
-            case TokenKind::percent: return arith("srem", "frem");
+            case TokenKind::slash:
+                if (!flt) guard_div_zero(r2.first, false, e->line, e->col);
+                return arith("sdiv", "fdiv");
+            case TokenKind::percent:
+                if (!flt) guard_div_zero(r2.first, true, e->line, e->col);
+                return arith("srem", "frem");
             case TokenKind::shl: return arith("shl", "shl");
             case TokenKind::shr: return arith("ashr", "ashr");
             case TokenKind::amp: return arith("and", "and");
@@ -1835,14 +2242,15 @@ struct FnEmit {
         if (obj.second->k == Ty::map_) {
             Ty* K = obj.second->args[0];
             Ty* V = obj.second->args[1];
-            int kind = K->k == Ty::str_ ? 1 : 0;
+            int kind = eq_kind(K);
             EV k = eval(s->target->index_expr.get(), K);
             EV v = eval(s->value.get(), V);
             // the map owns both refs — storing borrows here corrupted the heap
             transfer_in(k);
             transfer_in(v);
             line("call void @beans_map_set(ptr " + obj.first + ", i64 " + to_slot(k) +
-                 ", i64 " + to_slot(v) + ", i64 " + std::to_string(kind) + ")");
+                 ", i64 " + to_slot(v) + ", i64 " + std::to_string(kind) + ", ptr " +
+                 eq_thunk(K, kind) + ", ptr " + hash_thunk(K, kind) + ")");
             return;
         }
         cg.err(s->line, s->col, "assigning into this");
@@ -1948,7 +2356,7 @@ struct FnEmit {
         if (e->name.empty() && (is_map_hint || has_expr_keys)) {
             Ty* K = is_map_hint ? hint->args[0] : cg.t_str();
             Ty* V = is_map_hint ? hint->args[1] : cg.t_i64();
-            int kind = K->k == Ty::str_ ? 1 : 0;
+            int kind = eq_kind(K);
             std::string m = reg();
             line(m + " = call ptr @beans_map_new(i64 " +
                  std::string(is_rc(K) ? "1" : "0") + ", i64 " +
@@ -1960,7 +2368,9 @@ struct FnEmit {
                 transfer_in(k);
                 transfer_in(v);
                 line("call void @beans_map_set(ptr " + m + ", i64 " + to_slot(k) +
-                     ", i64 " + to_slot(v) + ", i64 " + std::to_string(kind) + ")");
+                     ", i64 " + to_slot(v) + ", i64 " + std::to_string(kind) +
+                     ", ptr " + eq_thunk(K, kind) + ", ptr " + hash_thunk(K, kind) +
+                     ")");
             }
             own(m, cg.t_map(K, V));
             return {m, cg.t_map(K, V)};
@@ -2029,7 +2439,9 @@ struct FnEmit {
             Ty* h = i < params.size()
                         ? cg.resolve(params[i].type.get(), penv, e->line, e->col)
                         : nullptr;
-            out.push_back(eval(e->args[i].get(), h));
+            EV v = eval(e->args[i].get(), h);
+            pin_borrow(e->args[i].get(), v);
+            out.push_back(v);
         }
         return out;
     }
@@ -2351,6 +2763,7 @@ struct FnEmit {
         }
 
         EV recv = eval(obj);
+        pin_borrow(obj, recv);
         return method_call(e, recv, mname);
     }
 
@@ -2703,6 +3116,7 @@ struct FnEmit {
                 if (mname == "abs") {
                     std::string r = reg();
                     line(r + " = call ptr @beans_dec_abs(ptr " + recv.first + ")");
+                    own(r, cg.t_dec()); // fresh BDec — unowned, it leaked
                     return {r, cg.t_dec()};
                 }
                 if (mname == "round") {
@@ -2710,6 +3124,7 @@ struct FnEmit {
                     std::string r = reg();
                     line(r + " = call ptr @beans_dec_round(ptr " + recv.first + ", i64 " +
                          p.first + ")");
+                    own(r, cg.t_dec());
                     return {r, cg.t_dec()};
                 }
                 break;
@@ -2826,10 +3241,7 @@ struct FnEmit {
                     return {r, cg.t_option(elem)};
                 }
                 if (mname == "max") {
-                    int kind = elem->k == Ty::f64_    ? 1
-                               : elem->k == Ty::str_  ? 2
-                               : elem->k == Ty::dec_  ? 3
-                                                      : 0;
+                    int kind = order_kind(elem);
                     std::string okf = fresh_slot("mokf", cg.t_i64());
                     std::string raw = reg();
                     line(raw + " = call i64 @beans_list_max(ptr " + recv.first +
@@ -2858,11 +3270,11 @@ struct FnEmit {
                 }
                 if (mname == "contains") {
                     EV v = eval(e->args[0].get(), elem);
-                    int kind = elem->k == Ty::str_ ? 2 : elem->k == Ty::dec_ ? 3
-                               : elem->k == Ty::f64_ ? 1 : 0;
+                    int kind = eq_kind(elem);
                     std::string c = reg(), r = reg();
                     line(c + " = call i64 @beans_list_contains(ptr " + recv.first +
-                         ", i64 " + to_slot(v) + ", i64 " + std::to_string(kind) + ")");
+                         ", i64 " + to_slot(v) + ", i64 " + std::to_string(kind) +
+                         ", ptr " + eq_thunk(elem, kind) + ")");
                     line(r + " = icmp ne i64 " + c + ", 0");
                     return {r, cg.t_bool()};
                 }
@@ -2923,10 +3335,7 @@ struct FnEmit {
                     return {r, cg.t_option(elem)};
                 }
                 if (mname == "min") {
-                    int kind = elem->k == Ty::f64_    ? 1
-                               : elem->k == Ty::str_  ? 2
-                               : elem->k == Ty::dec_  ? 3
-                                                      : 0;
+                    int kind = order_kind(elem);
                     std::string okf = fresh_slot("mnok", cg.t_i64());
                     std::string raw = reg();
                     line(raw + " = call i64 @beans_list_min(ptr " + recv.first +
@@ -2955,13 +3364,12 @@ struct FnEmit {
                 }
                 if (mname == "index_of") {
                     EV v = eval(e->args[0].get(), elem);
-                    int kind = elem->k == Ty::str_ ? 2 : elem->k == Ty::dec_ ? 3
-                               : elem->k == Ty::f64_ ? 1 : 0;
+                    int kind = eq_kind(elem);
                     std::string okf = fresh_slot("ixok", cg.t_i64());
                     std::string raw = reg();
                     line(raw + " = call i64 @beans_list_index(ptr " + recv.first +
                          ", i64 " + to_slot(v) + ", i64 " + std::to_string(kind) +
-                         ", ptr " + okf + ")");
+                         ", ptr " + okf + ", ptr " + eq_thunk(elem, kind) + ")");
                     std::string okv = reg(), c = reg();
                     line(okv + " = load i64, ptr " + okf);
                     line(c + " = icmp ne i64 " + okv + ", 0");
@@ -3024,10 +3432,7 @@ struct FnEmit {
                     return {r, rt_};
                 }
                 if (mname == "sort") {
-                    int kind = elem->k == Ty::f64_    ? 1
-                               : elem->k == Ty::str_  ? 2
-                               : elem->k == Ty::dec_  ? 3
-                                                      : 0;
+                    int kind = order_kind(elem);
                     line("call void @beans_list_sort(ptr " + recv.first + ", i64 " +
                          std::to_string(kind) + ")");
                     return {"", cg.t_unit()};
@@ -3044,7 +3449,9 @@ struct FnEmit {
             case Ty::map_: {
                 Ty* K = rt_->args[0];
                 Ty* V = rt_->args[1];
-                int kind = K->k == Ty::str_ ? 1 : 0;
+                int kind = eq_kind(K);
+                std::string keq = eq_thunk(K, kind);
+                std::string khash = hash_thunk(K, kind);
                 if (mname == "set") {
                     EV k = eval(e->args[0].get(), K);
                     EV v = eval(e->args[1].get(), V);
@@ -3052,7 +3459,8 @@ struct FnEmit {
                     transfer_in(v);
                     line("call void @beans_map_set(ptr " + recv.first + ", i64 " +
                          to_slot(k) + ", i64 " + to_slot(v) + ", i64 " +
-                         std::to_string(kind) + ")");
+                         std::to_string(kind) + ", ptr " + keq + ", ptr " + khash +
+                         ")");
                     return {"", cg.t_unit()};
                 }
                 if (mname == "get") {
@@ -3060,7 +3468,8 @@ struct FnEmit {
                     std::string okf = fresh_slot("gokf", cg.t_i64());
                     std::string raw = reg();
                     line(raw + " = call i64 @beans_map_get(ptr " + recv.first + ", i64 " +
-                         to_slot(k) + ", i64 " + std::to_string(kind) + ", ptr " + okf + ")");
+                         to_slot(k) + ", i64 " + std::to_string(kind) + ", ptr " + okf +
+                         ", ptr " + keq + ", ptr " + khash + ")");
                     std::string okv = reg(), c = reg();
                     line(okv + " = load i64, ptr " + okf);
                     line(c + " = icmp ne i64 " + okv + ", 0");
@@ -3093,7 +3502,8 @@ struct FnEmit {
                     (void)raw;
                     std::string d = reg();
                     line(d + " = call i64 @beans_map_get(ptr " + recv.first + ", i64 " +
-                         to_slot(k) + ", i64 " + std::to_string(kind) + ", ptr " + okf + ")");
+                         to_slot(k) + ", i64 " + std::to_string(kind) + ", ptr " + okf +
+                         ", ptr " + keq + ", ptr " + khash + ")");
                     std::string okv = reg(), r = reg();
                     line(okv + " = load i64, ptr " + okf);
                     line(r + " = icmp ne i64 " + okv + ", 0");
@@ -3103,7 +3513,8 @@ struct FnEmit {
                     EV k = eval(e->args[0].get(), K);
                     std::string c = reg(), r = reg();
                     line(c + " = call i64 @beans_map_remove(ptr " + recv.first +
-                         ", i64 " + to_slot(k) + ", i64 " + std::to_string(kind) + ")");
+                         ", i64 " + to_slot(k) + ", i64 " + std::to_string(kind) +
+                         ", ptr " + keq + ", ptr " + khash + ")");
                     line(r + " = icmp ne i64 " + c + ", 0");
                     return {r, cg.t_bool()};
                 }
@@ -3232,6 +3643,7 @@ struct FnEmit {
     // ---- match ----
     EV eval_match(const Expr* e, Ty* hint) {
         EV subj = eval(e->subject.get());
+        pin_borrow(e->subject.get(), subj);
         std::string endb = bb();
         // any block arm means statement position (checker-enforced): the whole
         // match is valueless and expr-arm values die as arm-local temps —
@@ -3468,8 +3880,14 @@ struct FnEmit {
                                      : s->op == TokenKind::minus_eq ? "sub"
                                      : s->op == TokenKind::star_eq  ? "mul"
                                                                     : "div";
-                    line(r + " = call ptr @beans_dec_" + fn + "(ptr " + cur + ", ptr " +
-                         v.first + ")");
+                    if (s->op == TokenKind::slash_eq) {
+                        line(r + " = call ptr @beans_dec_div(ptr " + cur + ", ptr " +
+                             v.first + ", i64 " + std::to_string(s->value->line) +
+                             ", i64 " + std::to_string(s->value->col) + ")");
+                    } else {
+                        line(r + " = call ptr @beans_dec_" + fn + "(ptr " + cur +
+                             ", ptr " + v.first + ")");
+                    }
                     line("store ptr " + r + ", ptr " + ptr);
                     emit_release(cur);
                     return;
@@ -3483,6 +3901,11 @@ struct FnEmit {
                         case TokenKind::slash_eq: op = flt ? "fdiv" : "sdiv"; break;
                         case TokenKind::percent_eq: op = flt ? "frem" : "srem"; break;
                         default: return;
+                    }
+                    if (!flt && (s->op == TokenKind::slash_eq ||
+                                 s->op == TokenKind::percent_eq)) {
+                        guard_div_zero(v.first, s->op == TokenKind::percent_eq,
+                                       s->value->line, s->value->col);
                     }
                     line(r + " = " + op + " " + (flt ? "double" : "i64") + " " + cur +
                          ", " + v.first);
@@ -3739,7 +4162,17 @@ struct FnEmit {
         }
 
         std::string firstb = bb();
-        exec_block(body_ref);
+        // The function body's scope is NOT released at block end the way
+        // nested blocks are: emit_ret runs the armed defers first and then
+        // releases the whole frame, so a defer never runs on freed locals.
+        // (threads.b's `defer ch.close()` closed a freed channel before this.)
+        scopes.emplace_back();
+        for (const StmtPtr& s : body_ref) {
+            if (terminated) break;
+            size_t mark = temps.size();
+            exec(s.get());
+            if (!terminated) flush_temps(mark);
+        }
         if (!terminated) {
             if (is_main) emit_ret("ret i32 0");
             else if (ret_ty->k == Ty::unit_) emit_ret("ret void");
@@ -3748,6 +4181,7 @@ struct FnEmit {
                 emit_ret("ret " + std::string(ll(ret_ty)) + " 0");
             else emit_ret("ret ptr null");
         }
+        scopes.pop_back();
         scopes.pop_back();
 
         return header + allocas + entry_inits + "  br label %" + firstb + "\n" +
@@ -3958,10 +4392,16 @@ std::string CodeGen::generate() {
     out += "declare ptr @beans_list_new(i64)\n";
     out += "declare ptr @beans_list_join(ptr, ptr, i64)\n";
     out += "declare ptr @beans_show_list(ptr, ptr)\n";
+    out += "declare ptr @beans_show_run(ptr, i64)\n";
+    out += "declare void @beans_show_append(ptr, ptr)\n";
+    out += "declare void @beans_show_push_val(ptr, ptr, i64)\n";
+    out += "declare void @beans_show_push_lit(ptr, ptr)\n";
+    out += "declare void @beans_show_list_iter(ptr, ptr, ptr)\n";
     out += "declare ptr @beans_list_join_show(ptr, ptr, ptr)\n";
     out += "declare void @beans_list_push(ptr, i64)\n";
     out += "declare i64 @beans_list_min(ptr, i64, ptr)\n";
-    out += "declare i64 @beans_list_index(ptr, i64, i64, ptr)\n";
+    out += "declare i64 @beans_list_index(ptr, i64, i64, ptr, ptr)\n";
+    out += "declare i64 @beans_str_eq(ptr, ptr)\n";
     out += "declare void @beans_list_insert(ptr, i64, i64, i64, i64)\n";
     out += "declare i64 @beans_list_remove(ptr, i64, i64, i64)\n";
     out += "declare void @beans_list_reverse(ptr)\n";
@@ -3969,17 +4409,22 @@ std::string CodeGen::generate() {
     out += "declare ptr @beans_list_slice(ptr, i64, i64, i64, i64)\n";
     out += "declare void @beans_list_sort(ptr, i64)\n";
     out += "declare void @beans_list_sort_by(ptr, ptr, ptr)\n";
-    out += "declare i64 @beans_map_remove(ptr, i64, i64)\n";
+    out += "declare i64 @beans_map_remove(ptr, i64, i64, ptr, ptr)\n";
     out += "declare ptr @beans_map_keys(ptr)\n";
     out += "declare ptr @beans_map_values(ptr)\n";
     out += "declare void @beans_map_clear(ptr)\n";
+    out += "declare i64 @beans_slot_mix(i64)\n";
+    out += "declare i64 @beans_f64_hash(i64)\n";
+    out += "declare i64 @beans_str_hash(ptr)\n";
+    out += "declare i64 @beans_dec_hash(ptr)\n";
+    out += "declare i64 @beans_bytes_hash(ptr)\n";
     out += "declare i64 @beans_f64_round(double)\n";
     out += "declare double @llvm.fabs.f64(double)\n";
     out += "declare ptr @beans_dec_new(i128, i64)\n";
     out += "declare ptr @beans_dec_add(ptr, ptr)\n";
     out += "declare ptr @beans_dec_sub(ptr, ptr)\n";
     out += "declare ptr @beans_dec_mul(ptr, ptr)\n";
-    out += "declare ptr @beans_dec_div(ptr, ptr)\n";
+    out += "declare ptr @beans_dec_div(ptr, ptr, i64, i64)\n";
     out += "declare ptr @beans_dec_neg(ptr)\n";
     out += "declare ptr @beans_dec_abs(ptr)\n";
     out += "declare ptr @beans_dec_round(ptr, i64)\n";
@@ -3990,10 +4435,10 @@ std::string CodeGen::generate() {
     out += "declare i64 @beans_dec_to_int(ptr)\n";
     out += "declare double @beans_dec_to_f64(ptr)\n";
     out += "declare i64 @beans_list_max(ptr, i64, ptr)\n";
-    out += "declare i64 @beans_list_contains(ptr, i64, i64)\n";
+    out += "declare i64 @beans_list_contains(ptr, i64, i64, ptr)\n";
     out += "declare ptr @beans_map_new(i64, i64)\n";
-    out += "declare void @beans_map_set(ptr, i64, i64, i64)\n";
-    out += "declare i64 @beans_map_get(ptr, i64, i64, ptr)\n";
+    out += "declare void @beans_map_set(ptr, i64, i64, i64, ptr, ptr)\n";
+    out += "declare i64 @beans_map_get(ptr, i64, i64, ptr, ptr, ptr)\n";
     out += "declare ptr @beans_thread_spawn(ptr, ptr)\n";
     out += "declare i64 @beans_thread_join(ptr)\n";
     out += "declare ptr @beans_mutex_new(i64, i64)\n";
@@ -4087,7 +4532,7 @@ static void cc_set_color(BHead* h, long long c) { h->meta = (h->meta & ~CC_COLOR
 static _Atomic long long cc_threads;  // live worker threads; collect only at 0
 static _Atomic int cc_pending;
 static int cc_collecting;
-static void cc_collect(void);
+static void cc_collect(int force);
 
 // segregated per-thread freelists over 64KB slabs: one calloc per slab,
 // then carve; a free pushes the block on the freeing thread's list. Slabs
@@ -4109,10 +4554,11 @@ __attribute__((constructor)) static void pool_setup(void) {
     pool_off = getenv("BEANS_NO_POOL") != NULL;
 }
 
+void beans_panic(const char* msg, long long line, long long col);
 void* beans_alloc(long long size, long long meta) {
     // allocation is the one safe point: never inside a release cascade,
     // and every stored reference is already counted
-    if (cc_pending && !cc_collecting && cc_threads == 0) cc_collect();
+    if (cc_pending && !cc_collecting && cc_threads == 0) cc_collect(0);
     size_t total = (16 + (size_t)size + 15) & ~(size_t)15;
     long long cls = (long long)(total >> 4);
     BHead* h;
@@ -4124,6 +4570,7 @@ void* beans_alloc(long long size, long long meta) {
         } else {
             if (!pool_cur || pool_cur + total > pool_end) {
                 pool_cur = calloc(1, POOL_SLAB);
+                if (!pool_cur) beans_panic("out of memory", 0, 0);
                 pool_end = pool_cur + POOL_SLAB;
                 pthread_mutex_lock(&pool_mu);
                 if (pool_slab_len == pool_slab_cap) {
@@ -4140,6 +4587,7 @@ void* beans_alloc(long long size, long long meta) {
         h->rc = 1 | (cls << RC_CLS_SHIFT);
     } else {
         h = calloc(1, total);
+        if (!h) beans_panic("out of memory", 0, 0);
         h->rc = 1;
     }
     h->meta = meta;
@@ -4165,8 +4613,18 @@ typedef struct {
     long long len, cap;
 } BList;
 typedef struct {
-    long long* data; // key,value interleaved
-    long long len, cap;
+    long long* data; // key,value interleaved, insertion order — len stays at
+    long long len, cap; // offset 8: map.len() is a direct field load in IR
+    // open-addressed index over data: (hash hi32 << 32) | (pos+2), 0 empty,
+    // 1 tombstone. NULL until the map outgrows a linear scan.
+    unsigned long long* idx;
+    long long icap, tombs;
+    // remove on an indexed map zeroes the pair and sets its dead bit instead
+    // of shifting, so delete is O(1); used counts physical slots, len live
+    // ones. deadbits NULL = no holes. map_reindex compacts when holes
+    // outnumber live entries, so iteration stays O(len) amortized.
+    long long used;
+    unsigned long long* deadbits;
 } BMap;
 typedef struct {
     pthread_mutex_t m;
@@ -4200,7 +4658,7 @@ static void cc_walk(void* p, long long meta, void (*fn)(void*, void*), void* ctx
         }
     } else if (kind == 3) {
         BMap* m = p;
-        for (long long i = 0; i < m->len; i++) {
+        for (long long i = 0; i < m->used; i++) { // holes are zeroed: null-skip
             if ((extra & 1) && m->data[i * 2]) fn((void*)m->data[i * 2], ctx);
             if ((extra & 2) && m->data[i * 2 + 1]) fn((void*)m->data[i * 2 + 1], ctx);
         }
@@ -4234,18 +4692,23 @@ typedef struct {
 static void cc_free_shell(void* p, long long meta) {
     long long kind = meta & 7;
     if (kind == 2) free(((BList*)p)->data);
-    else if (kind == 3) free(((BMap*)p)->data);
-    else if (kind == 4) free(((BChan*)p)->q);
+    else if (kind == 3) {
+        free(((BMap*)p)->data);
+        free(((BMap*)p)->idx);
+        free(((BMap*)p)->deadbits);
+    } else if (kind == 4) free(((BChan*)p)->q);
     else if (kind == 6) { // OS resource — dropping the last ref is the safety
+        // close whatever is still open at the OS level, whether the handle was
+        // never closed or its close was deferred while threads ran (fd/p left
+        // valid, the logical `closed` flag already set). The last ref is gone,
+        // so no thread can be mid-op here — releasing now is safe.
         if ((meta & CC_SHAPE) >> 3 & 1) { // shape bit 0: 0 = file, 1 = mmap
             BMMap* m = p;
-            if (!m->closed) {
-                if (m->p) munmap(m->p, (size_t)m->len);
-                if (m->fd >= 0) close((int)m->fd);
-            }
+            if (m->p) munmap(m->p, (size_t)m->len);
+            if (m->fd >= 0) close((int)m->fd);
         } else {
             BFile* f = p; // net; close() / f.close() is the real API
-            if (!f->closed && f->fd >= 0) close((int)f->fd);
+            if (f->fd >= 0) close((int)f->fd);
         }
     }
     BHead* h = head_of(p);
@@ -4286,14 +4749,16 @@ static void cc_possible_root(void* p) {
     BHead* h = head_of(p);
     long long old = __atomic_fetch_or(&h->meta, CC_PURPLE | CC_BUF, __ATOMIC_RELAXED);
     if (old & CC_BUF) return; // already parked
-    pthread_mutex_lock(&cc_mu);
+    // like the counts, the buffer goes unlocked until the first spawn: one
+    // thread exists, and after cc_mt flips every park takes the mutex
+    if (cc_mt) pthread_mutex_lock(&cc_mu);
     if (cc_len == cc_cap) {
         cc_cap = cc_cap ? cc_cap * 2 : 1024;
         cc_roots = realloc(cc_roots, (size_t)cc_cap * sizeof(void*));
     }
     cc_roots[cc_len++] = p;
     if (cc_len >= cc_threshold) cc_pending = 1;
-    pthread_mutex_unlock(&cc_mu);
+    if (cc_mt) pthread_mutex_unlock(&cc_mu);
 }
 
 // iterative: a dropped million-node chain pushes children on an explicit
@@ -4402,14 +4867,16 @@ static void cc_collect_white(void* root, CCStack* st, CCStack* dead) {
     }
 }
 
-static void cc_collect(void) {
+static long long cc_walk_min = 256; // adaptive gate for trial deletion
+
+static void cc_collect(int force) {
     if (cc_collecting) return;
     cc_collecting = 1;
-    pthread_mutex_lock(&cc_mu);
+    if (cc_mt) pthread_mutex_lock(&cc_mu);
 
     // keep only live purple candidates; zombies (released while parked)
     // just need their shells freed, everything else drops out
-    long long n = 0, husks = 0;
+    long long n = 0;
     for (long long i = 0; i < cc_len; i++) {
         void* p = cc_roots[i];
         BHead* h = head_of(p);
@@ -4417,49 +4884,58 @@ static void cc_collect(void) {
             cc_roots[n++] = p;
         } else {
             __atomic_and_fetch(&h->meta, ~CC_BUF, __ATOMIC_RELAXED);
-            if (RC_COUNT(h->rc) == 0) {
-                cc_free_shell(p, h->meta);
-                husks += 1;
-            }
+            if (RC_COUNT(h->rc) == 0) cc_free_shell(p, h->meta);
         }
     }
     cc_len = n;
 
-    CCStack st = {0, 0, 0}, aux = {0, 0, 0}, dead = {0, 0, 0};
-    for (long long i = 0; i < cc_len; i++) cc_mark_gray(cc_roots[i], &st);
-    for (long long i = 0; i < cc_len; i++) cc_scan(cc_roots[i], &st, &aux);
-    for (long long i = 0; i < cc_len; i++) {
-        BHead* h = head_of(cc_roots[i]);
-        __atomic_and_fetch(&h->meta, ~CC_BUF, __ATOMIC_RELAXED);
-        cc_collect_white(cc_roots[i], &st, &dead);
+    // The filter above is the cheap half and just ran: husk shells free at
+    // a steady cadence, so they can never pile past survivors + 256. Trial
+    // deletion is the expensive half — it walks everything reachable from
+    // the survivors — so it only runs once enough purple candidates pile
+    // up, and it backs off hard when a walk frees nothing: a live tree
+    // that gets borrow-pinned on every visit must not be re-walked every
+    // few hundred allocations (that made binary-trees 10x slower than Go).
+    if (cc_len && (force || cc_len >= cc_walk_min)) {
+        CCStack st = {0, 0, 0}, aux = {0, 0, 0}, dead = {0, 0, 0};
+        for (long long i = 0; i < cc_len; i++) cc_mark_gray(cc_roots[i], &st);
+        for (long long i = 0; i < cc_len; i++) cc_scan(cc_roots[i], &st, &aux);
+        for (long long i = 0; i < cc_len; i++) {
+            BHead* h = head_of(cc_roots[i]);
+            __atomic_and_fetch(&h->meta, ~CC_BUF, __ATOMIC_RELAXED);
+            cc_collect_white(cc_roots[i], &st, &dead);
+        }
+        cc_len = 0;
+        // nothing was freed while walking, so no stale pointer was ever
+        // read; now the whole white set goes at once
+        for (long long i = 0; i < dead.len; i++) {
+            cc_free_shell(dead.v[i], head_of(dead.v[i])->meta);
+        }
+        cc_walk_min = dead.len ? 256
+                               : (cc_walk_min * 4 > (1LL << 18) ? (1LL << 18)
+                                                                : cc_walk_min * 4);
+        free(st.v);
+        free(aux.v);
+        free(dead.v);
     }
-    cc_len = 0;
-    // nothing was freed while walking, so no stale pointer was ever read;
-    // now the whole white set goes at once
-    for (long long i = 0; i < dead.len; i++) {
-        cc_free_shell(dead.v[i], head_of(dead.v[i])->meta);
-    }
-    // unproductive collections back off — a big live cyclic-looking graph
-    // shouldn't be re-walked every few allocations. Husk shells freed in the
-    // filter count as productive: pure husk churn must keep the base cadence,
-    // or dead shells pile up to the threshold cap (~80MB seen at 1M)
-    cc_threshold = dead.len || husks ? 256
-                                     : (cc_threshold * 2 > (1LL << 20) ? (1LL << 20)
-                                                                       : cc_threshold * 2);
-    free(st.v);
-    free(aux.v);
-    free(dead.v);
+    // geometric re-arm: survivors stay parked, so the next filter may scan
+    // them again — amortized O(1) per park only if the buffer must grow by
+    // its own size first. Husk shells thus wait at most 2·survivors + 256
+    // parks, which keeps RSS flat in practice (husk-heavy programs have few
+    // long-lived survivors)
+    cc_threshold = cc_len * 2 + 256;
     cc_pending = 0;
-    pthread_mutex_unlock(&cc_mu);
+    if (cc_mt) pthread_mutex_unlock(&cc_mu);
     cc_collecting = 0;
 }
 
 static void cc_at_exit(void) {
-    if (cc_threads == 0) cc_collect();
+    if (cc_threads == 0) cc_collect(1); // forced: leaks must see 0 at exit
 }
 __attribute__((constructor)) static void cc_setup(void) { atexit(cc_at_exit); }
 
 void beans_panic(const char* msg, long long line, long long col) {
+    fflush(stdout); // ordered output: buffered stdout before the stderr panic
     fprintf(stderr, "runtime panic at %lld:%lld: %s\n", line, col, msg);
     exit(3);
 }
@@ -4477,16 +4953,28 @@ void beans_panic_index(long long i, long long len, long long has_len,
 // bits 3-60), so len is O(1) and never strlen. Read through beans_slen —
 // masking with CC_SHAPE is mandatory, colors share the word.
 static long long beans_slen(char* s) { return (head_of(s)->meta & CC_SHAPE) >> 3; }
+static char* str_make(const char* p, long long n);
 static char* rc_strdup(const char* s) {
     size_t n = strlen(s);
     char* r = beans_alloc((long long)n + 1, (long long)n << 3);
     memcpy(r, s, n + 1);
     return r;
 }
+// hand-rolled digits: snprintf("%lld") was ~1/3 of the string-build loop in
+// the strings bench (vfprintf machinery per call); this matches its output
+// byte for byte
 char* beans_from_int(long long v) {
-    char b[32];
-    snprintf(b, sizeof b, "%lld", v);
-    return rc_strdup(b);
+    char b[24];
+    char* e = b + sizeof b;
+    char* p = e;
+    unsigned long long u =
+        v < 0 ? (unsigned long long)-(v + 1) + 1 : (unsigned long long)v;
+    do {
+        *--p = (char)('0' + u % 10);
+        u /= 10;
+    } while (u);
+    if (v < 0) *--p = '-';
+    return str_make(p, e - p);
 }
 char* beans_from_float(double v) {
     char b[48];
@@ -4501,20 +4989,57 @@ char* beans_concat(char* a, char* b) {
     memcpy(r + la, b, lb + 1);
     return r;
 }
+// strings carry their byte length and may legally hold NUL (\0 escapes,
+// File.read) — every consumer here is length-based; C-string fns like fputs,
+// strcmp, and strstr would silently stop at the first NUL and diverge from
+// the interpreter
+static char* str_make(const char* p, long long n);
 void beans_println(char* s) {
-    fputs(s, stdout);
+    fwrite(s, 1, (size_t)beans_slen(s), stdout);
     fputc('\n', stdout);
 }
-void beans_print(char* s) { fputs(s, stdout); }
-int beans_str_cmp(char* a, char* b) { return strcmp(a, b); }
+void beans_print(char* s) { fwrite(s, 1, (size_t)beans_slen(s), stdout); }
+// std::string semantics: bytes compare unsigned over the shorter length,
+// ties break on length
+int beans_str_cmp(char* a, char* b) {
+    long long la = beans_slen(a), lb = beans_slen(b);
+    long long n = la < lb ? la : lb;
+    int c = n ? memcmp(a, b, (size_t)n) : 0;
+    if (c) return c;
+    return la < lb ? -1 : la > lb ? 1 : 0;
+}
 long long beans_str_len(char* s) { return beans_slen(s); }
 char* beans_str_last(char* s, long long n) {
     long long len = beans_slen(s);
     if (n < 0) n = 0;
     if (n > len) n = len;
-    return rc_strdup(s + (len - n));
+    return str_make(s + (len - n), n);
 }
-long long beans_str_contains(char* s, char* sub) { return strstr(s, sub) != NULL; }
+// leftmost match: memchr for the first byte (SIMD in libc), memcmp for the
+// tail. memcmp-at-every-offset made contains/replace/split the hot spot of
+// the strings bench, 2x behind Go's bytealg search.
+static long long str_search(const char* s, long long n, const char* sub,
+                            long long m, long long from) {
+    if (m > n - from) return -1;
+    if (m == 0) return from;
+    const char* end = s + n;
+    const char* p = s + from;
+    for (;;) {
+        long long room = (end - p) - (m - 1);
+        if (room <= 0) return -1;
+        const char* hit = memchr(p, sub[0], (size_t)room);
+        if (!hit) return -1;
+        if (m == 1 || memcmp(hit + 1, sub + 1, (size_t)(m - 1)) == 0) {
+            return hit - s;
+        }
+        p = hit + 1;
+    }
+}
+long long beans_str_contains(char* s, char* sub) {
+    long long n = beans_slen(s), m = beans_slen(sub);
+    if (m == 0) return 1;
+    return str_search(s, n, sub, m, 0) >= 0;
+}
 
 // a ready-made Error box: [vtable null][-1][msg][kind] — the exact 32-byte
 // layout codegen's make_error builds; meta 97 marks slots 2 and 3 as pointers
@@ -4522,6 +5047,15 @@ static void* mk_error(const char* msg, const char* kind) {
     long long* e = beans_alloc(32, 97);
     e[1] = -1;
     e[2] = (long long)rc_strdup(msg);
+    e[3] = (long long)rc_strdup(kind);
+    return e;
+}
+// like mk_error, but msg is already an rc string carrying its exact byte
+// length — user text can hold NUL and must not pass through strlen
+static void* mk_error_own(char* msg_rc, const char* kind) {
+    long long* e = beans_alloc(32, 97);
+    e[1] = -1;
+    e[2] = (long long)msg_rc;
     e[3] = (long long)rc_strdup(kind);
     return e;
 }
@@ -4534,12 +5068,23 @@ typedef struct {
 } BRes;
 
 static BRes parse_fail(const char* s, const char* what) {
-    size_t n = strlen(s) + 48;
-    char* b = malloc(n);
-    snprintf(b, n, "can't read '%s' as %s", s, what);
-    BRes r = {0, mk_error(b, "")};
-    free(b);
-    return r;
+    // s is the beans receiver string — splice it by its stored length so an
+    // embedded NUL keeps the message byte-identical to the interpreter's
+    const char* p1 = "can't read '";
+    const char* p2 = "' as ";
+    long long ls = beans_slen((char*)s);
+    size_t l1 = strlen(p1), l2 = strlen(p2), lw = strlen(what);
+    long long total = (long long)l1 + ls + (long long)l2 + (long long)lw;
+    char* m = beans_alloc(total + 1, total << 3);
+    char* w = m;
+    memcpy(w, p1, l1);
+    w += l1;
+    memcpy(w, s, (size_t)ls);
+    w += ls;
+    memcpy(w, p2, l2);
+    w += l2;
+    memcpy(w, what, lw);
+    return (BRes){0, mk_error_own(m, "")};
 }
 
 BRes beans_str_to_int(char* s) {
@@ -4592,9 +5137,8 @@ long long beans_str_ends_with(char* s, char* p) {
 BOpt beans_str_find(char* s, char* sub) {
     long long n = beans_slen(s), m = beans_slen(sub);
     if (m == 0) return (BOpt){0, 1};
-    for (long long i = 0; i + m <= n; i++) {
-        if (memcmp(s + i, sub, (size_t)m) == 0) return (BOpt){i, 1};
-    }
+    long long i = str_search(s, n, sub, m, 0);
+    if (i >= 0) return (BOpt){i, 1};
     return (BOpt){0, 0};
 }
 BOpt beans_str_rfind(char* s, char* sub) {
@@ -4663,26 +5207,25 @@ char* beans_str_replace(char* s, char* old, char* nw) {
     long long n = beans_slen(s), m = beans_slen(old), rl = beans_slen(nw);
     if (m == 0) return str_make(s, n); // replacing nothing changes nothing
     long long count = 0;
-    for (long long i = 0; i + m <= n;) {
-        if (memcmp(s + i, old, (size_t)m) == 0) {
-            count++;
-            i += m;
-        } else {
-            i++;
-        }
+    for (long long i = str_search(s, n, old, m, 0); i >= 0;
+         i = str_search(s, n, old, m, i + m)) {
+        count++;
     }
+    if (count == 0) return str_make(s, n);
     long long outn = n + count * (rl - m);
     char* out = beans_alloc(outn + 1, outn << 3);
     char* w = out;
-    for (long long i = 0; i < n;) {
-        if (i + m <= n && memcmp(s + i, old, (size_t)m) == 0) {
-            memcpy(w, nw, (size_t)rl);
-            w += rl;
-            i += m;
-        } else {
-            *w++ = s[i++];
-        }
+    long long i = 0;
+    for (;;) {
+        long long j = str_search(s, n, old, m, i);
+        if (j < 0) break;
+        memcpy(w, s + i, (size_t)(j - i));
+        w += j - i;
+        memcpy(w, nw, (size_t)rl);
+        w += rl;
+        i = j + m;
     }
+    memcpy(w, s + i, (size_t)(n - i));
     return out;
 }
 char* beans_str_repeat(char* s, long long n, long long line, long long col) {
@@ -4724,7 +5267,10 @@ long long beans_is_a(long long id, long long target) {
     return 0;
 }
 
-// ---- list search helpers (kind: 0 int-ish, 1 f64, 2 string, 3 decimal) ----
+// ---- list search helpers (kind: 0 int-ish, 1 f64, 2 string, 3 decimal,
+// 4 unordered — everything compares equal, so sort keeps the original order
+// and min/max return the first element, like the interpreter's value_less
+// returning false) ----
 struct BDec;
 int beans_dec_cmp(struct BDec* a, struct BDec* b);
 static int slot_cmp(long long a, long long b, long long kind) {
@@ -4734,9 +5280,80 @@ static int slot_cmp(long long a, long long b, long long kind) {
         memcpy(&y, &b, 8);
         return x < y ? -1 : x > y ? 1 : 0;
     }
-    if (kind == 2) return strcmp((char*)a, (char*)b);
+    if (kind == 2) return beans_str_cmp((char*)a, (char*)b);
     if (kind == 3) return beans_dec_cmp((struct BDec*)a, (struct BDec*)b);
+    if (kind == 4) return 0;
     return a < b ? -1 : a > b ? 1 : 0;
+}
+// content equality for strings — length header first, bytes second; strcmp
+// would stop at an embedded NUL and lie
+long long beans_str_eq(char* a, char* b) {
+    long long n = beans_slen(a);
+    return n == beans_slen(b) && memcmp(a, b, (size_t)n) == 0;
+}
+// equality kinds (separate lattice from the ordering kinds above), matching
+// the interpreter's value_eq arm for arm: 0 raw slot (ints, bools, pointer
+// identity), 1 f64 by IEEE value (NaN equals nothing), 2 string content,
+// 3 decimal value, 4 caller-supplied structural eq (enums, Bytes), 5 never
+// equal (maps and resource handles — value_eq's default arm)
+static long long slot_eq(long long a, long long b, long long kind,
+                         long long (*eq)(long long, long long)) {
+    if (kind == 0) return a == b;
+    if (kind == 1) {
+        double x, y;
+        memcpy(&x, &a, 8);
+        memcpy(&y, &b, 8);
+        return x == y;
+    }
+    if (kind == 2) return beans_str_eq((char*)a, (char*)b);
+    if (kind == 3) return beans_dec_cmp((struct BDec*)a, (struct BDec*)b) == 0;
+    if (kind == 4) return eq(a, b) != 0;
+    return 0;
+}
+// hashes for the map index, one per equality kind. The contract is only that
+// slot_eq-equal keys hash equal; the interpreter hashes differently and that
+// is fine — nothing observable depends on hash values, iteration walks the
+// insertion-ordered array.
+static unsigned long long beans_mix64(unsigned long long x) {
+    x ^= x >> 33;
+    x *= 0xff51afd7ed558ccdULL;
+    x ^= x >> 33;
+    x *= 0xc4ceb9fe1a85ec53ULL;
+    x ^= x >> 33;
+    return x;
+}
+long long beans_slot_mix(long long v) { return (long long)beans_mix64((unsigned long long)v); }
+long long beans_f64_hash(long long v) {
+    double x;
+    memcpy(&x, &v, 8);
+    if (x == 0.0) return (long long)beans_mix64(0); // -0.0 == 0.0
+    return (long long)beans_mix64((unsigned long long)v);
+}
+long long beans_str_hash(char* s) {
+    long long n = beans_slen(s);
+    unsigned long long h = 1469598103934665603ULL;
+    for (long long i = 0; i < n; i++) {
+        h ^= (unsigned char)s[i];
+        h *= 1099511628211ULL;
+    }
+    return (long long)beans_mix64(h);
+}
+long long beans_dec_hash(struct BDec* d);
+long long beans_bytes_hash(BList* b) {
+    unsigned long long h = 1469598103934665603ULL;
+    for (long long i = 0; i < b->len; i++) {
+        h ^= ((unsigned char*)b->data)[i];
+        h *= 1099511628211ULL;
+    }
+    return (long long)beans_mix64(h);
+}
+static unsigned long long slot_hash(long long v, long long kind,
+                                    long long (*hf)(long long)) {
+    if (kind == 1) return (unsigned long long)beans_f64_hash(v);
+    if (kind == 2) return (unsigned long long)beans_str_hash((char*)v);
+    if (kind == 3) return (unsigned long long)beans_dec_hash((struct BDec*)v);
+    if (kind == 4) return (unsigned long long)hf(v);
+    return beans_mix64((unsigned long long)v); // raw, and never-equal keys
 }
 long long beans_list_max(BList* l, long long kind, long long* ok) {
     *ok = l->len > 0;
@@ -4747,9 +5364,9 @@ long long beans_list_max(BList* l, long long kind, long long* ok) {
     }
     return best;
 }
-long long beans_list_contains(BList* l, long long v, long long kind) {
+long long beans_list_contains(BList* l, long long v, long long kind, void* eq) {
     for (long long i = 0; i < l->len; i++) {
-        if (slot_cmp(l->data[i], v, kind) == 0) return 1;
+        if (slot_eq(l->data[i], v, kind, (long long (*)(long long, long long))eq)) return 1;
     }
     return 0;
 }
@@ -4762,9 +5379,10 @@ long long beans_list_min(BList* l, long long kind, long long* ok) {
     }
     return best;
 }
-long long beans_list_index(BList* l, long long v, long long kind, long long* ok) {
+long long beans_list_index(BList* l, long long v, long long kind, long long* ok,
+                           void* eq) {
     for (long long i = 0; i < l->len; i++) {
-        if (slot_cmp(l->data[i], v, kind) == 0) {
+        if (slot_eq(l->data[i], v, kind, (long long (*)(long long, long long))eq)) {
             *ok = 1;
             return i;
         }
@@ -4867,26 +5485,89 @@ void beans_list_sort_by(BList* l, void* thunk, void* box) {
 }
 
 // ---- maps ----
+// A flat insertion-ordered key/value array (keys()/values()/printing walk it,
+// cc_walk too), plus an open-addressed index so lookup is O(1). Small maps
+// have no index and scan linearly, exactly the old behaviour.
+#define MAP_LINEAR_MAX 8
+#define IDX_POS 0xffffffffULL /* low 32: pos+2, 1 = tombstone */
+#define IDX_FRAG 0xffffffff00000000ULL /* high 32: hash fragment */
+#define MAP_DEAD(m, p) ((m)->deadbits && (m)->deadbits[(p) >> 6] >> ((p)&63) & 1)
 BMap* beans_map_new(long long key_ptr, long long val_ptr) {
     BMap* m = beans_alloc(sizeof(BMap), 3 | (key_ptr << 3) | (val_ptr << 4));
     m->cap = 4;
-    m->data = calloc(8, 8);
+    m->data = calloc(8, 8); // idx/tombs/used/deadbits start zero: beans_alloc zeroes
     return m;
 }
-static int str_eq(char* a, char* b) {
-    long long n = beans_slen(a);
-    return n == beans_slen(b) && memcmp(a, b, (size_t)n) == 0;
-}
-static long long map_find(BMap* m, long long key, long long kind) {
-    for (long long i = 0; i < m->len; i++) {
-        long long k = m->data[i * 2];
-        if (kind == 1 ? str_eq((char*)k, (char*)key) : k == key) return i;
+// (re)build the index sized for the current entry count, dropping tombstones
+// and compacting holes. Only moves slots and writes index words — never
+// retains or releases.
+static void map_reindex(BMap* m, long long kind, long long (*hf)(long long)) {
+    if (m->deadbits) {
+        long long w = 0;
+        for (long long p = 0; p < m->used; p++) {
+            if (MAP_DEAD(m, p)) continue;
+            if (w != p) {
+                m->data[w * 2] = m->data[p * 2];
+                m->data[w * 2 + 1] = m->data[p * 2 + 1];
+            }
+            w += 1;
+        }
+        free(m->deadbits);
+        m->deadbits = NULL;
+        m->used = w; // == m->len
     }
-    return -1;
+    long long cap = 16;
+    while (m->len * 3 >= cap * 2) cap <<= 1;
+    free(m->idx);
+    m->idx = calloc((size_t)cap, 8);
+    m->icap = cap;
+    m->tombs = 0;
+    unsigned long long mask = (unsigned long long)cap - 1;
+    for (long long p = 0; p < m->len; p++) {
+        unsigned long long h = slot_hash(m->data[p * 2], kind, hf);
+        unsigned long long i = h & mask;
+        while (m->idx[i] & IDX_POS) i = (i + 1) & mask;
+        m->idx[i] = (h & IDX_FRAG) | (unsigned long long)(p + 2);
+    }
+}
+// keys compare with the same equality lattice as list search (slot_eq): raw,
+// f64 value, string content, decimal value, structural thunk, never-equal.
+// *hout is filled iff the index is active, so set can reuse it; *slot_out
+// (may be NULL) gets the hit's index slot so remove can tombstone it O(1).
+static long long map_find(BMap* m, long long key, long long kind, void* eq,
+                          long long (*hf)(long long), unsigned long long* hout,
+                          unsigned long long* slot_out) {
+    if (!m->idx) {
+        for (long long i = 0; i < m->len; i++) {
+            if (slot_eq(m->data[i * 2], key, kind,
+                        (long long (*)(long long, long long))eq)) return i;
+        }
+        return -1;
+    }
+    unsigned long long h = slot_hash(key, kind, hf);
+    *hout = h;
+    unsigned long long mask = (unsigned long long)m->icap - 1;
+    unsigned long long frag = h & IDX_FRAG;
+    for (unsigned long long i = h & mask;; i = (i + 1) & mask) {
+        unsigned long long w = m->idx[i];
+        unsigned long long st = w & IDX_POS;
+        if (st == 0) return -1;
+        if (st >= 2 && (w & IDX_FRAG) == frag) {
+            long long p = (long long)st - 2;
+            if (slot_eq(m->data[p * 2], key, kind,
+                        (long long (*)(long long, long long))eq)) {
+                if (slot_out) *slot_out = i;
+                return p;
+            }
+        }
+    }
 }
 // note: the map owns key and value refs; the caller retains before calling
-void beans_map_set(BMap* m, long long key, long long val, long long kind) {
-    long long i = map_find(m, key, kind);
+void beans_map_set(BMap* m, long long key, long long val, long long kind, void* eq,
+                   void* hash) {
+    long long (*hf)(long long) = (long long (*)(long long))hash;
+    unsigned long long h = 0;
+    long long i = map_find(m, key, kind, eq, hf, &h, 0);
     if (i >= 0) {
         long long flags = (head_of(m)->meta & CC_SHAPE) >> 3;
         if (flags & 1) beans_release((void*)key); // duplicate key not stored
@@ -4894,33 +5575,73 @@ void beans_map_set(BMap* m, long long key, long long val, long long kind) {
         m->data[i * 2 + 1] = val;
         return;
     }
-    if (m->len == m->cap) {
+    if (m->used == m->cap) {
+        long long ow = (m->cap + 63) >> 6;
         m->cap *= 2;
         m->data = realloc(m->data, (size_t)m->cap * 16);
+        if (m->deadbits) {
+            long long nw = (m->cap + 63) >> 6;
+            m->deadbits = realloc(m->deadbits, (size_t)nw * 8);
+            memset(m->deadbits + ow, 0, (size_t)(nw - ow) * 8);
+        }
     }
-    m->data[m->len * 2] = key;
-    m->data[m->len * 2 + 1] = val;
+    m->data[m->used * 2] = key;
+    m->data[m->used * 2 + 1] = val;
+    m->used += 1;
     m->len += 1;
+    if (!m->idx) {
+        if (m->len > MAP_LINEAR_MAX) map_reindex(m, kind, hf);
+    } else if ((m->used + m->tombs) * 3 >= m->icap * 2) {
+        map_reindex(m, kind, hf);
+    } else { // h came from the map_find miss above
+        unsigned long long mask = (unsigned long long)m->icap - 1;
+        unsigned long long i2 = h & mask;
+        while ((m->idx[i2] & IDX_POS) >= 2) i2 = (i2 + 1) & mask;
+        if ((m->idx[i2] & IDX_POS) == 1) m->tombs -= 1;
+        m->idx[i2] = (h & IDX_FRAG) | (unsigned long long)(m->used + 1);
+    }
 }
-long long beans_map_get(BMap* m, long long key, long long kind, long long* ok) {
-    long long i = map_find(m, key, kind);
+long long beans_map_get(BMap* m, long long key, long long kind, long long* ok,
+                        void* eq, void* hash) {
+    unsigned long long h = 0;
+    long long i = map_find(m, key, kind, eq, (long long (*)(long long))hash, &h, 0);
     *ok = i >= 0;
     return i >= 0 ? m->data[i * 2 + 1] : 0;
 }
-long long beans_map_remove(BMap* m, long long key, long long kind) {
-    long long i = map_find(m, key, kind);
+long long beans_map_remove(BMap* m, long long key, long long kind, void* eq,
+                           void* hash) {
+    long long (*hf)(long long) = (long long (*)(long long))hash;
+    unsigned long long h = 0, slot = 0;
+    long long i = map_find(m, key, kind, eq, hf, &h, &slot);
     if (i < 0) return 0;
     long long flags = (head_of(m)->meta & CC_SHAPE) >> 3;
     if ((flags & 1) && m->data[i * 2]) beans_release((void*)m->data[i * 2]);
     if ((flags & 2) && m->data[i * 2 + 1]) beans_release((void*)m->data[i * 2 + 1]);
-    memmove(m->data + i * 2, m->data + (i + 1) * 2, (size_t)(m->len - i - 1) * 16);
+    if (!m->idx) { // small map: slide, exactly the old behaviour
+        memmove(m->data + i * 2, m->data + (i + 1) * 2,
+                (size_t)(m->used - i - 1) * 16);
+        m->len -= 1;
+        m->used -= 1;
+        return 1;
+    }
+    // indexed: zero the pair into a hole — no entry moves, so no index
+    // position needs fixing and delete is O(1). Reindex compacts once
+    // holes outnumber live entries, so the cost is amortized.
+    m->data[i * 2] = 0;
+    m->data[i * 2 + 1] = 0;
+    if (!m->deadbits) m->deadbits = calloc((size_t)((m->cap + 63) >> 6), 8);
+    m->deadbits[i >> 6] |= 1ULL << (i & 63);
     m->len -= 1;
+    m->idx[slot] = 1; // map_find landed on the hit's slot
+    m->tombs += 1;
+    if (m->used > m->len * 2) map_reindex(m, kind, hf);
     return 1;
 }
 BList* beans_map_keys(BMap* m) {
     long long flags = (head_of(m)->meta & CC_SHAPE) >> 3;
     BList* l = beans_list_new(flags & 1);
-    for (long long i = 0; i < m->len; i++) {
+    for (long long i = 0; i < m->used; i++) {
+        if (MAP_DEAD(m, i)) continue;
         long long k = m->data[i * 2];
         if ((flags & 1) && k) beans_retain((void*)k);
         beans_list_push(l, k);
@@ -4930,7 +5651,8 @@ BList* beans_map_keys(BMap* m) {
 BList* beans_map_values(BMap* m) {
     long long flags = (head_of(m)->meta & CC_SHAPE) >> 3;
     BList* l = beans_list_new((flags >> 1) & 1);
-    for (long long i = 0; i < m->len; i++) {
+    for (long long i = 0; i < m->used; i++) {
+        if (MAP_DEAD(m, i)) continue;
         long long v = m->data[i * 2 + 1];
         if ((flags & 2) && v) beans_retain((void*)v);
         beans_list_push(l, v);
@@ -4939,11 +5661,18 @@ BList* beans_map_values(BMap* m) {
 }
 void beans_map_clear(BMap* m) {
     long long flags = (head_of(m)->meta & CC_SHAPE) >> 3;
-    for (long long i = 0; i < m->len; i++) {
+    for (long long i = 0; i < m->used; i++) { // holes are zeroed: null-skip
         if ((flags & 1) && m->data[i * 2]) beans_release((void*)m->data[i * 2]);
         if ((flags & 2) && m->data[i * 2 + 1]) beans_release((void*)m->data[i * 2 + 1]);
     }
     m->len = 0;
+    m->used = 0;
+    free(m->deadbits);
+    m->deadbits = NULL;
+    free(m->idx);
+    m->idx = NULL;
+    m->icap = 0;
+    m->tombs = 0;
 }
 
 // element rendering matches the interpreter's display(): the kind code says
@@ -5046,6 +5775,70 @@ static char* show_join(BList* l, const char* sep, long long sl,
     free(buf);
     return out;
 }
+// ---- iterative show driver ----
+// printing recursed on data depth (a 400k-link enum chain smashed the C
+// stack); generated @bstep fns append their own text and PUSH child work
+// instead of calling each other, and this driver drains the stack. Text
+// items are borrowed (interned constants or C literals); scalar steps
+// append their temporary and release it.
+typedef struct {
+    void* fn; // step fn, or null for a text item
+    long long v;
+    const char* text;
+    long long tlen;
+} BShowItem;
+typedef struct BShowCtx {
+    BShowItem* items;
+    long long len, cap;
+    char* out;
+    long long olen, ocap;
+} BShowCtx;
+static void show_out(BShowCtx* c, const char* p, long long n) {
+    if (c->olen + n + 1 > c->ocap) {
+        c->ocap = (c->olen + n + 1) * 2 + 16;
+        c->out = realloc(c->out, (size_t)c->ocap);
+    }
+    memcpy(c->out + c->olen, p, (size_t)n);
+    c->olen += n;
+}
+void beans_show_append(BShowCtx* c, char* s) { show_out(c, s, beans_slen(s)); }
+static void show_push(BShowCtx* c, void* fn, long long v, const char* t, long long tn) {
+    if (c->len == c->cap) {
+        c->cap = c->cap ? c->cap * 2 : 32;
+        c->items = realloc(c->items, (size_t)c->cap * sizeof(BShowItem));
+    }
+    BShowItem it = {fn, v, t, tn};
+    c->items[c->len++] = it;
+}
+void beans_show_push_val(BShowCtx* c, void* fn, long long v) {
+    show_push(c, fn, v, NULL, 0);
+}
+void beans_show_push_lit(BShowCtx* c, char* s) {
+    show_push(c, NULL, 0, s, beans_slen(s));
+}
+void beans_show_list_iter(BShowCtx* c, BList* l, void* elem_step) {
+    show_out(c, "[", 1);
+    show_push(c, NULL, 0, "]", 1);
+    for (long long i = l->len; i-- > 1;) {
+        show_push(c, elem_step, l->data[i], NULL, 0);
+        show_push(c, NULL, 0, ", ", 2);
+    }
+    if (l->len > 0) show_push(c, elem_step, l->data[0], NULL, 0);
+}
+char* beans_show_run(void* fn, long long v) {
+    BShowCtx c = {0, 0, 0, 0, 0, 0};
+    show_push(&c, fn, v, NULL, 0);
+    while (c.len > 0) {
+        BShowItem it = c.items[--c.len];
+        if (it.fn) ((void (*)(BShowCtx*, long long))it.fn)(&c, it.v);
+        else show_out(&c, it.text, it.tlen);
+    }
+    char* r = str_make(c.out ? c.out : "", c.olen);
+    free(c.out);
+    free(c.items);
+    return r;
+}
+
 char* beans_show_list(BList* l, char* (*show)(long long)) {
     return show_join(l, ", ", 2, show, 1);
 }
@@ -5062,14 +5855,10 @@ BList* beans_str_split(char* s, char* sep) {
         return l;
     }
     long long i = 0;
-    for (long long j = 0; j + m <= n;) {
-        if (memcmp(s + j, sep, (size_t)m) == 0) {
-            beans_list_push(l, (long long)str_make(s + i, j - i));
-            j += m;
-            i = j;
-        } else {
-            j++;
-        }
+    for (long long j = str_search(s, n, sep, m, 0); j >= 0;
+         j = str_search(s, n, sep, m, i)) {
+        beans_list_push(l, (long long)str_make(s + i, j - i));
+        i = j + m;
     }
     beans_list_push(l, (long long)str_make(s + i, n - i));
     return l;
@@ -5093,6 +5882,7 @@ static BList* bytes_mk(long long n) {
     BList* b = beans_alloc(sizeof(BList), 2);
     long long cap = n < 8 ? 8 : n;
     b->data = calloc((size_t)cap, 1);
+    if (!b->data) beans_panic("out of memory", 0, 0);
     b->len = n;
     b->cap = cap;
     return b;
@@ -5229,14 +6019,16 @@ static void bytes_woob(const char* what, const char* op, long long pos, long lon
 }
 static long long bytes_getw(BList* b, long long pos, long long w, const char* what,
                             long long line, long long col) {
-    if (pos < 0 || pos + w > b->len) bytes_woob(what, "read", pos, b->len, line, col);
+    // pos > len - w, never pos + w > len: signed overflow on huge pos slips the
+    // wrapped sum past the guard and the memcpy goes wild
+    if (pos < 0 || w > b->len || pos > b->len - w) bytes_woob(what, "read", pos, b->len, line, col);
     unsigned long long v = 0;
     memcpy(&v, (char*)b->data + pos, (size_t)w); // little-endian hosts, documented
     return (long long)v;
 }
 static void bytes_putw(BList* b, long long pos, long long w, long long val,
                        const char* what, long long line, long long col) {
-    if (pos < 0 || pos + w > b->len) bytes_woob(what, "write", pos, b->len, line, col);
+    if (pos < 0 || w > b->len || pos > b->len - w) bytes_woob(what, "write", pos, b->len, line, col);
     unsigned long long v = (unsigned long long)val;
     memcpy((char*)b->data + pos, &v, (size_t)w);
 }
@@ -5264,7 +6056,7 @@ BList* beans_bytes_slice(BList* b, long long from, long long to, long long line,
 }
 void beans_bytes_copy_from(BList* b, BList* src, long long at, long long line,
                            long long col) {
-    if (at < 0 || at + src->len > b->len) {
+    if (at < 0 || src->len > b->len || at > b->len - src->len) {
         char m[96];
         snprintf(m, sizeof m, "copy of %lld bytes at %lld out of range (len %lld)",
                  src->len, at, b->len);
@@ -5311,6 +6103,21 @@ static void* fs_err_obj(const char* path, int err) {
     free(b);
     return e;
 }
+// for paths that are beans strings: splice by stored length so a path with
+// an embedded NUL reports the same bytes the interpreter does (the plain
+// fs_err_obj above stays for internal C-built paths, which never hold NUL)
+static void* fs_err_obj_rc(char* path, int err) {
+    const char* es = strerror(err);
+    long long lp = beans_slen(path);
+    size_t le = strlen(es);
+    long long total = lp + 2 + (long long)le;
+    char* m = beans_alloc(total + 1, total << 3);
+    memcpy(m, path, (size_t)lp);
+    m[lp] = ':';
+    m[lp + 1] = ' ';
+    memcpy(m + lp + 2, es, le);
+    return mk_error_own(m, fs_kind_of(err));
+}
 static void* op_err_obj(const char* op, int err) {
     char b[96];
     snprintf(b, sizeof b, "%s: %s", op, strerror(err));
@@ -5321,12 +6128,24 @@ static void* closed_err(void) { return mk_error("file is closed", "closed"); }
 BRes beans_file_read_at(BFile* f, long long pos, long long n) {
     if (f->closed) return (BRes){0, closed_err()};
     if (pos < 0 || n < 0) return (BRes){0, mk_error("negative read", "io")};
+    // clamp to what the file can actually give: a corrupted length field must
+    // not become a giant allocation — the read comes back short anyway
+    struct stat rst;
+    if (fstat((int)f->fd, &rst) == 0 && S_ISREG(rst.st_mode)) {
+        long long rem = rst.st_size > pos ? rst.st_size - pos : 0;
+        if (n > rem) n = rem;
+    }
     BList* buf = bytes_mk(n);
     long long got = 0;
     while (got < n) {
         ssize_t r = pread((int)f->fd, (char*)buf->data + got, (size_t)(n - got),
                           (off_t)(pos + got));
-        if (r < 0) return (BRes){0, op_err_obj("read", errno)};
+        if (r < 0) {
+            if (errno == EINTR) continue;
+            int e = errno;
+            beans_release(buf); // the error path must not leak the buffer
+            return (BRes){0, op_err_obj("read", e)};
+        }
         if (r == 0) break; // eof: a short read returns what's there
         got += r;
     }
@@ -5340,7 +6159,10 @@ BRes beans_file_write_at(BFile* f, long long pos, BList* d) {
     while (done < d->len) {
         ssize_t r = pwrite((int)f->fd, (char*)d->data + done, (size_t)(d->len - done),
                            (off_t)(pos + done));
-        if (r < 0) return (BRes){0, op_err_obj("write", errno)};
+        if (r < 0) {
+            if (errno == EINTR) continue;
+            return (BRes){0, op_err_obj("write", errno)};
+        }
         done += r;
     }
     return (BRes){done, NULL};
@@ -5348,11 +6170,22 @@ BRes beans_file_write_at(BFile* f, long long pos, BList* d) {
 BRes beans_file_read(BFile* f, long long n) {
     if (f->closed) return (BRes){0, closed_err()};
     if (n < 0) return (BRes){0, mk_error("negative read", "io")};
+    struct stat rst;
+    if (fstat((int)f->fd, &rst) == 0 && S_ISREG(rst.st_mode)) {
+        long long at = (long long)lseek((int)f->fd, 0, SEEK_CUR);
+        long long rem = at >= 0 && rst.st_size > at ? rst.st_size - at : 0;
+        if (n > rem) n = rem;
+    }
     BList* buf = bytes_mk(n);
     long long got = 0;
     while (got < n) {
         ssize_t r = read((int)f->fd, (char*)buf->data + got, (size_t)(n - got));
-        if (r < 0) return (BRes){0, op_err_obj("read", errno)};
+        if (r < 0) {
+            if (errno == EINTR) continue;
+            int e = errno;
+            beans_release(buf); // the error path must not leak the buffer
+            return (BRes){0, op_err_obj("read", e)};
+        }
         if (r == 0) break;
         got += r;
     }
@@ -5364,7 +6197,10 @@ BRes beans_file_write(BFile* f, BList* d) {
     long long done = 0;
     while (done < d->len) {
         ssize_t r = write((int)f->fd, (char*)d->data + done, (size_t)(d->len - done));
-        if (r < 0) return (BRes){0, op_err_obj("write", errno)};
+        if (r < 0) {
+            if (errno == EINTR) continue;
+            return (BRes){0, op_err_obj("write", errno)};
+        }
         done += r;
     }
     return (BRes){done, NULL};
@@ -5414,7 +6250,17 @@ BRes beans_file_sync(BFile* f) {
 BRes beans_file_close(BFile* f) {
     if (f->closed) return (BRes){0, mk_error("file already closed", "closed")};
     f->closed = 1;
-    if (close((int)f->fd) != 0) return (BRes){0, op_err_obj("close", errno)};
+    // While worker threads are live, defer the real close(): a racing op on
+    // another thread could still be mid-syscall on this fd, and reusing the
+    // number for a freshly-opened file would silently corrupt it. The fd stays
+    // open (harmless — same file) until the handle's last ref drops in
+    // cc_free_shell, when no thread can hold it. This mirrors the collector's
+    // own "don't touch shared resources while mutators run" gate. Zero cost
+    // single-threaded, where cc_threads is 0 and the fd closes now.
+    if (cc_threads > 0) return (BRes){1, NULL};
+    long long fd = f->fd;
+    f->fd = -1;
+    if (close((int)fd) != 0) return (BRes){0, op_err_obj("close", errno)};
     return (BRes){1, NULL};
 }
 
@@ -5422,7 +6268,11 @@ BRes beans_file_close(BFile* f) {
 // by someone else", every other failure is a real error
 BRes beans_file_lock(BFile* f) {
     if (f->closed) return (BRes){0, closed_err()};
-    if (flock((int)f->fd, LOCK_EX) != 0) return (BRes){0, op_err_obj("lock", errno)};
+    // a blocking lock is the classic EINTR victim — retry rather than fail
+    while (flock((int)f->fd, LOCK_EX) != 0) {
+        if (errno == EINTR) continue;
+        return (BRes){0, op_err_obj("lock", errno)};
+    }
     return (BRes){1, NULL};
 }
 BRes beans_file_try_lock(BFile* f) {
@@ -5440,18 +6290,18 @@ BRes beans_file_unlock(BFile* f) {
 }
 
 // ---- mmap (kind 6, shape bit 0 = 1) ----
-// whole-file shared mapping; the fd is closed right after mapping — the
-// mapping outlives it. get/put/read/write panic on a closed or short map,
-// flush/close report errors as Results like File does.
+// whole-file shared mapping; the fd is kept open so resize() can ftruncate +
+// remap. get/put/read/write panic on a closed or short map, flush/close
+// report errors as Results like File does.
 static void* mmap_closed_err(void) { return mk_error("mmap is closed", "closed"); }
 BRes beans_mmap_open(char* path, long long writable) {
     int fd = open(path, writable ? O_RDWR : O_RDONLY);
-    if (fd < 0) return (BRes){0, fs_err_obj(path, errno)};
+    if (fd < 0) return (BRes){0, fs_err_obj_rc(path, errno)};
     struct stat st;
     if (fstat(fd, &st) != 0) {
         int e = errno;
         close(fd);
-        return (BRes){0, fs_err_obj(path, e)};
+        return (BRes){0, fs_err_obj_rc(path, e)};
     }
     char* p = NULL;
     if (st.st_size > 0) {
@@ -5460,7 +6310,7 @@ BRes beans_mmap_open(char* path, long long writable) {
         if (p == MAP_FAILED) {
             int e = errno;
             close(fd);
-            return (BRes){0, fs_err_obj(path, e)};
+            return (BRes){0, fs_err_obj_rc(path, e)};
         }
     }
     BMMap* m = beans_alloc(sizeof(BMMap), 6 | (1 << 3));
@@ -5477,7 +6327,8 @@ static void mmap_guard(BMMap* m, long long line, long long col) {
 static long long mmap_word(BMMap* m, const char* what, long long pos, long long w,
                            long long line, long long col) {
     mmap_guard(m, line, col);
-    if (pos < 0 || pos + w > m->len) {
+    // pos > len - w, never pos + w > len — the sum overflows for huge pos
+    if (pos < 0 || w > m->len || pos > m->len - w) {
         char b[96];
         snprintf(b, sizeof b, "%s read at %lld out of range (len %lld)", what, pos,
                  m->len);
@@ -5491,7 +6342,7 @@ static void mmap_put_word(BMMap* m, const char* what, long long pos, long long v
                           long long w, long long line, long long col) {
     mmap_guard(m, line, col);
     if (!m->writable) beans_panic("mmap is read-only", line, col);
-    if (pos < 0 || pos + w > m->len) {
+    if (pos < 0 || w > m->len || pos > m->len - w) {
         char b[96];
         snprintf(b, sizeof b, "%s write at %lld out of range (len %lld)", what, pos,
                  m->len);
@@ -5512,7 +6363,7 @@ void beans_mmap_put_i64(BMMap* m, long long p, long long v, long long l, long lo
 BList* beans_mmap_read(BMMap* m, long long pos, long long n, long long line,
                        long long col) {
     mmap_guard(m, line, col);
-    if (pos < 0 || n < 0 || pos + n > m->len) {
+    if (pos < 0 || n < 0 || n > m->len || pos > m->len - n) {
         char b[96];
         snprintf(b, sizeof b, "read %lld at %lld out of range (len %lld)", n, pos,
                  m->len);
@@ -5526,7 +6377,7 @@ void beans_mmap_write(BMMap* m, long long pos, BList* d, long long line,
                       long long col) {
     mmap_guard(m, line, col);
     if (!m->writable) beans_panic("mmap is read-only", line, col);
-    if (pos < 0 || pos + d->len > m->len) {
+    if (pos < 0 || d->len > m->len || pos > m->len - d->len) {
         char b[96];
         snprintf(b, sizeof b, "write %lld at %lld out of range (len %lld)", d->len,
                  pos, m->len);
@@ -5543,7 +6394,7 @@ BRes beans_mmap_flush(BMMap* m) {
 }
 BRes beans_mmap_flush_range(BMMap* m, long long pos, long long n) {
     if (m->closed) return (BRes){0, mmap_closed_err()};
-    if (pos < 0 || n < 0 || pos + n > m->len) {
+    if (pos < 0 || n < 0 || n > m->len || pos > m->len - n) {
         char b[96];
         snprintf(b, sizeof b, "flush %lld at %lld out of range (len %lld)", n, pos,
                  m->len);
@@ -5561,9 +6412,14 @@ BRes beans_mmap_flush_range(BMMap* m, long long pos, long long n) {
 BRes beans_mmap_close(BMMap* m) {
     if (m->closed) return (BRes){0, mk_error("mmap already closed", "closed")};
     m->closed = 1;
+    // defer munmap+close while workers run (see beans_file_close): a racing op
+    // reading through the mapping must not have it pulled out from under it
+    if (cc_threads > 0) return (BRes){1, NULL};
     int bad = m->p && munmap(m->p, (size_t)m->len) != 0;
     int e = errno;
+    m->p = NULL;
     if (m->fd >= 0) close((int)m->fd);
+    m->fd = -1;
     if (bad) return (BRes){0, op_err_obj("close", e)};
     return (BRes){1, NULL};
 }
@@ -5672,44 +6528,54 @@ static char* path_cat(const char* a, const char* b) {
     r[la + 1 + lb] = 0;
     return r;
 }
-static int walk_dir(const char* root, const char* rel, StrVec* out, char** epath,
-                    int* eno) {
-    char* full = rel[0] ? path_cat(root, rel) : strdup(root);
-    DIR* d = opendir(full);
-    if (!d) {
-        *epath = full;
-        *eno = errno;
-        return 0;
-    }
-    free(full);
-    struct dirent* en;
-    while ((en = readdir(d))) {
-        if (strcmp(en->d_name, ".") == 0 || strcmp(en->d_name, "..") == 0) continue;
-        char* r2 = rel[0] ? path_cat(rel, en->d_name) : strdup(en->d_name);
-        char* abs = path_cat(root, r2);
-        struct stat st;
-        if (lstat(abs, &st) != 0) {
-            *epath = abs;
+static void sv_free(StrVec* s) {
+    for (long long i = 0; i < s->len; i++) free(s->v[i]);
+    free(s->v);
+}
+// Iterative walk: an explicit stack of relative dir paths, one DIR open at a
+// time. Recursion held one fd per depth level and ran out at ~250 deep; this
+// caps open fds at one. Output is sorted afterward, so traversal order is
+// free.
+static int walk_dir(const char* root, StrVec* out, char** epath, int* eno) {
+    StrVec stack = {0, 0, 0};
+    sv_push(&stack, strdup("")); // "" = root itself
+    int ok = 1;
+    while (stack.len > 0) {
+        char* rel = stack.v[--stack.len];
+        char* full = rel[0] ? path_cat(root, rel) : strdup(root);
+        DIR* d = opendir(full);
+        if (!d) {
+            *epath = full;
             *eno = errno;
-            free(r2);
-            closedir(d);
-            return 0;
+            free(rel);
+            ok = 0;
+            break;
         }
-        if (S_ISDIR(st.st_mode)) {
-            free(abs);
-            int ok = walk_dir(root, r2, out, epath, eno);
-            free(r2);
-            if (!ok) {
-                closedir(d);
-                return 0;
+        free(full);
+        struct dirent* en;
+        while ((en = readdir(d))) {
+            if (strcmp(en->d_name, ".") == 0 || strcmp(en->d_name, "..") == 0) continue;
+            char* r2 = rel[0] ? path_cat(rel, en->d_name) : strdup(en->d_name);
+            char* abs = path_cat(root, r2);
+            struct stat st;
+            if (lstat(abs, &st) != 0) {
+                *epath = abs;
+                *eno = errno;
+                free(r2);
+                ok = 0;
+                break;
             }
-        } else {
             free(abs);
-            sv_push(out, r2);
+            if (S_ISDIR(st.st_mode)) sv_push(&stack, r2); // descend later
+            else sv_push(out, r2);
         }
+        closedir(d);
+        free(rel);
+        if (!ok) break;
     }
-    closedir(d);
-    return 1;
+    for (long long i = 0; i < stack.len; i++) free(stack.v[i]);
+    free(stack.v);
+    return ok;
 }
 static int walk_cmp(const void* a, const void* b) {
     return strcmp(*(char* const*)a, *(char* const*)b);
@@ -5718,7 +6584,7 @@ BRes beans_dir_walk(char* path) {
     StrVec out = {0, 0, 0};
     char* epath = NULL;
     int eno = 0;
-    if (!walk_dir(path, "", &out, &epath, &eno)) {
+    if (!walk_dir(path, &out, &epath, &eno)) {
         void* e = fs_err_obj(epath, eno);
         free(epath);
         for (long long i = 0; i < out.len; i++) free(out.v[i]);
@@ -5813,12 +6679,17 @@ BRes beans_file_open(char* path, char* mode) {
     else if (strcmp(mode, "create") == 0) flags = O_RDWR | O_CREAT;
     else if (strcmp(mode, "append") == 0) flags = O_WRONLY | O_CREAT | O_APPEND;
     else {
-        char m[64];
-        snprintf(m, sizeof m, "bad open mode '%s'", mode);
-        return (BRes){0, mk_error(m, "io")};
+        // mode is a beans string of any length — heap-build so a long bad
+        // mode reports its full text like the interpreter, not a truncation
+        size_t n = strlen(mode) + 24;
+        char* m = malloc(n);
+        snprintf(m, n, "bad open mode '%s'", mode);
+        void* e = mk_error(m, "io");
+        free(m);
+        return (BRes){0, e};
     }
     int fd = open(path, flags, 0644);
-    if (fd < 0) return (BRes){0, fs_err_obj(path, errno)};
+    if (fd < 0) return (BRes){0, fs_err_obj_rc(path, errno)};
     BFile* f = beans_alloc(sizeof(BFile), 6);
     f->fd = fd;
     f->closed = 0;
@@ -5827,15 +6698,17 @@ BRes beans_file_open(char* path, char* mode) {
 
 static BRes fs_read_all(char* path, int as_bytes) {
     int fd = open(path, O_RDONLY);
-    if (fd < 0) return (BRes){0, fs_err_obj(path, errno)};
+    if (fd < 0) return (BRes){0, fs_err_obj_rc(path, errno)};
     BList* buf = bytes_mk(0);
     char chunk[65536];
     while (1) {
         ssize_t r = read(fd, chunk, sizeof chunk);
         if (r < 0) {
+            if (errno == EINTR) continue;
             int e = errno;
             close(fd);
-            return (BRes){0, fs_err_obj(path, e)};
+            beans_release(buf); // the error path must not leak the buffer
+            return (BRes){0, fs_err_obj_rc(path, e)};
         }
         if (r == 0) break;
         bytes_grow(buf, buf->len + r);
@@ -5854,14 +6727,15 @@ BRes beans_file_read_all_b(char* path) { return fs_read_all(path, 1); }
 static BRes fs_write_all(char* path, const char* p, long long n, int append) {
     int flags = O_WRONLY | O_CREAT | (append ? O_APPEND : O_TRUNC);
     int fd = open(path, flags, 0644);
-    if (fd < 0) return (BRes){0, fs_err_obj(path, errno)};
+    if (fd < 0) return (BRes){0, fs_err_obj_rc(path, errno)};
     long long done = 0;
     while (done < n) {
         ssize_t r = write(fd, p + done, (size_t)(n - done));
         if (r < 0) {
+            if (errno == EINTR) continue;
             int e = errno;
             close(fd);
-            return (BRes){0, fs_err_obj(path, e)};
+            return (BRes){0, fs_err_obj_rc(path, e)};
         }
         done += r;
     }
@@ -5886,28 +6760,29 @@ long long beans_file_exists(char* path) {
 }
 BRes beans_file_size_p(char* path) {
     struct stat st;
-    if (stat(path, &st) != 0) return (BRes){0, fs_err_obj(path, errno)};
+    if (stat(path, &st) != 0) return (BRes){0, fs_err_obj_rc(path, errno)};
     return (BRes){(long long)st.st_size, NULL};
 }
 BRes beans_file_remove(char* path) {
     struct stat st;
-    if (stat(path, &st) != 0) return (BRes){0, fs_err_obj(path, errno)};
+    // lstat: remove the link itself, and let a dangling symlink be removed
+    if (lstat(path, &st) != 0) return (BRes){0, fs_err_obj_rc(path, errno)};
     int r = S_ISDIR(st.st_mode) ? rmdir(path) : unlink(path);
-    if (r != 0) return (BRes){0, fs_err_obj(path, errno)};
+    if (r != 0) return (BRes){0, fs_err_obj_rc(path, errno)};
     return (BRes){1, NULL};
 }
 BRes beans_file_rename(char* from, char* to) {
-    if (rename(from, to) != 0) return (BRes){0, fs_err_obj(from, errno)};
+    if (rename(from, to) != 0) return (BRes){0, fs_err_obj_rc(from, errno)};
     return (BRes){1, NULL};
 }
 BRes beans_file_copy(char* from, char* to) {
     int src = open(from, O_RDONLY);
-    if (src < 0) return (BRes){0, fs_err_obj(from, errno)};
+    if (src < 0) return (BRes){0, fs_err_obj_rc(from, errno)};
     int dst = open(to, O_WRONLY | O_CREAT | O_TRUNC, 0644);
     if (dst < 0) {
         int e = errno;
         close(src);
-        return (BRes){0, fs_err_obj(to, e)};
+        return (BRes){0, fs_err_obj_rc(to, e)};
     }
     char chunk[65536];
     long long total = 0;
@@ -5917,7 +6792,7 @@ BRes beans_file_copy(char* from, char* to) {
             int e = errno;
             close(src);
             close(dst);
-            return (BRes){0, fs_err_obj(from, e)};
+            return (BRes){0, fs_err_obj_rc(from, e)};
         }
         if (r == 0) break;
         ssize_t done = 0;
@@ -5927,7 +6802,7 @@ BRes beans_file_copy(char* from, char* to) {
                 int e = errno;
                 close(src);
                 close(dst);
-                return (BRes){0, fs_err_obj(to, e)};
+                return (BRes){0, fs_err_obj_rc(to, e)};
             }
             done += w;
         }
@@ -5939,7 +6814,7 @@ BRes beans_file_copy(char* from, char* to) {
 }
 
 BRes beans_dir_make(char* path) {
-    if (mkdir(path, 0755) != 0) return (BRes){0, fs_err_obj(path, errno)};
+    if (mkdir(path, 0755) != 0) return (BRes){0, fs_err_obj_rc(path, errno)};
     return (BRes){1, NULL};
 }
 BRes beans_dir_make_all(char* path) {
@@ -5953,10 +6828,15 @@ BRes beans_dir_make_all(char* path) {
         cur[j] = 0;
         i = j + 1;
         if (cur[0] == 0) continue;
-        if (mkdir(cur, 0755) != 0 && errno != EEXIST) {
-            BRes r = {0, fs_err_obj(cur, errno)};
-            free(cur);
-            return r;
+        if (mkdir(cur, 0755) != 0) {
+            int me = errno;
+            // EEXIST is only ok if the existing entry is a directory
+            struct stat st;
+            if (me != EEXIST || stat(cur, &st) != 0 || !S_ISDIR(st.st_mode)) {
+                BRes r = {0, fs_err_obj(cur, me == EEXIST ? ENOTDIR : me)};
+                free(cur);
+                return r;
+            }
         }
     }
     free(cur);
@@ -5967,7 +6847,7 @@ static int name_cmp(const void* a, const void* b) {
 }
 BRes beans_dir_list(char* path) {
     DIR* d = opendir(path);
-    if (!d) return (BRes){0, fs_err_obj(path, errno)};
+    if (!d) return (BRes){0, fs_err_obj_rc(path, errno)};
     char** names = NULL;
     long long cnt = 0, cap = 0;
     struct dirent* de;
@@ -5990,32 +6870,63 @@ BRes beans_dir_list(char* path) {
     return (BRes){(long long)l, NULL};
 }
 BRes beans_dir_remove(char* path) {
-    if (rmdir(path) != 0) return (BRes){0, fs_err_obj(path, errno)};
+    if (rmdir(path) != 0) return (BRes){0, fs_err_obj_rc(path, errno)};
     return (BRes){1, NULL};
 }
+// Iterative delete: gather the tree pre-order (parent before child) with one
+// DIR open at a time, then remove in reverse (deepest first). Recursion held
+// one fd per level and a fixed 1024-byte path buffer that silently truncated
+// deep paths; this heap-builds every path and caps open fds at one.
 static int rm_tree(const char* p) {
     struct stat st;
     if (lstat(p, &st) != 0) return -1;
     if (!S_ISDIR(st.st_mode)) return unlink(p);
-    DIR* d = opendir(p);
-    if (!d) return -1;
-    struct dirent* de;
-    while ((de = readdir(d)) != NULL) {
-        if (strcmp(de->d_name, ".") == 0 || strcmp(de->d_name, "..") == 0) continue;
-        char sub[1024];
-        snprintf(sub, sizeof sub, "%s/%s", p, de->d_name);
-        if (rm_tree(sub) != 0) {
-            closedir(d);
-            return -1;
+    StrVec dirs = {0, 0, 0}; // dirs to rmdir, in discovery (pre) order
+    StrVec stack = {0, 0, 0}; // dirs still to scan
+    sv_push(&stack, strdup(p));
+    int ok = 1;
+    while (stack.len > 0) {
+        char* dir = stack.v[--stack.len];
+        DIR* d = opendir(dir);
+        if (!d) {
+            free(dir);
+            ok = 0;
+            break;
         }
+        struct dirent* de;
+        while ((de = readdir(d)) != NULL) {
+            if (strcmp(de->d_name, ".") == 0 || strcmp(de->d_name, "..") == 0) continue;
+            char* sub = path_cat(dir, de->d_name);
+            struct stat cst;
+            if (lstat(sub, &cst) != 0) {
+                free(sub);
+                ok = 0;
+                break;
+            }
+            if (S_ISDIR(cst.st_mode)) sv_push(&stack, sub); // scan later
+            else {
+                if (unlink(sub) != 0) ok = 0;
+                free(sub);
+                if (!ok) break;
+            }
+        }
+        closedir(d);
+        sv_push(&dirs, dir); // remove this dir after its children
+        if (!ok) break;
     }
-    closedir(d);
-    return rmdir(p);
+    for (long long i = 0; i < stack.len; i++) free(stack.v[i]);
+    free(stack.v);
+    // deepest first: dirs were collected parent-before-child, so reverse
+    for (long long i = dirs.len; ok && i-- > 0;) {
+        if (rmdir(dirs.v[i]) != 0) ok = 0;
+    }
+    sv_free(&dirs);
+    return ok ? 0 : -1;
 }
 BRes beans_dir_remove_all(char* path) {
     struct stat st;
-    if (lstat(path, &st) != 0) return (BRes){0, fs_err_obj(path, errno)};
-    if (rm_tree(path) != 0) return (BRes){0, fs_err_obj(path, errno)};
+    if (lstat(path, &st) != 0) return (BRes){0, fs_err_obj_rc(path, errno)};
+    if (rm_tree(path) != 0) return (BRes){0, fs_err_obj_rc(path, errno)};
     return (BRes){1, NULL};
 }
 long long beans_dir_exists(char* path) {
@@ -6024,20 +6935,19 @@ long long beans_dir_exists(char* path) {
 }
 char* beans_dir_temp(void) {
     const char* t = getenv("TMPDIR");
-    char buf[1024];
-    snprintf(buf, sizeof buf, "%s", t && *t ? t : "/tmp");
-    size_t n = strlen(buf);
-    while (n > 1 && buf[n - 1] == '/') buf[--n] = 0;
-    return rc_strdup(buf);
+    const char* src = t && *t ? t : "/tmp";
+    long long n = (long long)strlen(src);
+    while (n > 1 && src[n - 1] == '/') n--; // trim trailing slashes
+    return str_make(src, n);
 }
 BRes beans_dir_sync(char* path) {
     // the database commit pattern: fsync the directory after a rename
     int fd = open(path, O_RDONLY);
-    if (fd < 0) return (BRes){0, fs_err_obj(path, errno)};
+    if (fd < 0) return (BRes){0, fs_err_obj_rc(path, errno)};
     if (fsync(fd) != 0) {
         int e = errno;
         close(fd);
-        return (BRes){0, fs_err_obj(path, e)};
+        return (BRes){0, fs_err_obj_rc(path, e)};
     }
     close(fd);
     return (BRes){1, NULL};
@@ -6122,10 +7032,10 @@ char* beans_io_read_all(void) {
     return s;
 }
 void beans_eprintln(char* s) {
-    fputs(s, stderr);
+    fwrite(s, 1, (size_t)beans_slen(s), stderr);
     fputc('\n', stderr);
 }
-void beans_eprint(char* s) { fputs(s, stderr); }
+void beans_eprint(char* s) { fwrite(s, 1, (size_t)beans_slen(s), stderr); }
 
 // ---- threads ----
 typedef struct {
@@ -6266,8 +7176,8 @@ BDec* beans_dec_sub(BDec* a, BDec* b) {
     return dec_mk(ca - cb, s);
 }
 BDec* beans_dec_mul(BDec* a, BDec* b) { return dec_mk(a->c * b->c, a->s + b->s); }
-BDec* beans_dec_div(BDec* a, BDec* b) {
-    if (b->c == 0) beans_panic("divide by zero", 0, 0);
+BDec* beans_dec_div(BDec* a, BDec* b, long long ln, long long cl) {
+    if (b->c == 0) beans_panic("divide by zero", ln, cl);
     long long extra = 20;
     __int128 num = a->c * pow10i(extra + b->s);
     __int128 q = num / b->c;
@@ -6286,6 +7196,9 @@ BDec* beans_dec_round(BDec* a, long long places) {
     __int128 q = a->c / f, rem = a->c % f;
     if (rem < 0) rem = -rem;
     if (rem * 2 >= f) q += a->c >= 0 ? 1 : -1;
+    // negative places round to a power of ten: scale the whole-number result
+    // back up and keep scale 0 (matches Decimal::round_to)
+    if (places < 0) return dec_mk(q * pow10i(-places), 0);
     return dec_mk(q, places);
 }
 int beans_dec_cmp(BDec* a, BDec* b) {
@@ -6293,6 +7206,19 @@ int beans_dec_cmp(BDec* a, BDec* b) {
     long long s;
     dec_align(a, b, &ca, &cb, &s);
     return ca < cb ? -1 : ca > cb ? 1 : 0;
+}
+// dec_cmp aligns scales, so 2.50 == 2.5 — hash the canonical trailing-zero-free
+// form so equal decimals land in the same map index slot
+long long beans_dec_hash(BDec* d) {
+    __int128 c = d->c;
+    long long s = d->s;
+    while (s > 0 && c % 10 == 0) {
+        c /= 10;
+        s -= 1;
+    }
+    unsigned long long lo = (unsigned long long)(unsigned __int128)c;
+    unsigned long long hi = (unsigned long long)((unsigned __int128)c >> 64);
+    return (long long)beans_mix64(lo ^ beans_mix64(hi ^ (unsigned long long)s));
 }
 // same acceptance rule as the interpreter's dec_valid: [+-]? digits with '_',
 // one optional '.', one optional e/E exponent with its own sign and a digit
@@ -6309,7 +7235,13 @@ static int dec_valid_c(const char* s) {
             i++;
             if (s[i] == '+' || s[i] == '-') i++;
             if (!(s[i] >= '0' && s[i] <= '9')) return 0;
-            while (s[i] >= '0' && s[i] <= '9') i++;
+            // capped at 4096 exactly like the interpreter's dec_valid
+            long long ev = 0;
+            while (s[i] >= '0' && s[i] <= '9') {
+                ev = ev * 10 + (s[i] - '0');
+                if (ev > 4096) return 0;
+                i++;
+            }
             return s[i] == '\0';
         }
         return 0;
@@ -6378,27 +7310,42 @@ char* beans_dec_str(BDec* a) {
     __int128 c = a->c;
     int neg = c < 0;
     if (neg) c = -c;
-    char digits[64];
-    int n = 0;
+    // scratch sized from the scale: an __int128 holds at most 39 digits, but
+    // the zero-fill below runs to scale+1 — "1e-100".to_decimal() legitimately
+    // carries scale 100, and the old fixed 64/80-byte stack buffers smashed
+    // the stack. Small values keep the stack fast path.
+    long long cap = (a->s > 38 ? a->s : 38) + 2;
+    char dsmall[64], osmall[80];
+    char* digits = cap <= 63 ? dsmall : malloc((size_t)cap + 1);
+    char* out = cap + 2 <= 79 ? osmall : malloc((size_t)cap + 3);
+    if (!digits || !out) beans_panic("decimal too large to print", 0, 0);
+    long long n = 0;
     if (c == 0) digits[n++] = '0';
     while (c > 0) {
         digits[n++] = (char)('0' + (int)(c % 10));
         c /= 10;
     }
     while (n <= a->s) digits[n++] = '0';
-    char out[80];
-    int o = 0;
+    long long o = 0;
     if (neg) out[o++] = '-';
-    for (int i = n - 1; i >= 0; i--) {
+    for (long long i = n - 1; i >= 0; i--) {
         out[o++] = digits[i];
         if (i == a->s && i != 0) out[o++] = '.';
     }
     out[o] = '\0';
-    return rc_strdup(out);
+    char* r = rc_strdup(out);
+    if (digits != dsmall) free(digits);
+    if (out != osmall) free(out);
+    return r;
 }
 
 // ---- std.fmt (mirrors builtins.cpp byte for byte) ----
-char* beans_fmt_pad_left(char* s, long long w) {
+// same 1e6 width ceiling the interpolation spec enforces at compile time — a
+// pad is a fill, not an allocation primitive; past the cap it is a panic on
+// both backends, not a 1TB alloc the OOM killer reaps
+#define FMT_PAD_MAX 1000000
+char* beans_fmt_pad_left(char* s, long long w, long long line, long long col) {
+    if (w > FMT_PAD_MAX) beans_panic("pad width too large", line, col);
     long long n = beans_slen(s);
     if (w <= n) return str_make(s, n);
     char* out = beans_alloc(w + 1, w << 3);
@@ -6406,7 +7353,8 @@ char* beans_fmt_pad_left(char* s, long long w) {
     memcpy(out + (w - n), s, (size_t)n);
     return out;
 }
-char* beans_fmt_pad_right(char* s, long long w) {
+char* beans_fmt_pad_right(char* s, long long w, long long line, long long col) {
+    if (w > FMT_PAD_MAX) beans_panic("pad width too large", line, col);
     long long n = beans_slen(s);
     if (w <= n) return str_make(s, n);
     char* out = beans_alloc(w + 1, w << 3);

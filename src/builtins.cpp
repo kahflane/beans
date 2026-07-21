@@ -21,14 +21,15 @@
 namespace beans {
 
 FileVal::~FileVal() {
-    if (fd >= 0 && !closed) close(fd); // safety net; close() is the real API
+    // close whatever is still open: a live handle (never closed) or one whose
+    // close() was deferred while worker threads ran (fd left valid). The last
+    // ref is gone, so no thread can be mid-op — releasing now is safe.
+    if (fd >= 0) close(fd);
 }
 
 MMapVal::~MMapVal() {
-    if (!closed) { // same safety net
-        if (ptr) munmap(ptr, static_cast<size_t>(len));
-        if (fd >= 0) close(fd);
-    }
+    if (ptr) munmap(ptr, static_cast<size_t>(len));
+    if (fd >= 0) close(fd);
 }
 
 namespace {
@@ -324,7 +325,15 @@ bool dec_valid(const char* s) {
             i++;
             if (s[i] == '+' || s[i] == '-') i++;
             if (!(s[i] >= '0' && s[i] <= '9')) return false;
-            while (s[i] >= '0' && s[i] <= '9') i++;
+            // exponent magnitude is capped at 4096: it must fit an int32 on
+            // this side and a bounded pow10 walk on both — past the cap the
+            // string simply does not read as a decimal
+            long long ev = 0;
+            while (s[i] >= '0' && s[i] <= '9') {
+                ev = ev * 10 + (s[i] - '0');
+                if (ev > 4096) return false;
+                i++;
+            }
             return s[i] == '\0';
         }
         return false;
@@ -519,12 +528,20 @@ Value file_read_at(uint32_t, uint32_t, Value& recv, std::vector<Value>& args) {
     if (recv.file->closed) return closed_err();
     int64_t pos = args[0].i, n = args[1].i;
     if (pos < 0 || n < 0) return res_err("negative read", "io");
+    struct stat st;
+    if (fstat(recv.file->fd, &st) == 0 && S_ISREG(st.st_mode)) {
+        int64_t rem = st.st_size > pos ? st.st_size - pos : 0;
+        if (n > rem) n = rem;
+    }
     std::vector<uint8_t> buf(static_cast<size_t>(n));
     size_t got = 0;
     while (got < buf.size()) {
         ssize_t r = pread(recv.file->fd, buf.data() + got, buf.size() - got,
                           static_cast<off_t>(pos) + static_cast<off_t>(got));
-        if (r < 0) return res_err(std::string("read: ") + strerror(errno), fs_kind_of(errno));
+        if (r < 0) {
+            if (errno == EINTR) continue;
+            return res_err(std::string("read: ") + strerror(errno), fs_kind_of(errno));
+        }
         if (r == 0) break; // eof: a short read returns what's there
         got += static_cast<size_t>(r);
     }
@@ -541,7 +558,10 @@ Value file_write_at(uint32_t, uint32_t, Value& recv, std::vector<Value>& args) {
     while (done < d.size()) {
         ssize_t r = pwrite(recv.file->fd, d.data() + done, d.size() - done,
                            static_cast<off_t>(pos) + static_cast<off_t>(done));
-        if (r < 0) return res_err(std::string("write: ") + strerror(errno), fs_kind_of(errno));
+        if (r < 0) {
+            if (errno == EINTR) continue;
+            return res_err(std::string("write: ") + strerror(errno), fs_kind_of(errno));
+        }
         done += static_cast<size_t>(r);
     }
     return res_ok(Value::of_int(static_cast<int64_t>(done)));
@@ -551,11 +571,22 @@ Value file_read(uint32_t, uint32_t, Value& recv, std::vector<Value>& args) {
     if (recv.file->closed) return closed_err();
     int64_t n = args[0].i;
     if (n < 0) return res_err("negative read", "io");
+    // clamp to what the file can actually give: a corrupted length field must
+    // not become a giant allocation — the read comes back short anyway
+    struct stat st;
+    if (fstat(recv.file->fd, &st) == 0 && S_ISREG(st.st_mode)) {
+        int64_t at = static_cast<int64_t>(lseek(recv.file->fd, 0, SEEK_CUR));
+        int64_t rem = at >= 0 && st.st_size > at ? st.st_size - at : 0;
+        if (n > rem) n = rem;
+    }
     std::vector<uint8_t> buf(static_cast<size_t>(n));
     size_t got = 0;
     while (got < buf.size()) {
         ssize_t r = read(recv.file->fd, buf.data() + got, buf.size() - got);
-        if (r < 0) return res_err(std::string("read: ") + strerror(errno), fs_kind_of(errno));
+        if (r < 0) {
+            if (errno == EINTR) continue;
+            return res_err(std::string("read: ") + strerror(errno), fs_kind_of(errno));
+        }
         if (r == 0) break;
         got += static_cast<size_t>(r);
     }
@@ -569,7 +600,10 @@ Value file_write(uint32_t, uint32_t, Value& recv, std::vector<Value>& args) {
     size_t done = 0;
     while (done < d.size()) {
         ssize_t r = write(recv.file->fd, d.data() + done, d.size() - done);
-        if (r < 0) return res_err(std::string("write: ") + strerror(errno), fs_kind_of(errno));
+        if (r < 0) {
+            if (errno == EINTR) continue;
+            return res_err(std::string("write: ") + strerror(errno), fs_kind_of(errno));
+        }
         done += static_cast<size_t>(r);
     }
     return res_ok(Value::of_int(static_cast<int64_t>(done)));
@@ -626,7 +660,15 @@ Value file_sync(uint32_t, uint32_t, Value& recv, std::vector<Value>&) {
 Value file_close(uint32_t, uint32_t, Value& recv, std::vector<Value>&) {
     if (recv.file->closed) return res_err("file already closed", "closed");
     recv.file->closed = true;
-    if (close(recv.file->fd) != 0) {
+    // defer the real close() while workers run: a racing op on another thread
+    // could still be mid-syscall on this fd, and reusing the number would
+    // corrupt a freshly-opened file. The destructor closes it once the last
+    // ref drops. Mirrors the native runtime's cc_threads gate; zero cost with
+    // no threads.
+    if (beans_threads_live()) return res_ok(Value::of_bool(true));
+    int fd = recv.file->fd;
+    recv.file->fd = -1;
+    if (close(fd) != 0) {
         return res_err(std::string("close: ") + strerror(errno), fs_kind_of(errno));
     }
     return res_ok(Value::of_bool(true));
@@ -636,7 +678,9 @@ Value file_close(uint32_t, uint32_t, Value& recv, std::vector<Value>&) {
 // by someone else", every other failure is a real error
 Value file_lock(uint32_t, uint32_t, Value& recv, std::vector<Value>&) {
     if (recv.file->closed) return closed_err();
-    if (flock(recv.file->fd, LOCK_EX) != 0) {
+    // a blocking lock is the classic EINTR victim — retry rather than fail
+    while (flock(recv.file->fd, LOCK_EX) != 0) {
+        if (errno == EINTR) continue;
         return res_err(std::string("lock: ") + strerror(errno), fs_kind_of(errno));
     }
     return res_ok(Value::of_bool(true));
@@ -775,7 +819,7 @@ Value bytes_crc32(uint32_t line, uint32_t col, Value& recv, std::vector<Value>& 
 }
 
 // ---- MMap -------------------------------------------------------------------
-// whole-file shared mapping; the fd is closed right after mapping — the
+// whole-file shared mapping; the fd is kept open so resize() can remap — the
 // mapping outlives it. get/put/read/write panic on a closed or short map,
 // flush/close report errors as Results like File does.
 
@@ -790,7 +834,9 @@ Value mmap_get_w(uint32_t line, uint32_t col, Value& recv, std::vector<Value>& a
     MMapVal& m = *recv.mm;
     if (m.closed) bpanic(line, col, "mmap is closed");
     int64_t pos = args[0].i;
-    if (pos < 0 || pos + w > m.len) {
+    // pos > len - w, never pos + w > len: the addition overflows for huge pos
+    // and the wrapped sum sails past the guard into a wild read
+    if (pos < 0 || w > m.len || pos > m.len - w) {
         bpanic(line, col, std::string(what) + " read at " + std::to_string(pos) +
                               " out of range (len " + std::to_string(m.len) + ")");
     }
@@ -805,7 +851,7 @@ Value mmap_put_w(uint32_t line, uint32_t col, Value& recv, std::vector<Value>& a
     if (m.closed) bpanic(line, col, "mmap is closed");
     if (!m.writable) bpanic(line, col, "mmap is read-only");
     int64_t pos = args[0].i;
-    if (pos < 0 || pos + w > m.len) {
+    if (pos < 0 || w > m.len || pos > m.len - w) {
         bpanic(line, col, std::string(what) + " write at " + std::to_string(pos) +
                               " out of range (len " + std::to_string(m.len) + ")");
     }
@@ -829,7 +875,7 @@ Value mmap_read(uint32_t line, uint32_t col, Value& recv, std::vector<Value>& ar
     MMapVal& m = *recv.mm;
     if (m.closed) bpanic(line, col, "mmap is closed");
     int64_t pos = args[0].i, n = args[1].i;
-    if (pos < 0 || n < 0 || pos + n > m.len) {
+    if (pos < 0 || n < 0 || n > m.len || pos > m.len - n) {
         bpanic(line, col, "read " + std::to_string(n) + " at " + std::to_string(pos) +
                               " out of range (len " + std::to_string(m.len) + ")");
     }
@@ -847,7 +893,8 @@ Value mmap_write(uint32_t line, uint32_t col, Value& recv, std::vector<Value>& a
     if (!m.writable) bpanic(line, col, "mmap is read-only");
     auto& d = args[1].bytes->data;
     int64_t pos = args[0].i;
-    if (pos < 0 || pos + static_cast<int64_t>(d.size()) > m.len) {
+    int64_t wn = static_cast<int64_t>(d.size());
+    if (pos < 0 || wn > m.len || pos > m.len - wn) {
         bpanic(line, col, "write " + std::to_string(d.size()) + " at " +
                               std::to_string(pos) + " out of range (len " +
                               std::to_string(m.len) + ")");
@@ -869,7 +916,7 @@ Value mmap_flush_range(uint32_t, uint32_t, Value& recv, std::vector<Value>& args
     MMapVal& m = *recv.mm;
     if (m.closed) return mmap_closed_res();
     int64_t pos = args[0].i, n = args[1].i;
-    if (pos < 0 || n < 0 || pos + n > m.len) {
+    if (pos < 0 || n < 0 || n > m.len || pos > m.len - n) {
         return res_err("flush " + std::to_string(n) + " at " + std::to_string(pos) +
                            " out of range (len " + std::to_string(m.len) + ")",
                        "io");
@@ -890,9 +937,14 @@ Value mmap_close(uint32_t, uint32_t, Value& recv, std::vector<Value>&) {
     MMapVal& m = *recv.mm;
     if (m.closed) return res_err("mmap already closed", "closed");
     m.closed = true;
+    // defer munmap+close while workers run (see file_close): a racing op must
+    // not have the mapping pulled out from under it
+    if (beans_threads_live()) return res_ok(Value::of_bool(true));
     bool bad = m.ptr && munmap(m.ptr, static_cast<size_t>(m.len)) != 0;
     int e = errno;
+    m.ptr = nullptr;
     if (m.fd >= 0) close(m.fd);
+    m.fd = -1;
     if (bad) return res_err(std::string("close: ") + strerror(e), fs_kind_of(e));
     return res_ok(Value::of_bool(true));
 }
@@ -1023,7 +1075,9 @@ Value file_size_s(uint32_t, uint32_t, std::vector<Value>& args) {
 Value file_remove_s(uint32_t, uint32_t, std::vector<Value>& args) {
     const std::string& p = *args[0].s;
     struct stat st;
-    if (stat(p.c_str(), &st) != 0) return fs_err(p, errno);
+    // lstat, not stat: a dangling symlink has no target to stat, and even a
+    // live one should be unlinked as the link, not followed to its target
+    if (lstat(p.c_str(), &st) != 0) return fs_err(p, errno);
     int r = S_ISDIR(st.st_mode) ? rmdir(p.c_str()) : unlink(p.c_str());
     if (r != 0) return fs_err(p, errno);
     return res_ok(Value::of_bool(true));
@@ -1105,7 +1159,14 @@ Value dir_make_all_s(uint32_t, uint32_t, std::vector<Value>& args) {
         cur = p.substr(0, j);
         i = j + 1;
         if (cur.empty()) continue;
-        if (mkdir(cur.c_str(), 0755) != 0 && errno != EEXIST) return fs_err(cur, errno);
+        if (mkdir(cur.c_str(), 0755) != 0) {
+            if (errno != EEXIST) return fs_err(cur, errno);
+            // EEXIST is only ok if it's already a directory — a regular file
+            // in the path is a real error (Go's MkdirAll semantics)
+            struct stat st;
+            if (stat(cur.c_str(), &st) != 0 || !S_ISDIR(st.st_mode))
+                return fs_err(cur, ENOTDIR);
+        }
     }
     return res_ok(Value::of_bool(true));
 }
@@ -1130,22 +1191,41 @@ Value dir_remove_s(uint32_t, uint32_t, std::vector<Value>& args) {
     return res_ok(Value::of_bool(true));
 }
 
+// Iterative delete: gather the tree pre-order (parent before child) one DIR
+// at a time, then rmdir in reverse (deepest first). Recursion held one fd per
+// level and ran out on deep trees; this caps open fds at one.
 int rm_tree(const std::string& p) {
     struct stat st;
     if (lstat(p.c_str(), &st) != 0) return -1;
     if (!S_ISDIR(st.st_mode)) return unlink(p.c_str());
-    DIR* d = opendir(p.c_str());
-    if (!d) return -1;
-    struct dirent* de;
-    while ((de = readdir(d)) != nullptr) {
-        if (strcmp(de->d_name, ".") == 0 || strcmp(de->d_name, "..") == 0) continue;
-        if (rm_tree(p + "/" + de->d_name) != 0) {
-            closedir(d);
-            return -1;
+    std::vector<std::string> dirs;  // to rmdir, discovery (pre) order
+    std::vector<std::string> stack{p};
+    while (!stack.empty()) {
+        std::string dir = std::move(stack.back());
+        stack.pop_back();
+        DIR* d = opendir(dir.c_str());
+        if (!d) return -1;
+        while (dirent* de = readdir(d)) {
+            if (strcmp(de->d_name, ".") == 0 || strcmp(de->d_name, "..") == 0) continue;
+            std::string sub = dir + "/" + de->d_name;
+            struct stat cst;
+            if (lstat(sub.c_str(), &cst) != 0) {
+                closedir(d);
+                return -1;
+            }
+            if (S_ISDIR(cst.st_mode)) stack.push_back(sub); // scan later
+            else if (unlink(sub.c_str()) != 0) {
+                closedir(d);
+                return -1;
+            }
         }
+        closedir(d);
+        dirs.push_back(std::move(dir)); // remove after its children
     }
-    closedir(d);
-    return rmdir(p.c_str());
+    for (size_t i = dirs.size(); i-- > 0;) { // deepest first
+        if (rmdir(dirs[i].c_str()) != 0) return -1;
+    }
+    return 0;
 }
 
 Value dir_remove_all_s(uint32_t, uint32_t, std::vector<Value>& args) {
@@ -1186,36 +1266,38 @@ Value dir_sync_s(uint32_t, uint32_t, std::vector<Value>& args) {
 
 // files and symlinks under root (lstat — never follows a link), paths
 // relative to root, "/"-joined, sorted at the end so readdir order is moot
-bool walk_dir(const std::string& root, const std::string& rel,
+// Iterative walk: an explicit stack of relative dir paths, one DIR open at a
+// time. Recursion held one fd per depth level and ran out at ~250 deep; this
+// caps open fds at one. Output is sorted by the caller, so order is free.
+bool walk_dir(const std::string& root, const std::string&,
               std::vector<std::string>& out, std::string& epath, int& eno) {
-    std::string full = rel.empty() ? root : root + "/" + rel;
-    DIR* d = opendir(full.c_str());
-    if (!d) {
-        epath = full;
-        eno = errno;
-        return false;
-    }
-    while (dirent* en = readdir(d)) {
-        std::string name = en->d_name;
-        if (name == "." || name == "..") continue;
-        std::string r2 = rel.empty() ? name : rel + "/" + name;
-        struct stat st;
-        if (lstat((root + "/" + r2).c_str(), &st) != 0) {
-            epath = root + "/" + r2;
+    std::vector<std::string> stack{""}; // "" = root itself
+    while (!stack.empty()) {
+        std::string rel = std::move(stack.back());
+        stack.pop_back();
+        std::string full = rel.empty() ? root : root + "/" + rel;
+        DIR* d = opendir(full.c_str());
+        if (!d) {
+            epath = full;
             eno = errno;
-            closedir(d);
             return false;
         }
-        if (S_ISDIR(st.st_mode)) {
-            if (!walk_dir(root, r2, out, epath, eno)) {
+        while (dirent* en = readdir(d)) {
+            std::string name = en->d_name;
+            if (name == "." || name == "..") continue;
+            std::string r2 = rel.empty() ? name : rel + "/" + name;
+            struct stat st;
+            if (lstat((root + "/" + r2).c_str(), &st) != 0) {
+                epath = root + "/" + r2;
+                eno = errno;
                 closedir(d);
                 return false;
             }
-        } else {
-            out.push_back(r2);
+            if (S_ISDIR(st.st_mode)) stack.push_back(r2); // descend later
+            else out.push_back(r2);
         }
+        closedir(d);
     }
-    closedir(d);
     return true;
 }
 
@@ -1376,11 +1458,13 @@ Value io_read_all(uint32_t, uint32_t, std::vector<Value>&) {
 // ---- std.fmt ----------------------------------------------------------------
 // pure text rendering; the C runtime mirrors each of these byte for byte
 
-Value fmt_pad_left(uint32_t, uint32_t, std::vector<Value>& args) {
+Value fmt_pad_left(uint32_t line, uint32_t col, std::vector<Value>& args) {
+    if (args[1].i > 1000000) bpanic(line, col, "pad width too large");
     return Value::of_str(fmt_pad_text(*args[0].s, args[1].i, false));
 }
 
-Value fmt_pad_right(uint32_t, uint32_t, std::vector<Value>& args) {
+Value fmt_pad_right(uint32_t line, uint32_t col, std::vector<Value>& args) {
+    if (args[1].i > 1000000) bpanic(line, col, "pad width too large");
     return Value::of_str(fmt_pad_text(*args[0].s, args[1].i, true));
 }
 
@@ -1600,8 +1684,8 @@ const std::vector<BuiltinFn>& builtin_fns() {
         {"std.os", "sleep_ms", {BT::i64}, BT::unit, "beans_os_sleep_ms", false, os_sleep_ms},
         {"std.io", "read_line", {}, BT::opt_str, "beans_io_read_line", false, io_read_line},
         {"std.io", "read_all", {}, BT::str, "beans_io_read_all", false, io_read_all},
-        {"std.fmt", "pad_left", {BT::str, BT::i64}, BT::str, "beans_fmt_pad_left", false, fmt_pad_left},
-        {"std.fmt", "pad_right", {BT::str, BT::i64}, BT::str, "beans_fmt_pad_right", false, fmt_pad_right},
+        {"std.fmt", "pad_left", {BT::str, BT::i64}, BT::str, "beans_fmt_pad_left", true, fmt_pad_left},
+        {"std.fmt", "pad_right", {BT::str, BT::i64}, BT::str, "beans_fmt_pad_right", true, fmt_pad_right},
         {"std.fmt", "float", {BT::f64, BT::i64}, BT::str, "beans_fmt_float", false, fmt_float},
         {"std.fmt", "dec", {BT::dec, BT::i64}, BT::str, "beans_fmt_dec", false, fmt_dec},
         {"std.fmt", "hex", {BT::i64}, BT::str, "beans_fmt_hex", false, fmt_hex},

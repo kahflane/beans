@@ -1,6 +1,12 @@
 // stdlib phase 3: advisory file locks (flock) — the single-writer database
 // pattern. Locks belong to the open file description, so two handles on the
 // same file contend: try_lock's ok(false) means "someone else holds it".
+//
+// This example uses try_lock so its output stays deterministic. The blocking
+// lock() waits until the holder releases (across processes or threads that
+// each opened the file separately) — it retries through EINTR. A single thread
+// that calls lock() on a description it already holds via another handle would
+// wait forever, so use try_lock when the same thread might already hold it.
 import std.io
 
 fn main() {

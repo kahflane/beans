@@ -47,6 +47,13 @@ bytes on every program. Small objects normally live inside pooled 64KB slabs, wh
 leaks from the tool — hunt real leaks with `BEANS_NO_POOL=1 leaks --atExit -- ...`, which routes every
 allocation through plain calloc/free.
 
+`leaks` does not catch use-after-free or out-of-bounds access — the pool recycles freed blocks, so a
+UAF reads valid pooled memory and passes silently. Compile the emitted IR with AddressSanitizer to
+catch those: `clang -O1 -g -fsanitize=address -Wno-override-module build/<stem>.ll build/beans_rt.c
+-o asan_<stem>` then `BEANS_NO_POOL=1 ./asan_<stem>`. This is what surfaces lifetime bugs the diff test
+and `leaks` both miss (e.g. a `defer` running on a freed local). Run it, plus `-fsanitize=thread` on
+`examples/threads.b`, after any change to `FnEmit`, the RC discipline, or the C runtime.
+
 Only `examples/` and `bench/` are tracked — `build/` is gitignored, so scratch `.b` test programs
 written there do not survive.
 

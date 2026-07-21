@@ -28,6 +28,11 @@ class KV {
         for pos + 8 <= data.len() {
             let kl: int = data.get_u32(pos)
             let vl: int = data.get_u32(pos + 4)
+            // a crash mid-append can leave a torn trailing record; stop at it
+            // rather than slicing past the end (append-only-log recovery)
+            if pos + 8 + kl + vl > data.len() {
+                break
+            }
             let k: string = data.slice(pos + 8, pos + 8 + kl).to_string()
             if k == key {
                 found = data.slice(pos + 8 + kl, pos + 8 + kl + vl).to_string()
@@ -54,6 +59,10 @@ class KV {
         for pos + 8 <= data.len() {
             let kl: int = data.get_u32(pos)
             let vl: int = data.get_u32(pos + 4)
+            // torn trailing record from a crash mid-append: stop the scan
+            if pos + 8 + kl + vl > data.len() {
+                break
+            }
             let k: string = data.slice(pos + 8, pos + 8 + kl).to_string()
             let v: string = data.slice(pos + 8 + kl, pos + 8 + kl + vl).to_string()
             if !names.contains(k) {
@@ -109,6 +118,16 @@ fn main() {
 
     io.println(kv.get("name").expect("still there"))
     io.println(kv.get("year").expect("still there"))
+
+    // simulate a crash mid-append: a full 8-byte header claiming a 100+100
+    // byte key/value that never got written. get/compact must treat this torn
+    // tail as EOF, not slice past the end and panic.
+    var torn: Bytes = Bytes.new(8)
+    torn.put_u32(0, 100).put_u32(4, 100)
+    File.append_bytes(kv.path, torn).expect("torn append")
+    io.println(kv.get("name").expect("survives torn tail"))
+    let recovered: int = kv.compact().expect("compact past torn tail")
+    io.println("recovered, {recovered} bytes")
 
     Dir.remove_all(base).expect("cleanup")
     io.println("done")

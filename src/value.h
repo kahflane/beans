@@ -96,8 +96,8 @@ struct Decimal {
         __int128 f = pow10(scale - places);
         __int128 q = coeff / f, rem = coeff % f;
         if (rem < 0) rem = -rem;
-        // round half away from zero (banker's rounding is still an open question)
         if (rem * 2 >= f) q += coeff >= 0 ? 1 : -1;
+        if (places < 0) return {q * pow10(-places), 0};
         return {q, places};
     }
 
@@ -235,6 +235,18 @@ struct ListVal {
 };
 struct MapVal {
     std::vector<std::pair<Value, Value>> entries;
+    // open-addressed index over entries, so lookup is O(1) while iteration
+    // order stays insertion order. Each word is (hash high 32 << 32) | (pos+2);
+    // 0 = empty, 1 = tombstone. Empty vector = small map, linear scan.
+    std::vector<uint64_t> index;
+    size_t tombs = 0;
+    // remove on an indexed map resets the pair to unit and marks it dead
+    // instead of shifting, so delete is O(1); map_reindex compacts once holes
+    // outnumber live entries. Empty dead = no holes (mirrors the C runtime).
+    std::vector<uint8_t> dead;
+    size_t holes = 0;
+    bool is_dead(size_t i) const { return !dead.empty() && dead[i]; }
+    size_t live() const { return entries.size() - holes; }
     ~MapVal() {
         for (auto& [k, v] : entries) {
             teardown_park(k);
