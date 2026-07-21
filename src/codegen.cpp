@@ -164,6 +164,17 @@ const char* ll(const Ty* t) {
         default: return "ptr";
     }
 }
+// does this type live on the RC'd heap?
+bool is_rc(const Ty* t) {
+    switch (t->k) {
+        case Ty::str_: case Ty::dec_: case Ty::obj_: case Ty::enum_:
+        case Ty::list_: case Ty::map_: case Ty::fn_: case Ty::thread_:
+        case Ty::mutex_: case Ty::chan_: case Ty::atomic_:
+            return true;
+        default:
+            return false;
+    }
+}
 } // namespace
 
 // a monomorphized class
@@ -373,9 +384,13 @@ struct CG2 {
     }
 
     // ---- misc lookups ----
+    // string constants carry an immortal RC header so releases skip them;
+    // the value handed around points 16 bytes past the header
     std::string intern_string(const std::string& bytes) {
         std::string name = "@.str" + std::to_string(next_str++);
-        globals += name + " = private unnamed_addr constant [" +
+        globals += name + " = private unnamed_addr constant {i64, i64, [" +
+                   std::to_string(bytes.size() + 1) +
+                   " x i8]} {i64 4611686018427387904, i64 0, [" +
                    std::to_string(bytes.size() + 1) + " x i8] c\"";
         for (unsigned char c : bytes) {
             if (c >= 0x20 && c <= 0x7E && c != '"' && c != '\\') {
@@ -386,8 +401,8 @@ struct CG2 {
                 globals += buf;
             }
         }
-        globals += "\\00\"\n";
-        return name;
+        globals += "\\00\"}\n";
+        return "getelementptr (i8, ptr " + name + ", i64 16)";
     }
 
     int selector(const std::string& name) {
@@ -758,10 +773,18 @@ struct FnEmit {
     std::string allocas, body, entry_inits;
     int next_reg = 0, next_bb = 0;
     bool terminated = false;
-    struct Var { std::string slot; Ty* ty; bool boxed = false; };
+    struct Var {
+        std::string slot;
+        Ty* ty;
+        bool boxed = false;
+        bool owned = false; // frame holds a ref (lets); params/bindings borrow
+    };
     std::vector<std::map<std::string, Var>> scopes;
-    std::vector<std::pair<std::string, std::string>> loop_stack;
+    struct LoopCtx { std::string brk, cont; size_t scope_depth; };
+    std::vector<LoopCtx> loop_stack;
     std::vector<std::unique_ptr<std::string>> interp_srcs;
+    // owned temporaries created while emitting the current statement
+    std::vector<std::string> temps;
     Ty* ret_ty = nullptr;
     std::set<std::string> boxed_names; // captured by closures
     struct DeferRec {
@@ -814,7 +837,9 @@ struct FnEmit {
             // params get their cell in the entry block; lets get a fresh cell
             // at their statement site.
             std::string cell = "%cell" + std::to_string(next_reg++);
-            std::string code = "  " + cell + " = call ptr @beans_alloc(i64 8)\n" +
+            long long cmeta = is_rc(t) ? fixed_meta(1) : 0;
+            std::string code = "  " + cell + " = call ptr @beans_alloc(i64 8, i64 " +
+                               std::to_string(cmeta) + ")\n" +
                                "  store ptr " + cell + ", ptr " + slot + "\n";
             if (entry) entry_inits += code;
             else body += code;
@@ -826,6 +851,51 @@ struct FnEmit {
         std::string slot = "%v" + std::to_string(next_reg++) + "." + tag;
         allocas += "  " + slot + " = alloca " + ll(t) + "\n";
         return slot;
+    }
+
+    // ---- ownership bookkeeping ----
+    void own(const std::string& val, Ty* t) {
+        if (is_rc(t) && !val.empty() && val[0] == '%') temps.push_back(val);
+    }
+    bool consume(const std::string& val) {
+        for (auto it = temps.rbegin(); it != temps.rend(); ++it) {
+            if (*it == val) {
+                temps.erase(std::next(it).base());
+                return true;
+            }
+        }
+        return false;
+    }
+    void emit_retain(const std::string& val) {
+        line("call void @beans_retain(ptr " + val + ")");
+    }
+    void emit_release(const std::string& val) {
+        line("call void @beans_release(ptr " + val + ")");
+    }
+    // release owned temps created since `mark`
+    void flush_temps(size_t mark) {
+        while (temps.size() > mark) {
+            emit_release(temps.back());
+            temps.pop_back();
+        }
+    }
+    // release the frame-owned locals of scopes [from_depth, end)
+    void release_scopes(size_t from_depth) {
+        for (size_t si = scopes.size(); si-- > from_depth;) {
+            for (auto& [name, v] : scopes[si]) {
+                if (v.boxed) {
+                    if (v.owned) {
+                        std::string cell = reg();
+                        line(cell + " = load ptr, ptr " + v.slot);
+                        emit_release(cell);
+                    }
+                } else if (v.owned && is_rc(v.ty)) {
+                    std::string val = reg();
+                    line(val + " = load ptr, ptr " + v.slot);
+                    emit_release(val);
+                }
+            }
+        }
     }
 
     // read/write a Var, transparently going through its cell when boxed
@@ -849,12 +919,21 @@ struct FnEmit {
 
     using EV = std::pair<std::string, Ty*>;
 
+    // value is about to be stored somewhere that owns it: transfer or +1
+    void transfer_in(const EV& v) {
+        if (!is_rc(v.second)) return;
+        if (consume(v.first)) return; // ownership moves
+        emit_retain(v.first);
+    }
+
     // ---- allocation helpers ----
-    std::string alloc_bytes(int n) {
+    std::string alloc_bytes(int n, long long meta) {
         std::string r = reg();
-        line(r + " = call ptr @beans_alloc(i64 " + std::to_string(n) + ")");
+        line(r + " = call ptr @beans_alloc(i64 " + std::to_string(n) + ", i64 " +
+             std::to_string(meta) + ")");
         return r;
     }
+    static long long fixed_meta(long long mask) { return 1 | (mask << 3); }
     void store_at(const std::string& base, int offset, const std::string& val, Ty* t) {
         std::string p = reg();
         line(p + " = getelementptr i8, ptr " + base + ", i64 " + std::to_string(offset));
@@ -866,12 +945,20 @@ struct FnEmit {
         line(r + " = load " + std::string(ll(t)) + ", ptr " + p);
         return r;
     }
+    // enum boxes own their payload refs; the box itself is an owned temp
     std::string box_enum(int tag, const std::vector<EV>& payload) {
-        std::string b = alloc_bytes(8 + 8 * static_cast<int>(payload.size()));
+        long long mask = 0;
+        for (size_t i = 0; i < payload.size(); i++) {
+            if (is_rc(payload[i].second)) mask |= 1LL << (i + 1);
+        }
+        std::string b = alloc_bytes(8 + 8 * static_cast<int>(payload.size()),
+                                    fixed_meta(mask));
         store_at(b, 0, std::to_string(tag), cg.t_i64());
         for (size_t i = 0; i < payload.size(); i++) {
+            transfer_in(payload[i]);
             store_at(b, 8 + 8 * static_cast<int>(i), payload[i].first, payload[i].second);
         }
+        own(b, cg.t_enum("Option", {})); // any rc type works for bookkeeping
         return b;
     }
 
@@ -945,6 +1032,7 @@ struct FnEmit {
                         line(r + " = fneg double " + v.first);
                     } else if (v.second->k == Ty::dec_) {
                         line(r + " = call ptr @beans_dec_neg(ptr " + v.first + ")");
+                        own(r, cg.t_dec());
                     } else {
                         line(r + " = sub i64 0, " + v.first);
                     }
@@ -998,14 +1086,21 @@ struct FnEmit {
             }
             case Expr::Kind::list_lit: {
                 Ty* elem = hint && hint->k == Ty::list_ ? hint->args[0] : nullptr;
-                std::string l = reg();
-                line(l + " = call ptr @beans_list_new()");
+                std::vector<EV> elems;
                 for (const ExprPtr& el : e->args) {
                     EV v = eval(el.get(), elem);
                     if (!elem) elem = v.second;
-                    line("call void @beans_list_push(ptr " + l + ", i64 " + to_slot(v) + ")");
+                    elems.push_back(std::move(v));
                 }
                 if (!elem) elem = cg.t_i64();
+                std::string l = reg();
+                line(l + " = call ptr @beans_list_new(i64 " +
+                     std::string(is_rc(elem) ? "1" : "0") + ")");
+                for (const EV& v : elems) {
+                    transfer_in(v);
+                    line("call void @beans_list_push(ptr " + l + ", i64 " + to_slot(v) + ")");
+                }
+                own(l, cg.t_list(elem));
                 return {l, cg.t_list(elem)};
             }
             case Expr::Kind::init:
@@ -1025,9 +1120,14 @@ struct FnEmit {
                 std::string okb = bb(), errb = bb();
                 line("br i1 " + c + ", label %" + okb + ", label %" + errb);
                 label(errb);
-                emit_ret("ret ptr " + v.first); // pass the err/none box up unchanged
+                if (!in_temps(v.first)) emit_retain(v.first); // caller gets +1
+                emit_ret("ret ptr " + v.first, v.first);
                 label(okb);
                 std::string payload = load_at(v.first, 8, inner);
+                if (is_rc(inner)) {
+                    emit_retain(payload); // survives the box
+                    own(payload, inner);
+                }
                 return {payload, inner};
             }
             case Expr::Kind::if_expr: {
@@ -1035,17 +1135,24 @@ struct FnEmit {
                 std::string then_bb = bb(), else_bb = bb(), end_bb = bb();
                 line("br i1 " + c.first + ", label %" + then_bb + ", label %" + else_bb);
                 label(then_bb);
+                size_t tmark = temps.size();
                 EV a = eval(e->then_e.get(), hint);
+                if (is_rc(a.second)) transfer_in(a);
                 std::string slot = fresh_slot("ifv", a.second);
                 line("store " + std::string(ll(a.second)) + " " + a.first + ", ptr " + slot);
+                flush_temps(tmark);
                 line("br label %" + end_bb);
                 label(else_bb);
+                size_t emark = temps.size();
                 EV b2 = eval(e->else_e.get(), hint ? hint : a.second);
+                if (is_rc(a.second)) transfer_in(b2);
                 line("store " + std::string(ll(a.second)) + " " + b2.first + ", ptr " + slot);
+                flush_temps(emark);
                 line("br label %" + end_bb);
                 label(end_bb);
                 std::string r = reg();
                 line(r + " = load " + std::string(ll(a.second)) + ", ptr " + slot);
+                own(r, a.second);
                 return {r, a.second};
             }
             case Expr::Kind::match_expr:
@@ -1077,15 +1184,20 @@ struct FnEmit {
         sig.push_back(e->type ? rt(e->type.get(), e->line, e->col) : cg.t_unit());
         Ty* fty = cg.t_fn(std::move(sig));
 
-        std::string box = alloc_bytes(8 + 8 * static_cast<int>(caps.size()));
+        long long mask = 0;
+        for (size_t i = 0; i < caps.size(); i++) mask |= 1LL << (i + 1);
+        std::string box = alloc_bytes(8 + 8 * static_cast<int>(caps.size()),
+                                      fixed_meta(mask));
         store_at(box, 0, sym, cg.t_str());
         for (size_t i = 0; i < caps.size(); i++) {
             Var* v = find_var(caps[i].first);
-            // v is boxed (the prepass saw this closure) — pass the cell itself
+            // v is boxed (the prepass saw this closure) — share the cell, +1
             std::string cell = reg();
             line(cell + " = load ptr, ptr " + v->slot);
+            emit_retain(cell);
             store_at(box, 8 + 8 * static_cast<int>(i), cell, cg.t_str());
         }
+        own(box, fty);
         return {box, fty};
     }
 
@@ -1107,6 +1219,7 @@ struct FnEmit {
         std::string r = reg();
         line(r + " = call ptr @beans_dec_new(i128 " + i128_str(d.coeff) + ", i64 " +
              std::to_string(d.scale) + ")");
+        own(r, cg.t_dec());
         return {r, cg.t_dec()};
     }
 
@@ -1129,6 +1242,7 @@ struct FnEmit {
             } else {
                 std::string r = reg();
                 line(r + " = call ptr @beans_concat(ptr " + acc + ", ptr " + piece + ")");
+                own(r, cg.t_str());
                 acc = r;
             }
         }
@@ -1141,17 +1255,21 @@ struct FnEmit {
             case Ty::str_: return v.first;
             case Ty::i64_:
                 line(r + " = call ptr @beans_from_int(i64 " + v.first + ")");
+                own(r, cg.t_str());
                 return r;
             case Ty::f64_:
                 line(r + " = call ptr @beans_from_float(double " + v.first + ")");
+                own(r, cg.t_str());
                 return r;
             case Ty::dec_:
                 line(r + " = call ptr @beans_dec_str(ptr " + v.first + ")");
+                own(r, cg.t_str());
                 return r;
             case Ty::i1_: {
                 std::string z = reg();
                 line(z + " = zext i1 " + v.first + " to i32");
                 line(r + " = call ptr @beans_from_bool(i32 " + z + ")");
+                own(r, cg.t_str());
                 return r;
             }
             default:
@@ -1170,8 +1288,10 @@ struct FnEmit {
             if (is_and) line("br i1 " + l.first + ", label %" + more + ", label %" + end);
             else line("br i1 " + l.first + ", label %" + end + ", label %" + more);
             label(more);
+            size_t smark = temps.size();
             EV r2 = eval(e->rhs.get());
             line("store i1 " + r2.first + ", ptr " + slot);
+            flush_temps(smark);
             line("br label %" + end);
             label(end);
             std::string r = reg();
@@ -1220,6 +1340,7 @@ struct FnEmit {
                                                               : "div";
                     line(r + " = call ptr @beans_dec_" + fn + "(ptr " + l.first +
                          ", ptr " + r2.first + ")");
+                    own(r, cg.t_dec());
                     return {r, cg.t_dec()};
                 }
                 default: {
@@ -1305,9 +1426,12 @@ struct FnEmit {
         return {"0", cg.t_i64()};
     }
 
-    // run armed defers (newest first), then return. the deferred expression
-    // compiles against the names that were visible where the defer was written.
-    void emit_ret(const std::string& ret_instr) {
+    // exit path: release live temps (keeping the returned value), run armed
+    // defers (newest first), release frame-owned locals, then return.
+    void emit_ret(const std::string& ret_instr, const std::string& except = "") {
+        for (const std::string& t : temps) {
+            if (t != except) emit_release(t);
+        }
         for (auto it = defers.rbegin(); it != defers.rend(); ++it) {
             std::string flag = reg();
             line(flag + " = load i1, ptr " + it->flag);
@@ -1316,12 +1440,21 @@ struct FnEmit {
             label(runb);
             std::vector<std::map<std::string, Var>> saved = std::move(scopes);
             scopes = it->scope_snap;
+            size_t dmark = temps.size();
             eval(it->expr);
+            flush_temps(dmark);
             scopes = std::move(saved);
             line("br label %" + skipb);
             label(skipb);
         }
+        release_scopes(0);
         line(ret_instr);
+    }
+    bool in_temps(const std::string& v) const {
+        for (const std::string& t : temps) {
+            if (t == v) return true;
+        }
+        return false;
     }
 
     void exec_index_assign(const Stmt* s) {
@@ -1341,10 +1474,19 @@ struct FnEmit {
             line("unreachable");
             label(okb);
             EV v = eval(s->value.get(), elem);
+            transfer_in(v);
             std::string data = load_at(obj.first, 0, cg.t_str());
             std::string ep = reg();
             line(ep + " = getelementptr i64, ptr " + data + ", i64 " + idx.first);
-            line("store i64 " + to_slot(v) + ", ptr " + ep);
+            if (is_rc(elem)) {
+                std::string oldraw = reg(), oldp = reg();
+                line(oldraw + " = load i64, ptr " + ep);
+                line(oldp + " = inttoptr i64 " + oldraw + " to ptr");
+                line("store i64 " + to_slot(v) + ", ptr " + ep);
+                emit_release(oldp);
+            } else {
+                line("store i64 " + to_slot(v) + ", ptr " + ep);
+            }
             return;
         }
         if (obj.second->k == Ty::map_) {
@@ -1404,15 +1546,18 @@ struct FnEmit {
             line("br i1 " + cb + ", label %" + yes + ", label %" + no);
             label(yes);
             std::string sb = box_enum(0, {{v.first, to}});
+            consume(sb);
             line("store ptr " + sb + ", ptr " + slot);
             line("br label %" + end);
             label(no);
             std::string nb = box_enum(1, {});
+            consume(nb);
             line("store ptr " + nb + ", ptr " + slot);
             line("br label %" + end);
             label(end);
             std::string r = reg();
             line(r + " = load ptr, ptr " + slot);
+            own(r, cg.t_option(to));
             return {r, cg.t_option(to)};
         }
         if (v.second == to) return v;
@@ -1427,6 +1572,7 @@ struct FnEmit {
         }
         if (v.second->k == Ty::i64_ && to->k == Ty::dec_) {
             line(r + " = call ptr @beans_dec_from_int(i64 " + v.first + ")");
+            own(r, to);
             return {r, to};
         }
         if (v.second->k == Ty::dec_ && to->k == Ty::i64_) {
@@ -1435,6 +1581,7 @@ struct FnEmit {
         }
         if (v.second->k == Ty::f64_ && to->k == Ty::dec_) {
             line(r + " = call ptr @beans_dec_from_f64(double " + v.first + ")");
+            own(r, to);
             return {r, to};
         }
         if (v.second->k == Ty::dec_ && to->k == Ty::f64_) {
@@ -1457,14 +1604,19 @@ struct FnEmit {
             Ty* V = is_map_hint ? hint->args[1] : cg.t_i64();
             int kind = K->k == Ty::str_ ? 1 : 0;
             std::string m = reg();
-            line(m + " = call ptr @beans_map_new()");
+            line(m + " = call ptr @beans_map_new(i64 " +
+                 std::string(is_rc(K) ? "1" : "0") + ", i64 " +
+                 std::string(is_rc(V) ? "1" : "0") + ")");
             for (const InitEntry& en : e->entries) {
                 EV k = en.key ? eval(en.key.get(), K)
                               : EV{cg.intern_string(en.name), cg.t_str()};
                 EV v = eval(en.value.get(), V);
+                transfer_in(k);
+                transfer_in(v);
                 line("call void @beans_map_set(ptr " + m + ", i64 " + to_slot(k) +
                      ", i64 " + to_slot(v) + ", i64 " + std::to_string(kind) + ")");
             }
+            own(m, cg.t_map(K, V));
             return {m, cg.t_map(K, V)};
         }
 
@@ -1486,7 +1638,11 @@ struct FnEmit {
             return {"null", cg.t_bad()};
         }
         int size = 16 + 8 * static_cast<int>(im->fields.size());
-        std::string o = alloc_bytes(size);
+        long long mask = 0;
+        for (const CImpl::FieldInfo& f : im->fields) {
+            if (is_rc(f.ty)) mask |= 1LL << (f.offset / 8);
+        }
+        std::string o = alloc_bytes(size, fixed_meta(mask));
         line("store ptr @vt_" + im->mangled + ", ptr " + o);
         store_at(o, 8, std::to_string(im->id), cg.t_i64());
         for (const CImpl::FieldInfo& f : im->fields) {
@@ -1496,9 +1652,11 @@ struct FnEmit {
             }
             if (given) {
                 EV v = eval(given->value.get(), f.ty);
+                transfer_in(v);
                 store_at(o, f.offset, v.first, f.ty);
             } else if (f.decl->def) {
                 EV v = eval(f.decl->def.get(), f.ty);
+                transfer_in(v);
                 store_at(o, f.offset, v.first, f.ty);
             } else if (f.ty->k == Ty::f64_) {
                 store_at(o, f.offset, fmt_double(0), f.ty);
@@ -1508,6 +1666,7 @@ struct FnEmit {
                 store_at(o, f.offset, "null", f.ty);
             }
         }
+        own(o, cg.t_obj(im->mangled));
         return {o, cg.t_obj(im->mangled)};
     }
 
@@ -1544,6 +1703,7 @@ struct FnEmit {
         }
         std::string r = reg();
         line(r + " = call " + std::string(ll(ret)) + " " + target + "(" + args + ")");
+        own(r, ret); // beans functions return +1
         return {r, ret};
     }
 
@@ -1688,29 +1848,37 @@ struct FnEmit {
                     t += "  %z = ptrtoint ptr %r to i64\n  ret i64 %z\n}\n\n";
                 }
                 cg.lifted += t;
+                transfer_in(clo);
                 std::string r = reg();
                 line(r + " = call ptr @beans_thread_spawn(ptr " + thunk + ", ptr " +
                      clo.first + ")");
+                own(r, cg.t_kind1(Ty::thread_, ret));
                 return {r, cg.t_kind1(Ty::thread_, ret)};
             }
             if (n == "Mutex" && mname == "new") {
                 Ty* inner = hint && hint->k == Ty::mutex_ ? hint->args[0] : nullptr;
                 EV v = eval(e->args[0].get(), inner);
+                transfer_in(v);
                 std::string r = reg();
-                line(r + " = call ptr @beans_mutex_new(i64 " + to_slot(v) + ")");
+                line(r + " = call ptr @beans_mutex_new(i64 " + to_slot(v) + ", i64 " +
+                     std::string(is_rc(v.second) ? "1" : "0") + ")");
+                own(r, cg.t_kind1(Ty::mutex_, v.second));
                 return {r, cg.t_kind1(Ty::mutex_, inner ? inner : v.second)};
             }
             if (n == "Channel" && mname == "new") {
                 EV cap = eval(e->args[0].get());
                 Ty* elem = hint && hint->k == Ty::chan_ ? hint->args[0] : cg.t_i64();
                 std::string r = reg();
-                line(r + " = call ptr @beans_chan_new(i64 " + cap.first + ")");
+                line(r + " = call ptr @beans_chan_new(i64 " + cap.first + ", i64 " +
+                     std::string(is_rc(elem) ? "1" : "0") + ")");
+                own(r, cg.t_kind1(Ty::chan_, elem));
                 return {r, cg.t_kind1(Ty::chan_, elem)};
             }
             if (n == "AtomicInt" && mname == "new") {
                 EV v = eval(e->args[0].get());
                 std::string r = reg();
                 line(r + " = call ptr @beans_atomic_new(i64 " + v.first + ")");
+                own(r, cg.t_atomic());
                 return {r, cg.t_atomic()};
             }
         }
@@ -1720,11 +1888,13 @@ struct FnEmit {
     }
 
     std::string make_error(const std::string& msg_val) {
-        std::string o = alloc_bytes(32);
+        std::string o = alloc_bytes(32, fixed_meta((1LL << 2) | (1LL << 3)));
         line("store ptr null, ptr " + o);
         store_at(o, 8, "-1", cg.t_i64());
+        transfer_in({msg_val, cg.t_str()});
         store_at(o, 16, msg_val, cg.t_str());
         store_at(o, 24, cg.intern_string(""), cg.t_str());
+        own(o, cg.t_error());
         return o;
     }
 
@@ -1779,6 +1949,7 @@ struct FnEmit {
             Ty* inner = rt_->args.empty() ? cg.t_i64() : rt_->args[0];
             if (mname == "or") {
                 EV dflt = eval(e->args[0].get(), inner);
+                if (is_rc(inner)) transfer_in(dflt);
                 std::string tag = load_at(recv.first, 0, cg.t_i64());
                 std::string c = reg();
                 line(c + " = icmp eq i64 " + tag + ", 0");
@@ -1787,12 +1958,15 @@ struct FnEmit {
                 line("store " + std::string(ll(inner)) + " " + dflt.first + ", ptr " + slot);
                 line("br i1 " + c + ", label %" + hasb + ", label %" + endb);
                 label(hasb);
+                if (is_rc(inner)) emit_release(dflt.first);
                 std::string payload = load_at(recv.first, 8, inner);
+                if (is_rc(inner)) emit_retain(payload);
                 line("store " + std::string(ll(inner)) + " " + payload + ", ptr " + slot);
                 line("br label %" + endb);
                 label(endb);
                 std::string r = reg();
                 line(r + " = load " + std::string(ll(inner)) + ", ptr " + slot);
+                own(r, inner);
                 return {r, inner};
             }
             if (mname == "expect") {
@@ -1808,6 +1982,10 @@ struct FnEmit {
                 line("unreachable");
                 label(okb);
                 std::string payload = load_at(recv.first, 8, inner);
+                if (is_rc(inner)) {
+                    emit_retain(payload);
+                    own(payload, inner);
+                }
                 return {payload, inner};
             }
             if (mname == "is_some" || mname == "is_ok" || mname == "is_none") {
@@ -1869,6 +2047,7 @@ struct FnEmit {
                     std::string r = reg();
                     line(r + " = call ptr @beans_str_last(ptr " + recv.first + ", i64 " +
                          n.first + ")");
+                    own(r, cg.t_str());
                     return {r, cg.t_str()};
                 }
                 if (mname == "contains") {
@@ -1892,22 +2071,29 @@ struct FnEmit {
                     line("br i1 " + c + ", label %" + okb + ", label %" + errb);
                     label(okb);
                     std::string ob = box_enum(0, {{v, cg.t_i64()}});
+                    consume(ob);
                     line("store ptr " + ob + ", ptr " + slot);
                     line("br label %" + endb);
                     label(errb);
+                    size_t ebmark = temps.size();
                     // message matches the interpreter exactly
                     std::string m1 = reg(), m2 = reg();
                     line(m1 + " = call ptr @beans_concat(ptr " +
                          cg.intern_string("can't read '") + ", ptr " + recv.first + ")");
+                    own(m1, cg.t_str());
                     line(m2 + " = call ptr @beans_concat(ptr " + m1 + ", ptr " +
                          cg.intern_string("' as int") + ")");
+                    own(m2, cg.t_str());
                     std::string eo = make_error(m2);
                     std::string eb = box_enum(1, {{eo, cg.t_error()}});
+                    consume(eb);
                     line("store ptr " + eb + ", ptr " + slot);
+                    flush_temps(ebmark);
                     line("br label %" + endb);
                     label(endb);
                     std::string r = reg();
                     line(r + " = load ptr, ptr " + slot);
+                    own(r, cg.t_result(cg.t_i64(), cg.t_error()));
                     return {r, cg.t_result(cg.t_i64(), cg.t_error())};
                 }
                 break;
@@ -1916,6 +2102,7 @@ struct FnEmit {
                 Ty* elem = rt_->args[0];
                 if (mname == "push") {
                     EV v = eval(e->args[0].get(), elem);
+                    transfer_in(v);
                     line("call void @beans_list_push(ptr " + recv.first + ", i64 " +
                          to_slot(v) + ")");
                     return {"", cg.t_unit()};
@@ -1938,16 +2125,21 @@ struct FnEmit {
                     std::string ep = reg(), raw = reg();
                     line(ep + " = getelementptr i64, ptr " + data + ", i64 " + n1);
                     line(raw + " = load i64, ptr " + ep);
-                    std::string sb = box_enum(0, {{from_slot(raw, elem), elem}});
+                    std::string popped = from_slot(raw, elem);
+                    own(popped, elem); // moved out of the list
+                    std::string sb = box_enum(0, {{popped, elem}});
+                    consume(sb);
                     line("store ptr " + sb + ", ptr " + slot);
                     line("br label %" + endb);
                     label(noneb);
                     std::string nb = box_enum(1, {});
+                    consume(nb);
                     line("store ptr " + nb + ", ptr " + slot);
                     line("br label %" + endb);
                     label(endb);
                     std::string r = reg();
                     line(r + " = load ptr, ptr " + slot);
+                    own(r, cg.t_option(elem));
                     return {r, cg.t_option(elem)};
                 }
                 if (mname == "get") {
@@ -1964,15 +2156,18 @@ struct FnEmit {
                     line(ep + " = getelementptr i64, ptr " + data + ", i64 " + idx.first);
                     line(raw + " = load i64, ptr " + ep);
                     std::string sb = box_enum(0, {{from_slot(raw, elem), elem}});
+                    consume(sb);
                     line("store ptr " + sb + ", ptr " + slot);
                     line("br label %" + endb);
                     label(noneb);
                     std::string nb = box_enum(1, {});
+                    consume(nb);
                     line("store ptr " + nb + ", ptr " + slot);
                     line("br label %" + endb);
                     label(endb);
                     std::string r = reg();
                     line(r + " = load ptr, ptr " + slot);
+                    own(r, cg.t_option(elem));
                     return {r, cg.t_option(elem)};
                 }
                 if (mname == "max") {
@@ -1992,15 +2187,18 @@ struct FnEmit {
                     line("br i1 " + c + ", label %" + someb + ", label %" + noneb);
                     label(someb);
                     std::string sb = box_enum(0, {{from_slot(raw, elem), elem}});
+                    consume(sb);
                     line("store ptr " + sb + ", ptr " + slot);
                     line("br label %" + endb);
                     label(noneb);
                     std::string nb = box_enum(1, {});
+                    consume(nb);
                     line("store ptr " + nb + ", ptr " + slot);
                     line("br label %" + endb);
                     label(endb);
                     std::string r = reg();
                     line(r + " = load ptr, ptr " + slot);
+                    own(r, cg.t_option(elem));
                     return {r, cg.t_option(elem)};
                 }
                 if (mname == "contains") {
@@ -2022,6 +2220,8 @@ struct FnEmit {
                 if (mname == "set") {
                     EV k = eval(e->args[0].get(), K);
                     EV v = eval(e->args[1].get(), V);
+                    transfer_in(k);
+                    transfer_in(v);
                     line("call void @beans_map_set(ptr " + recv.first + ", i64 " +
                          to_slot(k) + ", i64 " + to_slot(v) + ", i64 " +
                          std::to_string(kind) + ")");
@@ -2041,15 +2241,18 @@ struct FnEmit {
                     line("br i1 " + c + ", label %" + someb + ", label %" + noneb);
                     label(someb);
                     std::string sb = box_enum(0, {{from_slot(raw, V), V}});
+                    consume(sb);
                     line("store ptr " + sb + ", ptr " + slot);
                     line("br label %" + endb);
                     label(noneb);
                     std::string nb = box_enum(1, {});
+                    consume(nb);
                     line("store ptr " + nb + ", ptr " + slot);
                     line("br label %" + endb);
                     label(endb);
                     std::string r = reg();
                     line(r + " = load ptr, ptr " + slot);
+                    own(r, cg.t_option(V));
                     return {r, cg.t_option(V)};
                 }
                 if (mname == "len") {
@@ -2099,6 +2302,7 @@ struct FnEmit {
                 Ty* elem = rt_->args[0];
                 if (mname == "send") {
                     EV v = eval(e->args[0].get(), elem);
+                    transfer_in(v);
                     std::string ok = reg();
                     line(ok + " = call i64 @beans_chan_send(ptr " + recv.first + ", i64 " +
                          to_slot(v) + ")");
@@ -2126,16 +2330,21 @@ struct FnEmit {
                     std::string slot = fresh_slot("rv", cg.t_str());
                     line("br i1 " + c + ", label %" + someb + ", label %" + noneb);
                     label(someb);
-                    std::string sb = box_enum(0, {{from_slot(raw, elem), elem}});
+                    std::string recvd = from_slot(raw, elem);
+                    own(recvd, elem); // the queue's ref moves to us
+                    std::string sb = box_enum(0, {{recvd, elem}});
+                    consume(sb);
                     line("store ptr " + sb + ", ptr " + slot);
                     line("br label %" + endb);
                     label(noneb);
                     std::string nb = box_enum(1, {});
+                    consume(nb);
                     line("store ptr " + nb + ", ptr " + slot);
                     line("br label %" + endb);
                     label(endb);
                     std::string r = reg();
                     line(r + " = load ptr, ptr " + slot);
+                    own(r, cg.t_option(elem));
                     return {r, cg.t_option(elem)};
                 }
                 if (mname == "close") {
@@ -2191,6 +2400,7 @@ struct FnEmit {
             label(armb);
             scopes.emplace_back();
             bind_pattern(arm.pat.get(), subj);
+            size_t amark = temps.size();
             EV v = eval(arm.value.get(), result && !unit_result ? result : nullptr);
             scopes.pop_back();
             if (!result && !unit_result) {
@@ -2201,15 +2411,20 @@ struct FnEmit {
                 }
             }
             if (result && !unit_result && v.second->k != Ty::unit_) {
+                if (is_rc(result)) transfer_in(v);
                 line("store " + std::string(ll(result)) + " " + v.first + ", ptr " + slot);
             }
-            if (!terminated) line("br label %" + endb);
+            if (!terminated) {
+                flush_temps(amark); // arm-local temps die inside the arm
+                line("br label %" + endb);
+            }
             if (ai + 1 < e->arms.size()) label(nextb);
         }
         label(endb);
         if (unit_result || !result) return {"", cg.t_unit()};
         std::string r = reg();
         line(r + " = load " + std::string(ll(result)) + ", ptr " + slot);
+        own(r, result);
         return {r, result};
     }
 
@@ -2311,8 +2526,11 @@ struct FnEmit {
         scopes.emplace_back();
         for (const StmtPtr& s : stmts) {
             if (terminated) break;
+            size_t mark = temps.size();
             exec(s.get());
+            if (!terminated) flush_temps(mark);
         }
+        if (!terminated) release_scopes(scopes.size() - 1);
         scopes.pop_back();
     }
 
@@ -2322,8 +2540,10 @@ struct FnEmit {
                 Ty* t = rt(s->type.get(), s->line, s->col);
                 if (t->k == Ty::bad_ || t->k == Ty::unit_) return;
                 EV v = eval(s->init.get(), t);
+                transfer_in(v);
                 alloc_slot(s->name, t);
                 Var* var = find_var(s->name);
+                var->owned = is_rc(t) || var->boxed;
                 line("store " + std::string(ll(t)) + " " + v.first + ", ptr " +
                      var_ptr(var));
                 break;
@@ -2349,7 +2569,15 @@ struct FnEmit {
                 }
                 EV v = eval(s->value.get(), t);
                 if (s->op == TokenKind::assign) {
-                    line("store " + std::string(ll(t)) + " " + v.first + ", ptr " + ptr);
+                    if (is_rc(t)) {
+                        transfer_in(v);
+                        std::string old = reg();
+                        line(old + " = load ptr, ptr " + ptr);
+                        line("store " + std::string(ll(t)) + " " + v.first + ", ptr " + ptr);
+                        emit_release(old);
+                    } else {
+                        line("store " + std::string(ll(t)) + " " + v.first + ", ptr " + ptr);
+                    }
                     return;
                 }
                 std::string cur = reg();
@@ -2362,6 +2590,9 @@ struct FnEmit {
                                                                     : "div";
                     line(r + " = call ptr @beans_dec_" + fn + "(ptr " + cur + ", ptr " +
                          v.first + ")");
+                    line("store ptr " + r + ", ptr " + ptr);
+                    emit_release(cur);
+                    return;
                 } else {
                     bool flt = t->k == Ty::f64_;
                     const char* op = nullptr;
@@ -2397,6 +2628,7 @@ struct FnEmit {
                     emit_ret("ret i32 0");
                 } else if (s->expr) {
                     EV v = eval(s->expr.get(), ret_ty);
+                    if (is_rc(v.second) && !consume(v.first)) emit_retain(v.first);
                     emit_ret("ret " + std::string(ll(v.second)) + " " + v.first);
                 } else {
                     emit_ret("ret void");
@@ -2406,13 +2638,17 @@ struct FnEmit {
             }
             case Stmt::Kind::brk:
                 if (!loop_stack.empty()) {
-                    line("br label %" + loop_stack.back().first);
+                    for (const std::string& t : temps) emit_release(t);
+                    release_scopes(loop_stack.back().scope_depth);
+                    line("br label %" + loop_stack.back().brk);
                     terminated = true;
                 }
                 break;
             case Stmt::Kind::cont:
                 if (!loop_stack.empty()) {
-                    line("br label %" + loop_stack.back().second);
+                    for (const std::string& t : temps) emit_release(t);
+                    release_scopes(loop_stack.back().scope_depth);
+                    line("br label %" + loop_stack.back().cont);
                     terminated = true;
                 }
                 break;
@@ -2438,7 +2674,7 @@ struct FnEmit {
                 std::string head = bb(), end = bb();
                 line("br label %" + head);
                 label(head);
-                loop_stack.push_back({end, head});
+                loop_stack.push_back({end, head, scopes.size()});
                 exec_block(s->body);
                 loop_stack.pop_back();
                 if (!terminated) line("br label %" + head);
@@ -2449,10 +2685,12 @@ struct FnEmit {
                 std::string head = bb(), body_bb = bb(), end = bb();
                 line("br label %" + head);
                 label(head);
+                size_t cmark = temps.size();
                 EV c = eval(s->cond.get());
+                flush_temps(cmark);
                 line("br i1 " + c.first + ", label %" + body_bb + ", label %" + end);
                 label(body_bb);
-                loop_stack.push_back({end, head});
+                loop_stack.push_back({end, head, scopes.size()});
                 exec_block(s->body);
                 loop_stack.pop_back();
                 if (!terminated) line("br label %" + head);
@@ -2478,6 +2716,7 @@ struct FnEmit {
             scopes.emplace_back();
             alloc_slot(s->loop_var, cg.t_i64());
             Var* lv = find_var(s->loop_var);
+            if (lv->boxed) lv->owned = true;
             line("store i64 " + lo.first + ", ptr " + var_ptr(lv));
             std::string head = bb(), body_bb = bb(), step = bb(), end = bb();
             line("br label %" + head);
@@ -2487,7 +2726,7 @@ struct FnEmit {
                  cur + ", " + hi.first);
             line("br i1 " + c + ", label %" + body_bb + ", label %" + end);
             label(body_bb);
-            loop_stack.push_back({end, step});
+            loop_stack.push_back({end, step, scopes.size()});
             exec_block(s->body);
             loop_stack.pop_back();
             if (!terminated) line("br label %" + step);
@@ -2512,6 +2751,7 @@ struct FnEmit {
         line("store i64 0, ptr " + idx);
         alloc_slot(s->loop_var, elem);
         Var* lv = find_var(s->loop_var);
+        if (lv->boxed) lv->owned = true;
         std::string head = bb(), body_bb = bb(), step = bb(), end = bb();
         line("br label %" + head);
         label(head);
@@ -2524,9 +2764,19 @@ struct FnEmit {
         std::string ep = reg(), raw = reg();
         line(ep + " = getelementptr i64, ptr " + data + ", i64 " + i);
         line(raw + " = load i64, ptr " + ep);
-        line("store " + std::string(ll(elem)) + " " + from_slot(raw, elem) + ", ptr " +
-             var_ptr(lv));
-        loop_stack.push_back({end, step});
+        std::string elem_val = from_slot(raw, elem);
+        if (lv->boxed && is_rc(elem)) {
+            std::string cellp = var_ptr(lv);
+            std::string old = reg();
+            line(old + " = load ptr, ptr " + cellp);
+            emit_retain(elem_val);
+            line("store " + std::string(ll(elem)) + " " + elem_val + ", ptr " + cellp);
+            emit_release(old);
+        } else {
+            line("store " + std::string(ll(elem)) + " " + elem_val + ", ptr " +
+                 var_ptr(lv));
+        }
+        loop_stack.push_back({end, step, scopes.size()});
         exec_block(s->body);
         loop_stack.pop_back();
         if (!terminated) line("br label %" + step);
@@ -2573,7 +2823,9 @@ struct FnEmit {
             header += "ptr %self.arg";
             first = false;
             std::string slot = alloc_slot("self", self_ty, true);
-            store_param("%self.arg", slot, "ptr", boxed_names.count("self") > 0);
+            bool bx = boxed_names.count("self") > 0;
+            store_param("%self.arg", slot, "ptr", bx, is_rc(self_ty));
+            if (bx) scopes.back()["self"].owned = true; // the frame made the cell
         }
         for (size_t i = 0; i < params_ref.size(); i++) {
             Ty* pt = cg.resolve(params_ref[i].type.get(), env,
@@ -2583,7 +2835,9 @@ struct FnEmit {
             std::string preg = "%p" + std::to_string(i);
             header += std::string(ll(pt)) + " " + preg;
             std::string slot = alloc_slot(params_ref[i].name, pt, true);
-            store_param(preg, slot, ll(pt), boxed_names.count(params_ref[i].name) > 0);
+            bool bx = boxed_names.count(params_ref[i].name) > 0;
+            store_param(preg, slot, ll(pt), bx, is_rc(pt));
+            if (bx) scopes.back()[params_ref[i].name].owned = true;
         }
         header += ") {\nentry:\n";
 
@@ -2619,15 +2873,17 @@ struct FnEmit {
                firstb + ":\n" + body + "}\n\n";
     }
 
-    // param → its slot; boxed params store into their heap cell instead
+    // param → its slot; boxed params store into their heap cell instead.
+    // the cell owns its content, so RC params get a +1 going in.
     void store_param(const std::string& preg, const std::string& slot,
-                     const std::string& lty, bool boxed) {
+                     const std::string& lty, bool boxed, bool rc) {
         if (!boxed) {
             entry_inits += "  store " + lty + " " + preg + ", ptr " + slot + "\n";
             return;
         }
         std::string cell = preg + ".cell";
         entry_inits += "  " + cell + " = load ptr, ptr " + slot + "\n";
+        if (rc) entry_inits += "  call void @beans_retain(ptr " + preg + ")\n";
         entry_inits += "  store " + lty + " " + preg + ", ptr " + cell + "\n";
     }
 };
@@ -2740,7 +2996,9 @@ std::string CodeGen::generate() {
 
     std::string out;
     out += "; generated by beansc\n";
-    out += "declare ptr @beans_alloc(i64)\n";
+    out += "declare ptr @beans_alloc(i64, i64)\n";
+    out += "declare void @beans_retain(ptr)\n";
+    out += "declare void @beans_release(ptr)\n";
     out += "declare ptr @beans_from_int(i64)\n";
     out += "declare ptr @beans_from_float(double)\n";
     out += "declare ptr @beans_from_bool(i32)\n";
@@ -2754,7 +3012,7 @@ std::string CodeGen::generate() {
     out += "declare i64 @beans_parse_int(ptr, ptr)\n";
     out += "declare void @beans_panic(ptr, i64, i64)\n";
     out += "declare i64 @beans_is_a(i64, i64)\n";
-    out += "declare ptr @beans_list_new()\n";
+    out += "declare ptr @beans_list_new(i64)\n";
     out += "declare void @beans_list_push(ptr, i64)\n";
     out += "declare i64 @beans_f64_round(double)\n";
     out += "declare double @llvm.fabs.f64(double)\n";
@@ -2774,15 +3032,15 @@ std::string CodeGen::generate() {
     out += "declare double @beans_dec_to_f64(ptr)\n";
     out += "declare i64 @beans_list_max(ptr, i64, ptr)\n";
     out += "declare i64 @beans_list_contains(ptr, i64, i64)\n";
-    out += "declare ptr @beans_map_new()\n";
+    out += "declare ptr @beans_map_new(i64, i64)\n";
     out += "declare void @beans_map_set(ptr, i64, i64, i64)\n";
     out += "declare i64 @beans_map_get(ptr, i64, i64, ptr)\n";
     out += "declare ptr @beans_thread_spawn(ptr, ptr)\n";
     out += "declare i64 @beans_thread_join(ptr)\n";
-    out += "declare ptr @beans_mutex_new(i64)\n";
+    out += "declare ptr @beans_mutex_new(i64, i64)\n";
     out += "declare i64 @beans_mutex_lock(ptr)\n";
     out += "declare void @beans_mutex_unlock(ptr)\n";
-    out += "declare ptr @beans_chan_new(i64)\n";
+    out += "declare ptr @beans_chan_new(i64, i64)\n";
     out += "declare i64 @beans_chan_send(ptr, i64)\n";
     out += "declare i64 @beans_chan_recv(ptr, ptr)\n";
     out += "declare void @beans_chan_close(ptr)\n";
@@ -2800,35 +3058,134 @@ std::string CodeGen::generate() {
 }
 
 const char* CodeGen::runtime_c() {
-    return R"RT(// beans native runtime v2 — strings, lists, decimal, panics, class checks.
-// v1 memory note: heap values are never freed (RC comes later).
+    return R"RT(// beans native runtime v3 — reference-counted heap.
+// Every heap value has a 16-byte header just before its payload:
+//   { atomic long long rc, long long meta }
+// meta low 3 bits = kind, upper bits = per-kind payload:
+//   0 leaf | 1 fixed (bitmask of pointer slots) | 2 list (elem_ptr)
+//   3 map (key_ptr | val_ptr<<1) | 4 chan (elem_ptr) | 5 mutex (inner_ptr)
+// String constants carry an immortal header emitted by the compiler.
 #include <math.h>
+#include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
-void* beans_alloc(long long n) { return calloc(1, (size_t)n); }
+#define BEANS_IMMORTAL (1LL << 62)
+
+typedef struct {
+    _Atomic long long rc;
+    long long meta;
+} BHead;
+
+static BHead* head_of(void* p) { return (BHead*)((char*)p - 16); }
+
+void* beans_alloc(long long size, long long meta) {
+    BHead* h = calloc(1, 16 + (size_t)size);
+    h->rc = 1;
+    h->meta = meta;
+    return (char*)h + 16;
+}
+
+void beans_retain(void* p) {
+    if (!p) return;
+    BHead* h = head_of(p);
+    if (h->rc >= BEANS_IMMORTAL) return;
+    h->rc += 1;
+}
+
+void beans_release(void* p);
+
+typedef struct {
+    long long* data;
+    long long len, cap;
+} BList;
+typedef struct {
+    long long* data; // key,value interleaved
+    long long len, cap;
+} BMap;
+typedef struct {
+    pthread_mutex_t m;
+    pthread_cond_t can_send, can_recv;
+    long long* q;
+    long long head, count, cap;
+    int closed;
+} BChan;
+typedef struct {
+    pthread_mutex_t m;
+    long long inner;
+} BMutex;
+
+static void destroy(void* p, long long meta) {
+    long long kind = meta & 7;
+    long long extra = meta >> 3;
+    if (kind == 1) { // fixed: release marked 8-byte slots
+        for (int i = 0; i < 60 && (extra >> i); i++) {
+            if ((extra >> i) & 1) beans_release(*(void**)((char*)p + 8 * i));
+        }
+    } else if (kind == 2) {
+        BList* l = p;
+        if (extra & 1) {
+            for (long long i = 0; i < l->len; i++) beans_release((void*)l->data[i]);
+        }
+        free(l->data);
+    } else if (kind == 3) {
+        BMap* m = p;
+        for (long long i = 0; i < m->len; i++) {
+            if (extra & 1) beans_release((void*)m->data[i * 2]);
+            if (extra & 2) beans_release((void*)m->data[i * 2 + 1]);
+        }
+        free(m->data);
+    } else if (kind == 4) {
+        BChan* c = p;
+        if (extra & 1) {
+            for (long long i = 0; i < c->count; i++) {
+                beans_release((void*)c->q[(c->head + i) % c->cap]);
+            }
+        }
+        free(c->q);
+    } else if (kind == 5) {
+        BMutex* mu = p;
+        if (extra & 1) beans_release((void*)mu->inner);
+    }
+}
+
+void beans_release(void* p) {
+    if (!p) return;
+    BHead* h = head_of(p);
+    if (h->rc >= BEANS_IMMORTAL) return;
+    if (--h->rc == 0) {
+        destroy(p, h->meta);
+        free(h);
+    }
+}
 
 void beans_panic(const char* msg, long long line, long long col) {
     fprintf(stderr, "runtime panic at %lld:%lld: %s\n", line, col, msg);
     exit(3);
 }
 
-// ---- strings ----
+// ---- strings (leaf allocations) ----
+static char* rc_strdup(const char* s) {
+    size_t n = strlen(s);
+    char* r = beans_alloc((long long)n + 1, 0);
+    memcpy(r, s, n + 1);
+    return r;
+}
 char* beans_from_int(long long v) {
     char b[32];
     snprintf(b, sizeof b, "%lld", v);
-    return strdup(b);
+    return rc_strdup(b);
 }
 char* beans_from_float(double v) {
     char b[48];
     snprintf(b, sizeof b, "%.10g", v);
-    return strdup(b);
+    return rc_strdup(b);
 }
-char* beans_from_bool(int v) { return strdup(v ? "true" : "false"); }
+char* beans_from_bool(int v) { return rc_strdup(v ? "true" : "false"); }
 char* beans_concat(char* a, char* b) {
     size_t la = strlen(a), lb = strlen(b);
-    char* r = malloc(la + lb + 1);
+    char* r = beans_alloc((long long)(la + lb + 1), 0);
     memcpy(r, a, la);
     memcpy(r + la, b, lb + 1);
     return r;
@@ -2844,7 +3201,7 @@ char* beans_str_last(char* s, long long n) {
     long long len = (long long)strlen(s);
     if (n < 0) n = 0;
     if (n > len) n = len;
-    return strdup(s + (len - n));
+    return rc_strdup(s + (len - n));
 }
 long long beans_str_contains(char* s, char* sub) { return strstr(s, sub) != NULL; }
 long long beans_parse_int(char* s, long long* ok) {
@@ -2855,13 +3212,9 @@ long long beans_parse_int(char* s, long long* ok) {
 }
 long long beans_f64_round(double v) { return llround(v); }
 
-// ---- lists: { data, len, cap } of raw 8-byte slots ----
-typedef struct {
-    long long* data;
-    long long len, cap;
-} BList;
-BList* beans_list_new(void) {
-    BList* l = calloc(1, sizeof(BList));
+// ---- lists ----
+BList* beans_list_new(long long elem_ptr) {
+    BList* l = beans_alloc(sizeof(BList), 2 | (elem_ptr << 3));
     l->cap = 4;
     l->data = calloc(4, 8);
     return l;
@@ -2914,13 +3267,9 @@ long long beans_list_contains(BList* l, long long v, long long kind) {
     return 0;
 }
 
-// ---- maps: flat (key, value) pairs; kind 1 = string keys ----
-typedef struct {
-    long long* data; // key,value interleaved
-    long long len, cap;
-} BMap;
-BMap* beans_map_new(void) {
-    BMap* m = calloc(1, sizeof(BMap));
+// ---- maps ----
+BMap* beans_map_new(long long key_ptr, long long val_ptr) {
+    BMap* m = beans_alloc(sizeof(BMap), 3 | (key_ptr << 3) | (val_ptr << 4));
     m->cap = 4;
     m->data = calloc(8, 8);
     return m;
@@ -2932,9 +3281,13 @@ static long long map_find(BMap* m, long long key, long long kind) {
     }
     return -1;
 }
+// note: the map owns key and value refs; the caller retains before calling
 void beans_map_set(BMap* m, long long key, long long val, long long kind) {
     long long i = map_find(m, key, kind);
     if (i >= 0) {
+        long long flags = head_of(m)->meta >> 3;
+        if (flags & 1) beans_release((void*)key); // duplicate key not stored
+        if (flags & 2) beans_release((void*)m->data[i * 2 + 1]);
         m->data[i * 2 + 1] = val;
         return;
     }
@@ -2953,7 +3306,6 @@ long long beans_map_get(BMap* m, long long key, long long kind, long long* ok) {
 }
 
 // ---- threads ----
-#include <pthread.h>
 typedef struct {
     pthread_t th;
     long long result;
@@ -2961,15 +3313,19 @@ typedef struct {
     void* env;
     int joined;
 } BThread;
+void beans_thread_release_env(void* env);
 static void* thread_main(void* arg) {
     BThread* t = arg;
     t->result = t->thunk(t->env);
+    beans_release(t->env);
+    beans_release(t); // the running thread's own ref on the handle
     return NULL;
 }
 BThread* beans_thread_spawn(void* thunk, void* env) {
-    BThread* t = calloc(1, sizeof(BThread));
+    BThread* t = beans_alloc(sizeof(BThread), 0);
     t->thunk = (long long (*)(void*))thunk;
-    t->env = env;
+    t->env = env; // ownership of the closure box moves to the thread
+    beans_retain(t); // one ref for the handle, one for the running thread
     pthread_create(&t->th, NULL, thread_main, t);
     return t;
 }
@@ -2980,12 +3336,8 @@ long long beans_thread_join(BThread* t) {
     return t->result;
 }
 
-typedef struct {
-    pthread_mutex_t m;
-    long long inner;
-} BMutex;
-BMutex* beans_mutex_new(long long inner) {
-    BMutex* mu = calloc(1, sizeof(BMutex));
+BMutex* beans_mutex_new(long long inner, long long inner_ptr) {
+    BMutex* mu = beans_alloc(sizeof(BMutex), 5 | (inner_ptr << 3));
     pthread_mutex_init(&mu->m, NULL);
     mu->inner = inner;
     return mu;
@@ -2996,15 +3348,8 @@ long long beans_mutex_lock(BMutex* mu) {
 }
 void beans_mutex_unlock(BMutex* mu) { pthread_mutex_unlock(&mu->m); }
 
-typedef struct {
-    pthread_mutex_t m;
-    pthread_cond_t can_send, can_recv;
-    long long* q;
-    long long head, count, cap;
-    int closed;
-} BChan;
-BChan* beans_chan_new(long long cap) {
-    BChan* c = calloc(1, sizeof(BChan));
+BChan* beans_chan_new(long long cap, long long elem_ptr) {
+    BChan* c = beans_alloc(sizeof(BChan), 4 | (elem_ptr << 3));
     c->cap = cap > 0 ? cap : 1;
     c->q = calloc((size_t)c->cap, 8);
     pthread_mutex_init(&c->m, NULL);
@@ -3017,7 +3362,7 @@ long long beans_chan_send(BChan* c, long long v) {
     while (c->count == c->cap && !c->closed) pthread_cond_wait(&c->can_send, &c->m);
     if (c->closed) {
         pthread_mutex_unlock(&c->m);
-        return 0; // caller panics
+        return 0; // caller panics; caller also still owns v
     }
     c->q[(c->head + c->count) % c->cap] = v;
     c->count += 1;
@@ -3051,7 +3396,7 @@ void beans_chan_close(BChan* c) {
 
 typedef struct { _Atomic long long v; } BAtomic;
 BAtomic* beans_atomic_new(long long init) {
-    BAtomic* a = calloc(1, sizeof(BAtomic));
+    BAtomic* a = beans_alloc(sizeof(BAtomic), 0);
     a->v = init;
     return a;
 }
@@ -3065,7 +3410,7 @@ typedef struct BDec {
     long long s;
 } BDec;
 static BDec* dec_mk(__int128 c, long long s) {
-    BDec* d = malloc(sizeof(BDec));
+    BDec* d = beans_alloc(sizeof(BDec), 0);
     d->c = c;
     d->s = s;
     return d;
@@ -3128,7 +3473,6 @@ double beans_dec_to_f64(BDec* a) { return (double)a->c / (double)pow10i(a->s); }
 BDec* beans_dec_from_f64(double v) {
     char buf[64];
     snprintf(buf, sizeof buf, "%.17g", v);
-    // parse the text form so the double's decimal digits carry over
     __int128 c = 0;
     long long s = 0;
     int neg = 0, after = 0;
@@ -3172,7 +3516,7 @@ char* beans_dec_str(BDec* a) {
         if (i == a->s && i != 0) out[o++] = '.';
     }
     out[o] = '\0';
-    return strdup(out);
+    return rc_strdup(out);
 }
 )RT";
 }

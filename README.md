@@ -15,7 +15,7 @@ A small OOP language: Java-style objects, Go-sized grammar, C++-level access, bu
 | parser | done |
 | type checker | done (v1) |
 | interpreter | done (v1) — `beansc run` |
-| LLVM native backend | v3 — whole language native (closures, threads, maps, generics) |
+| LLVM native backend | v4 — whole language native + reference-counted memory |
 
 ## Build
 
@@ -34,7 +34,11 @@ The interpreter is the reference implementation: exact `decimal` math, real OS t
 
 The native backend emits textual LLVM IR and hands it to clang — no LLVM library dependency. v3 covers the whole language: classes (vtable dispatch, inheritance, interface defaults, `override`, `as?`), monomorphized generics on classes *and* functions, enums + `match`, Option/Result + `?`, exact `decimal`, lists and maps, closures (lambda-lifted, captured variables live in shared heap cells — mutation works, escaping works), real pthreads for `thread.spawn`/`Mutex`/`Channel`/`AtomicInt`, `defer`, and string interpolation. Every test file produces byte-identical output under `beansc build` and `beansc run` — panics included, same message, same exit code.
 
-Known v1 memory model: native heap values are never freed. Reference counting is the next big piece.
+## Memory
+
+Native binaries use automatic reference counting — no GC, no pauses. Every heap value carries a 16-byte header (atomic count + shape info); the compiler emits retains and releases at ownership boundaries and a generic destructor walks nested structures. String constants are immortal. Verified with Apple's `leaks` tool: **0 leaked bytes** on every test program, and a 1M-iteration allocation stress test (object + interpolated strings + decimal math per pass) runs in **1.4MB flat**.
+
+The design keeps RC off hot paths: function arguments, loop variables, and reads borrow instead of retaining, so the benchmark numbers above are measured *with* RC enabled. Known limits: reference cycles leak (cycle detection later, Nim-style), and a `?` early-return can hold mid-statement temporaries a little longer.
 
 ## Benchmarks (Apple Silicon, clang 21 -O2 vs go 1.26.4)
 
