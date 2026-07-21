@@ -105,6 +105,31 @@ self, so page-building chains work: `Bytes.new(4096).put_u32(0, root).put_u64(8,
 - `slice(from, to)`, `copy_from(src, at)`, `append(other)`, `append_str(s)`
 - `to_string()` — as text, stops at an embedded NUL
 
+## Files and the OS (v0.5, implemented)
+
+Class-first, like everything builtin. Errors are `Result<T>`; `Error.kind` carries a slug
+(`not_found`, `permission`, `exists`, `is_dir`, `not_dir`, `not_empty`, `closed`, `io`) and
+`Error.msg` is `path: OS message`.
+
+- **File statics**: `read`/`read_bytes`, `write`/`append` (+`_bytes`) → `Result<int>`,
+  `exists`, `size`, `remove`, `rename`, `copy`, `open(path, mode)` → `Result<File>` with
+  modes `"r"`, `"rw"`, `"create"`, `"append"`.
+- **File methods**: positional I/O first — `read_at(pos, n)` → `Result<Bytes>` (short read at
+  EOF returns what's there), `write_at(pos, b)`; cursor `read(n)`/`write(b)`; `seek`/`seek_end`
+  (return the new position, panic on a closed file), `tell`, `size`, `truncate`, `sync` (fsync —
+  the durability call), `close` (double close is an error result). Dropping the last reference
+  closes the fd as a safety net; `close()` is still the API.
+- **Dir statics**: `make`, `make_all`, `list` → `Result<List<string>>` (sorted), `remove`
+  (empty only), `remove_all` (recursive), `exists`, `temp`, `sync` — fsync a directory, the
+  rename-commit pattern's second half.
+- **std.os**: `args()` (`beansc run f.b -- a b` passes them; the native binary uses argv),
+  `env(name)` → `Option<string>`, `exit(code)`, `now_ms`, `ticks_ms`, `sleep_ms`.
+- **std.io**: `println`/`print`, `eprintln`/`eprint` (stderr), `read_line()` → `Option<string>`
+  (none at EOF), `read_all()`.
+
+[examples/kv.b](examples/kv.b) is the proof: an append-only KV store with binary records and a
+durable compaction (write temp, sync, rename over, sync the parent dir).
+
 ## Variables
 
 ```
@@ -434,7 +459,7 @@ import as defer unsafe self true false
 
 ## Decided
 
-- Stdlib v0.5: the string method set and `Bytes` (implemented); byte semantics, panics carry positions, mutators return self for chaining
+- Stdlib v0.5: the string method set, `Bytes`, `File`/`Dir`, `std.os`, and the `std.io` console set (implemented); byte semantics, panics carry positions, mutators return self for chaining, fs errors carry kind slugs
 - Modules: `beans.mod`, one folder = one package, git imports with a global cache (v0.4, implemented)
 - Block-bodied match arms in statement position (v0.4, implemented)
 - `pub interface` exposes its method set implicitly (v0.4)

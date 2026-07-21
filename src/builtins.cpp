@@ -1,15 +1,30 @@
 #include "builtins.h"
 
+#include <algorithm>
+#include <cerrno>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <ctime>
 #include <string>
+
+#include <dirent.h>
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <unistd.h>
 
 #include "interp.h" // BeansPanic — builtin rows panic with the same messages
                     // the C runtime prints; the two must stay byte-identical
 
 namespace beans {
 
+FileVal::~FileVal() {
+    if (fd >= 0 && !closed) close(fd); // safety net; close() is the real API
+}
+
 namespace {
+
+std::vector<std::string> g_args;
 
 [[noreturn]] void bpanic(uint32_t line, uint32_t col, std::string msg) {
     throw BeansPanic{std::move(msg), line, col};
@@ -26,12 +41,12 @@ Value res_ok(Value v) {
 }
 
 // same shape Interp::make_err builds — Error is an instance with msg/kind
-Value res_err(std::string msg) {
+Value res_err(std::string msg, std::string kind = "") {
     Value e;
     e.k = Value::K::instance;
     e.inst = std::make_shared<InstanceVal>();
     e.inst->fields.emplace_back("msg", Value::of_str(std::move(msg)));
-    e.inst->fields.emplace_back("kind", Value::of_str(""));
+    e.inst->fields.emplace_back("kind", Value::of_str(std::move(kind)));
     Value x;
     x.k = Value::K::enum_v;
     x.en = std::make_shared<EnumVal>();
@@ -39,6 +54,25 @@ Value res_err(std::string msg) {
     x.en->variant = "err";
     x.en->payload.push_back(std::move(e));
     return x;
+}
+
+// errno -> Error.kind slug; message is "path: strerror" — the C runtime
+// builds the identical pair
+const char* fs_kind_of(int err) {
+    switch (err) {
+        case ENOENT: return "not_found";
+        case EACCES:
+        case EPERM: return "permission";
+        case EEXIST: return "exists";
+        case ENOTDIR: return "not_dir";
+        case EISDIR: return "is_dir";
+        case ENOTEMPTY: return "not_empty";
+        default: return "io";
+    }
+}
+
+Value fs_err(const std::string& path, int err) {
+    return res_err(path + ": " + strerror(err), fs_kind_of(err));
 }
 
 Value opt_some(Value v) {
@@ -423,6 +457,143 @@ Value bytes_to_string(uint32_t, uint32_t, Value& recv, std::vector<Value>&) {
     return Value::of_str(std::string(reinterpret_cast<const char*>(d.data()), n));
 }
 
+// ---- File / Dir -------------------------------------------------------------
+
+Value file_val(int fd) {
+    Value v;
+    v.k = Value::K::file;
+    v.file = std::make_shared<FileVal>();
+    v.file->fd = fd;
+    return v;
+}
+
+Value bytes_val(std::vector<uint8_t> data) {
+    Value v;
+    v.k = Value::K::bytes;
+    v.bytes = std::make_shared<BytesVal>();
+    v.bytes->data = std::move(data);
+    return v;
+}
+
+Value closed_err() { return res_err("file is closed", "closed"); }
+
+Value file_read_at(uint32_t, uint32_t, Value& recv, std::vector<Value>& args) {
+    if (recv.file->closed) return closed_err();
+    int64_t pos = args[0].i, n = args[1].i;
+    if (pos < 0 || n < 0) return res_err("negative read", "io");
+    std::vector<uint8_t> buf(static_cast<size_t>(n));
+    size_t got = 0;
+    while (got < buf.size()) {
+        ssize_t r = pread(recv.file->fd, buf.data() + got, buf.size() - got,
+                          static_cast<off_t>(pos) + static_cast<off_t>(got));
+        if (r < 0) return res_err(std::string("read: ") + strerror(errno), fs_kind_of(errno));
+        if (r == 0) break; // eof: a short read returns what's there
+        got += static_cast<size_t>(r);
+    }
+    buf.resize(got);
+    return res_ok(bytes_val(std::move(buf)));
+}
+
+Value file_write_at(uint32_t, uint32_t, Value& recv, std::vector<Value>& args) {
+    if (recv.file->closed) return closed_err();
+    int64_t pos = args[0].i;
+    auto& d = args[1].bytes->data;
+    if (pos < 0) return res_err("negative write", "io");
+    size_t done = 0;
+    while (done < d.size()) {
+        ssize_t r = pwrite(recv.file->fd, d.data() + done, d.size() - done,
+                           static_cast<off_t>(pos) + static_cast<off_t>(done));
+        if (r < 0) return res_err(std::string("write: ") + strerror(errno), fs_kind_of(errno));
+        done += static_cast<size_t>(r);
+    }
+    return res_ok(Value::of_int(static_cast<int64_t>(done)));
+}
+
+Value file_read(uint32_t, uint32_t, Value& recv, std::vector<Value>& args) {
+    if (recv.file->closed) return closed_err();
+    int64_t n = args[0].i;
+    if (n < 0) return res_err("negative read", "io");
+    std::vector<uint8_t> buf(static_cast<size_t>(n));
+    size_t got = 0;
+    while (got < buf.size()) {
+        ssize_t r = read(recv.file->fd, buf.data() + got, buf.size() - got);
+        if (r < 0) return res_err(std::string("read: ") + strerror(errno), fs_kind_of(errno));
+        if (r == 0) break;
+        got += static_cast<size_t>(r);
+    }
+    buf.resize(got);
+    return res_ok(bytes_val(std::move(buf)));
+}
+
+Value file_write(uint32_t, uint32_t, Value& recv, std::vector<Value>& args) {
+    if (recv.file->closed) return closed_err();
+    auto& d = args[0].bytes->data;
+    size_t done = 0;
+    while (done < d.size()) {
+        ssize_t r = write(recv.file->fd, d.data() + done, d.size() - done);
+        if (r < 0) return res_err(std::string("write: ") + strerror(errno), fs_kind_of(errno));
+        done += static_cast<size_t>(r);
+    }
+    return res_ok(Value::of_int(static_cast<int64_t>(done)));
+}
+
+Value file_seek(uint32_t line, uint32_t col, Value& recv, std::vector<Value>& args) {
+    if (recv.file->closed) bpanic(line, col, "file is closed");
+    off_t r = lseek(recv.file->fd, static_cast<off_t>(args[0].i), SEEK_SET);
+    if (r < 0) {
+        bpanic(line, col, "seek to " + std::to_string(args[0].i) + ": " + strerror(errno));
+    }
+    return Value::of_int(static_cast<int64_t>(r));
+}
+
+Value file_seek_end(uint32_t line, uint32_t col, Value& recv, std::vector<Value>& args) {
+    if (recv.file->closed) bpanic(line, col, "file is closed");
+    off_t r = lseek(recv.file->fd, static_cast<off_t>(args[0].i), SEEK_END);
+    if (r < 0) {
+        bpanic(line, col, "seek to " + std::to_string(args[0].i) + ": " + strerror(errno));
+    }
+    return Value::of_int(static_cast<int64_t>(r));
+}
+
+Value file_tell(uint32_t line, uint32_t col, Value& recv, std::vector<Value>&) {
+    if (recv.file->closed) bpanic(line, col, "file is closed");
+    return Value::of_int(static_cast<int64_t>(lseek(recv.file->fd, 0, SEEK_CUR)));
+}
+
+Value file_size_m(uint32_t, uint32_t, Value& recv, std::vector<Value>&) {
+    if (recv.file->closed) return closed_err();
+    struct stat st;
+    if (fstat(recv.file->fd, &st) != 0) {
+        return res_err(std::string("size: ") + strerror(errno), fs_kind_of(errno));
+    }
+    return res_ok(Value::of_int(static_cast<int64_t>(st.st_size)));
+}
+
+Value file_truncate(uint32_t, uint32_t, Value& recv, std::vector<Value>& args) {
+    if (recv.file->closed) return closed_err();
+    if (ftruncate(recv.file->fd, static_cast<off_t>(args[0].i)) != 0) {
+        return res_err(std::string("truncate: ") + strerror(errno), fs_kind_of(errno));
+    }
+    return res_ok(Value::of_bool(true));
+}
+
+Value file_sync(uint32_t, uint32_t, Value& recv, std::vector<Value>&) {
+    if (recv.file->closed) return closed_err();
+    if (fsync(recv.file->fd) != 0) {
+        return res_err(std::string("sync: ") + strerror(errno), fs_kind_of(errno));
+    }
+    return res_ok(Value::of_bool(true));
+}
+
+Value file_close(uint32_t, uint32_t, Value& recv, std::vector<Value>&) {
+    if (recv.file->closed) return res_err("file already closed", "closed");
+    recv.file->closed = true;
+    if (close(recv.file->fd) != 0) {
+        return res_err(std::string("close: ") + strerror(errno), fs_kind_of(errno));
+    }
+    return res_ok(Value::of_bool(true));
+}
+
 // ---- statics ---------------------------------------------------------------
 
 Value bytes_new(uint32_t line, uint32_t col, std::vector<Value>& args) {
@@ -444,7 +615,308 @@ Value bytes_from(uint32_t, uint32_t, std::vector<Value>& args) {
     return v;
 }
 
+Value fs_read_all_fd(const std::string& path, bool as_bytes) {
+    int fd = open(path.c_str(), O_RDONLY);
+    if (fd < 0) return fs_err(path, errno);
+    std::vector<uint8_t> buf;
+    uint8_t chunk[65536];
+    while (true) {
+        ssize_t r = read(fd, chunk, sizeof chunk);
+        if (r < 0) {
+            int e = errno;
+            close(fd);
+            return fs_err(path, e);
+        }
+        if (r == 0) break;
+        buf.insert(buf.end(), chunk, chunk + r);
+    }
+    close(fd);
+    if (as_bytes) return res_ok(bytes_val(std::move(buf)));
+    return res_ok(Value::of_str(std::string(buf.begin(), buf.end())));
+}
+
+Value file_read_s(uint32_t, uint32_t, std::vector<Value>& args) {
+    return fs_read_all_fd(*args[0].s, false);
+}
+Value file_read_bytes_s(uint32_t, uint32_t, std::vector<Value>& args) {
+    return fs_read_all_fd(*args[0].s, true);
+}
+
+Value fs_write_all(const std::string& path, const uint8_t* p, size_t n, bool append) {
+    int flags = O_WRONLY | O_CREAT | (append ? O_APPEND : O_TRUNC);
+    int fd = open(path.c_str(), flags, 0644);
+    if (fd < 0) return fs_err(path, errno);
+    size_t done = 0;
+    while (done < n) {
+        ssize_t r = write(fd, p + done, n - done);
+        if (r < 0) {
+            int e = errno;
+            close(fd);
+            return fs_err(path, e);
+        }
+        done += static_cast<size_t>(r);
+    }
+    close(fd);
+    return res_ok(Value::of_int(static_cast<int64_t>(done)));
+}
+
+Value file_write_s(uint32_t, uint32_t, std::vector<Value>& args) {
+    const std::string& s = *args[1].s;
+    return fs_write_all(*args[0].s, reinterpret_cast<const uint8_t*>(s.data()), s.size(),
+                        false);
+}
+Value file_append_s(uint32_t, uint32_t, std::vector<Value>& args) {
+    const std::string& s = *args[1].s;
+    return fs_write_all(*args[0].s, reinterpret_cast<const uint8_t*>(s.data()), s.size(),
+                        true);
+}
+Value file_write_bytes_s(uint32_t, uint32_t, std::vector<Value>& args) {
+    auto& d = args[1].bytes->data;
+    return fs_write_all(*args[0].s, d.data(), d.size(), false);
+}
+Value file_append_bytes_s(uint32_t, uint32_t, std::vector<Value>& args) {
+    auto& d = args[1].bytes->data;
+    return fs_write_all(*args[0].s, d.data(), d.size(), true);
+}
+
+Value file_exists_s(uint32_t, uint32_t, std::vector<Value>& args) {
+    struct stat st;
+    return Value::of_bool(stat(args[0].s->c_str(), &st) == 0 && !S_ISDIR(st.st_mode));
+}
+
+Value file_size_s(uint32_t, uint32_t, std::vector<Value>& args) {
+    struct stat st;
+    if (stat(args[0].s->c_str(), &st) != 0) return fs_err(*args[0].s, errno);
+    return res_ok(Value::of_int(static_cast<int64_t>(st.st_size)));
+}
+
+Value file_remove_s(uint32_t, uint32_t, std::vector<Value>& args) {
+    const std::string& p = *args[0].s;
+    struct stat st;
+    if (stat(p.c_str(), &st) != 0) return fs_err(p, errno);
+    int r = S_ISDIR(st.st_mode) ? rmdir(p.c_str()) : unlink(p.c_str());
+    if (r != 0) return fs_err(p, errno);
+    return res_ok(Value::of_bool(true));
+}
+
+Value file_rename_s(uint32_t, uint32_t, std::vector<Value>& args) {
+    if (rename(args[0].s->c_str(), args[1].s->c_str()) != 0) {
+        return fs_err(*args[0].s, errno);
+    }
+    return res_ok(Value::of_bool(true));
+}
+
+Value file_copy_s(uint32_t, uint32_t, std::vector<Value>& args) {
+    const std::string& from = *args[0].s;
+    const std::string& to = *args[1].s;
+    int src = open(from.c_str(), O_RDONLY);
+    if (src < 0) return fs_err(from, errno);
+    int dst = open(to.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (dst < 0) {
+        int e = errno;
+        close(src);
+        return fs_err(to, e);
+    }
+    uint8_t chunk[65536];
+    int64_t total = 0;
+    while (true) {
+        ssize_t r = read(src, chunk, sizeof chunk);
+        if (r < 0) {
+            int e = errno;
+            close(src);
+            close(dst);
+            return fs_err(from, e);
+        }
+        if (r == 0) break;
+        ssize_t done = 0;
+        while (done < r) {
+            ssize_t w = write(dst, chunk + done, static_cast<size_t>(r - done));
+            if (w < 0) {
+                int e = errno;
+                close(src);
+                close(dst);
+                return fs_err(to, e);
+            }
+            done += w;
+        }
+        total += r;
+    }
+    close(src);
+    close(dst);
+    return res_ok(Value::of_int(total));
+}
+
+Value file_open_s(uint32_t, uint32_t, std::vector<Value>& args) {
+    const std::string& path = *args[0].s;
+    const std::string& mode = *args[1].s;
+    int flags;
+    if (mode == "r") flags = O_RDONLY;
+    else if (mode == "rw") flags = O_RDWR;
+    else if (mode == "create") flags = O_RDWR | O_CREAT;
+    else if (mode == "append") flags = O_WRONLY | O_CREAT | O_APPEND;
+    else return res_err("bad open mode '" + mode + "'", "io");
+    int fd = open(path.c_str(), flags, 0644);
+    if (fd < 0) return fs_err(path, errno);
+    return res_ok(file_val(fd));
+}
+
+Value dir_make_s(uint32_t, uint32_t, std::vector<Value>& args) {
+    if (mkdir(args[0].s->c_str(), 0755) != 0) return fs_err(*args[0].s, errno);
+    return res_ok(Value::of_bool(true));
+}
+
+Value dir_make_all_s(uint32_t, uint32_t, std::vector<Value>& args) {
+    const std::string& p = *args[0].s;
+    std::string cur;
+    size_t i = 0;
+    while (i < p.size()) {
+        size_t j = p.find('/', i);
+        if (j == std::string::npos) j = p.size();
+        cur = p.substr(0, j);
+        i = j + 1;
+        if (cur.empty()) continue;
+        if (mkdir(cur.c_str(), 0755) != 0 && errno != EEXIST) return fs_err(cur, errno);
+    }
+    return res_ok(Value::of_bool(true));
+}
+
+Value dir_list_s(uint32_t, uint32_t, std::vector<Value>& args) {
+    const std::string& p = *args[0].s;
+    DIR* d = opendir(p.c_str());
+    if (!d) return fs_err(p, errno);
+    std::vector<std::string> names;
+    struct dirent* de;
+    while ((de = readdir(d)) != nullptr) {
+        if (strcmp(de->d_name, ".") == 0 || strcmp(de->d_name, "..") == 0) continue;
+        names.push_back(de->d_name);
+    }
+    closedir(d);
+    std::sort(names.begin(), names.end()); // deterministic for diff tests
+    return res_ok(str_list(std::move(names)));
+}
+
+Value dir_remove_s(uint32_t, uint32_t, std::vector<Value>& args) {
+    if (rmdir(args[0].s->c_str()) != 0) return fs_err(*args[0].s, errno);
+    return res_ok(Value::of_bool(true));
+}
+
+int rm_tree(const std::string& p) {
+    struct stat st;
+    if (lstat(p.c_str(), &st) != 0) return -1;
+    if (!S_ISDIR(st.st_mode)) return unlink(p.c_str());
+    DIR* d = opendir(p.c_str());
+    if (!d) return -1;
+    struct dirent* de;
+    while ((de = readdir(d)) != nullptr) {
+        if (strcmp(de->d_name, ".") == 0 || strcmp(de->d_name, "..") == 0) continue;
+        if (rm_tree(p + "/" + de->d_name) != 0) {
+            closedir(d);
+            return -1;
+        }
+    }
+    closedir(d);
+    return rmdir(p.c_str());
+}
+
+Value dir_remove_all_s(uint32_t, uint32_t, std::vector<Value>& args) {
+    struct stat st;
+    if (lstat(args[0].s->c_str(), &st) != 0) return fs_err(*args[0].s, errno);
+    if (rm_tree(*args[0].s) != 0) return fs_err(*args[0].s, errno);
+    return res_ok(Value::of_bool(true));
+}
+
+Value dir_exists_s(uint32_t, uint32_t, std::vector<Value>& args) {
+    struct stat st;
+    return Value::of_bool(stat(args[0].s->c_str(), &st) == 0 && S_ISDIR(st.st_mode));
+}
+
+std::string temp_dir_path() {
+    const char* t = getenv("TMPDIR");
+    std::string p = t && *t ? t : "/tmp";
+    while (p.size() > 1 && p.back() == '/') p.pop_back();
+    return p;
+}
+
+Value dir_temp_s(uint32_t, uint32_t, std::vector<Value>&) {
+    return Value::of_str(temp_dir_path());
+}
+
+Value dir_sync_s(uint32_t, uint32_t, std::vector<Value>& args) {
+    // the database commit pattern: fsync the directory after a rename
+    int fd = open(args[0].s->c_str(), O_RDONLY);
+    if (fd < 0) return fs_err(*args[0].s, errno);
+    if (fsync(fd) != 0) {
+        int e = errno;
+        close(fd);
+        return fs_err(*args[0].s, e);
+    }
+    close(fd);
+    return res_ok(Value::of_bool(true));
+}
+
+// ---- std.os / std.io --------------------------------------------------------
+
+Value os_args(uint32_t, uint32_t, std::vector<Value>&) {
+    return str_list(std::vector<std::string>(g_args));
+}
+
+Value os_env(uint32_t, uint32_t, std::vector<Value>& args) {
+    const char* v = getenv(args[0].s->c_str());
+    if (!v) return opt_none();
+    return opt_some(Value::of_str(v));
+}
+
+Value os_exit(uint32_t, uint32_t, std::vector<Value>& args) {
+    std::exit(static_cast<int>(args[0].i));
+}
+
+Value os_now_ms(uint32_t, uint32_t, std::vector<Value>&) {
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    return Value::of_int(static_cast<int64_t>(ts.tv_sec) * 1000 + ts.tv_nsec / 1000000);
+}
+
+Value os_ticks_ms(uint32_t, uint32_t, std::vector<Value>&) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return Value::of_int(static_cast<int64_t>(ts.tv_sec) * 1000 + ts.tv_nsec / 1000000);
+}
+
+Value os_sleep_ms(uint32_t, uint32_t, std::vector<Value>& args) {
+    int64_t ms = args[0].i;
+    if (ms > 0) {
+        struct timespec ts;
+        ts.tv_sec = ms / 1000;
+        ts.tv_nsec = (ms % 1000) * 1000000;
+        nanosleep(&ts, nullptr);
+    }
+    return Value::unit();
+}
+
+Value io_read_line(uint32_t, uint32_t, std::vector<Value>&) {
+    std::string out;
+    int c;
+    bool any = false;
+    while ((c = fgetc(stdin)) != EOF) {
+        any = true;
+        if (c == '\n') break;
+        out.push_back(static_cast<char>(c));
+    }
+    if (!any) return opt_none();
+    return opt_some(Value::of_str(std::move(out)));
+}
+
+Value io_read_all(uint32_t, uint32_t, std::vector<Value>&) {
+    std::string out;
+    char chunk[65536];
+    size_t r;
+    while ((r = fread(chunk, 1, sizeof chunk, stdin)) > 0) out.append(chunk, r);
+    return Value::of_str(std::move(out));
+}
+
 } // namespace
+
+void set_program_args(std::vector<std::string> args) { g_args = std::move(args); }
 
 const std::vector<BuiltinMethod>& builtin_methods() {
     static const std::vector<BuiltinMethod> table = {
@@ -493,6 +965,18 @@ const std::vector<BuiltinMethod>& builtin_methods() {
         {BT::bytes, "append", {BT::bytes}, BT::self_recv, "beans_bytes_append", false, bytes_append},
         {BT::bytes, "append_str", {BT::str}, BT::self_recv, "beans_bytes_append_str", false, bytes_append_str},
         {BT::bytes, "to_string", {}, BT::str, "beans_bytes_to_string", false, bytes_to_string},
+        // File — positional I/O first: that's what a database wants
+        {BT::file, "read_at", {BT::i64, BT::i64}, BT::res_bytes, "beans_file_read_at", false, file_read_at},
+        {BT::file, "write_at", {BT::i64, BT::bytes}, BT::res_i64, "beans_file_write_at", false, file_write_at},
+        {BT::file, "read", {BT::i64}, BT::res_bytes, "beans_file_read", false, file_read},
+        {BT::file, "write", {BT::bytes}, BT::res_i64, "beans_file_write", false, file_write},
+        {BT::file, "seek", {BT::i64}, BT::i64, "beans_file_seek", true, file_seek},
+        {BT::file, "seek_end", {BT::i64}, BT::i64, "beans_file_seek_end", true, file_seek_end},
+        {BT::file, "tell", {}, BT::i64, "beans_file_tell", true, file_tell},
+        {BT::file, "size", {}, BT::res_i64, "beans_file_size", false, file_size_m},
+        {BT::file, "truncate", {BT::i64}, BT::res_bool, "beans_file_truncate", false, file_truncate},
+        {BT::file, "sync", {}, BT::res_bool, "beans_file_sync", false, file_sync},
+        {BT::file, "close", {}, BT::res_bool, "beans_file_close", false, file_close},
     };
     return table;
 }
@@ -501,6 +985,40 @@ const std::vector<BuiltinStatic>& builtin_statics() {
     static const std::vector<BuiltinStatic> table = {
         {"Bytes", "new", {BT::i64}, BT::bytes, "beans_bytes_new", true, bytes_new},
         {"Bytes", "from", {BT::str}, BT::bytes, "beans_bytes_from", false, bytes_from},
+        {"File", "read", {BT::str}, BT::res_str, "beans_file_read_all", false, file_read_s},
+        {"File", "read_bytes", {BT::str}, BT::res_bytes, "beans_file_read_all_b", false, file_read_bytes_s},
+        {"File", "write", {BT::str, BT::str}, BT::res_i64, "beans_file_write_all", false, file_write_s},
+        {"File", "append", {BT::str, BT::str}, BT::res_i64, "beans_file_append_all", false, file_append_s},
+        {"File", "write_bytes", {BT::str, BT::bytes}, BT::res_i64, "beans_file_write_all_b", false, file_write_bytes_s},
+        {"File", "append_bytes", {BT::str, BT::bytes}, BT::res_i64, "beans_file_append_all_b", false, file_append_bytes_s},
+        {"File", "exists", {BT::str}, BT::boolean, "beans_file_exists", false, file_exists_s},
+        {"File", "size", {BT::str}, BT::res_i64, "beans_file_size_p", false, file_size_s},
+        {"File", "remove", {BT::str}, BT::res_bool, "beans_file_remove", false, file_remove_s},
+        {"File", "rename", {BT::str, BT::str}, BT::res_bool, "beans_file_rename", false, file_rename_s},
+        {"File", "copy", {BT::str, BT::str}, BT::res_i64, "beans_file_copy", false, file_copy_s},
+        {"File", "open", {BT::str, BT::str}, BT::res_file, "beans_file_open", false, file_open_s},
+        {"Dir", "make", {BT::str}, BT::res_bool, "beans_dir_make", false, dir_make_s},
+        {"Dir", "make_all", {BT::str}, BT::res_bool, "beans_dir_make_all", false, dir_make_all_s},
+        {"Dir", "list", {BT::str}, BT::res_list_str, "beans_dir_list", false, dir_list_s},
+        {"Dir", "remove", {BT::str}, BT::res_bool, "beans_dir_remove", false, dir_remove_s},
+        {"Dir", "remove_all", {BT::str}, BT::res_bool, "beans_dir_remove_all", false, dir_remove_all_s},
+        {"Dir", "exists", {BT::str}, BT::boolean, "beans_dir_exists", false, dir_exists_s},
+        {"Dir", "temp", {}, BT::str, "beans_dir_temp", false, dir_temp_s},
+        {"Dir", "sync", {BT::str}, BT::res_bool, "beans_dir_sync", false, dir_sync_s},
+    };
+    return table;
+}
+
+const std::vector<BuiltinFn>& builtin_fns() {
+    static const std::vector<BuiltinFn> table = {
+        {"std.os", "args", {}, BT::list_str, "beans_os_args", false, os_args},
+        {"std.os", "env", {BT::str}, BT::opt_str, "beans_os_env", false, os_env},
+        {"std.os", "exit", {BT::i64}, BT::unit, "beans_os_exit", false, os_exit},
+        {"std.os", "now_ms", {}, BT::i64, "beans_os_now_ms", false, os_now_ms},
+        {"std.os", "ticks_ms", {}, BT::i64, "beans_os_ticks_ms", false, os_ticks_ms},
+        {"std.os", "sleep_ms", {BT::i64}, BT::unit, "beans_os_sleep_ms", false, os_sleep_ms},
+        {"std.io", "read_line", {}, BT::opt_str, "beans_io_read_line", false, io_read_line},
+        {"std.io", "read_all", {}, BT::str, "beans_io_read_all", false, io_read_all},
     };
     return table;
 }

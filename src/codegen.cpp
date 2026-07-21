@@ -146,6 +146,7 @@ struct Ty {
         chan_,    // args = {elem}
         atomic_,
         bytes_,
+        file_,
     };
     K k = K::bad_;
     std::string name;          // obj: impl/iface name, enum_: enum name
@@ -172,6 +173,7 @@ bool is_rc(const Ty* t) {
         case Ty::str_: case Ty::dec_: case Ty::obj_: case Ty::enum_:
         case Ty::list_: case Ty::map_: case Ty::fn_: case Ty::thread_:
         case Ty::mutex_: case Ty::chan_: case Ty::atomic_: case Ty::bytes_:
+        case Ty::file_:
             return true;
         default:
             return false;
@@ -302,6 +304,7 @@ struct CG2 {
     }
     Ty* t_atomic() { return prim(Ty::atomic_); }
     Ty* t_bytes() { return prim(Ty::bytes_); }
+    Ty* t_file() { return prim(Ty::file_); }
 
     std::string mangle(Ty* t) {
         switch (t->k) {
@@ -403,6 +406,7 @@ struct CG2 {
             return t_kind1(Ty::chan_, resolve(t->args[0].get(), env, line, col));
         if (n == "AtomicInt") return t_atomic();
         if (n == "Bytes") return t_bytes();
+        if (n == "File") return t_file();
         if (n == "Option" && t->args.size() == 1)
             return t_option(resolve(t->args[0].get(), env, line, col));
         if (n == "Result") {
@@ -1930,16 +1934,39 @@ struct FnEmit {
         const Expr* obj = callee->object.get();
         const std::string& mname = callee->name;
 
+        // module functions from the registry, args assembled the same way
+        // whether the checker pinned the call or the fallback matched it
+        auto emit_builtin_fn = [&](const BuiltinFn& b) -> EV {
+            std::string args;
+            for (size_t i = 0; i < b.params.size() && i < e->args.size(); i++) {
+                Ty* pt = bty(b.params[i]);
+                EV a = eval(e->args[i].get(), pt);
+                if (i) args += ", ";
+                args += std::string(ll(pt)) + " " + a.first;
+            }
+            if (b.panics) {
+                if (!args.empty()) args += ", ";
+                args += "i64 " + std::to_string(e->line) + ", i64 " +
+                        std::to_string(e->col);
+            }
+            return emit_bcall(b.sym, b.ret, args, nullptr, e);
+        };
+        auto emit_print = [&](const std::string& which) -> EV {
+            EV v = eval(e->args[0].get());
+            std::string s = to_str(v, e->args[0].get());
+            line("call void @beans_" + which + "(ptr " + s + ")");
+            return {"", cg.t_unit()};
+        };
+
         // the checker pinned this call: a std builtin or a package function
         if (!callee->resolved.empty()) {
             const std::string& r = callee->resolved;
-            if (r == "std.io.println" || r == "std.io.print") {
-                EV v = eval(e->args[0].get());
-                std::string s = to_str(v, e->args[0].get());
-                line("call void @beans_" + (r == "std.io.println" ? std::string("println")
-                                                                  : std::string("print")) +
-                     "(ptr " + s + ")");
-                return {"", cg.t_unit()};
+            if (r == "std.io.println") return emit_print("println");
+            if (r == "std.io.print") return emit_print("print");
+            if (r == "std.io.eprintln") return emit_print("eprintln");
+            if (r == "std.io.eprint") return emit_print("eprint");
+            for (const BuiltinFn& b : builtin_fns()) {
+                if (r == std::string(b.module) + "." + b.name) return emit_builtin_fn(b);
             }
             auto rfit = cg.fn_decls.find(r);
             if (r != "std.thread.spawn" && rfit != cg.fn_decls.end()) {
@@ -1950,6 +1977,13 @@ struct FnEmit {
         if (obj->kind == Expr::Kind::ident && !find_var(std::string(obj->text))) {
             std::string n(obj->text);
             std::string bpath = cg.binding_path(n);
+            if (bpath == "std.io" &&
+                (mname == "eprintln" || mname == "eprint")) {
+                return emit_print(mname);
+            }
+            for (const BuiltinFn& b : builtin_fns()) {
+                if (bpath == b.module && mname == b.name) return emit_builtin_fn(b);
+            }
             if (bpath == "std.io" && (mname == "println" || mname == "print")) {
                 EV v = eval(e->args[0].get());
                 std::string s = to_str(v, e->args[0].get());
@@ -2054,9 +2088,9 @@ struct FnEmit {
                 own(r, cg.t_atomic());
                 return {r, cg.t_atomic()};
             }
-            if (n == "Bytes") {
+            if (n == "Bytes" || n == "File" || n == "Dir") {
                 for (const BuiltinStatic& b : builtin_statics()) {
-                    if (mname != b.name) continue;
+                    if (n != b.cls || mname != b.name) continue;
                     std::string args;
                     for (size_t i = 0; i < b.params.size() && i < e->args.size(); i++) {
                         Ty* pt = bty(b.params[i]);
@@ -2069,11 +2103,7 @@ struct FnEmit {
                         args += "i64 " + std::to_string(e->line) + ", i64 " +
                                 std::to_string(e->col);
                     }
-                    std::string r = reg();
-                    line(r + " = call ptr @" + std::string(b.sym) + "(" + args + ")");
-                    Ty* rt2 = bty(b.ret);
-                    own(r, rt2);
-                    return {r, rt2};
+                    return emit_bcall(b.sym, b.ret, args, nullptr, e);
                 }
             }
         }
@@ -2137,7 +2167,125 @@ struct FnEmit {
             case BT::boolean: return cg.t_bool();
             case BT::str: return cg.t_str();
             case BT::bytes: return cg.t_bytes();
+            case BT::file: return cg.t_file();
+            case BT::list_str: return cg.t_list(cg.t_str());
             default: return cg.t_i64();
+        }
+    }
+    // the shared tail of every registry call: emit the C call for `sym` with
+    // `args` already assembled, box the return per its BT shape. `recv` is
+    // null for statics and module functions.
+    EV emit_bcall(const char* sym, BT ret, const std::string& args, const EV* recv,
+                  const Expr* e) {
+        (void)e;
+        if (ret == BT::self_recv) {
+            line("call void @" + std::string(sym) + "(" + args + ")");
+            return {recv->first, recv->second}; // the receiver, still borrowed
+        }
+        if (ret == BT::opt_i64 || ret == BT::opt_str) {
+            Ty* ok_t = ret == BT::opt_str ? cg.t_str() : cg.t_i64();
+            std::string sr = reg();
+            line(sr + " = call {i64, i64} @" + std::string(sym) + "(" + args + ")");
+            std::string raw = reg(), has = reg(), c = reg();
+            line(raw + " = extractvalue {i64, i64} " + sr + ", 0");
+            line(has + " = extractvalue {i64, i64} " + sr + ", 1");
+            line(c + " = icmp ne i64 " + has + ", 0");
+            std::string someb = bb(), noneb = bb(), endb = bb();
+            std::string slot = fresh_slot("bop", cg.t_str());
+            line("br i1 " + c + ", label %" + someb + ", label %" + noneb);
+            label(someb);
+            size_t smark = temps.size();
+            std::string okv = from_slot(raw, ok_t);
+            if (is_rc(ok_t)) own(okv, ok_t); // runtime hands over its ref
+            std::string sb = box_enum(0, {{okv, ok_t}});
+            consume(sb);
+            line("store ptr " + sb + ", ptr " + slot);
+            flush_temps(smark);
+            line("br label %" + endb);
+            label(noneb);
+            std::string nb = box_enum(1, {});
+            consume(nb);
+            line("store ptr " + nb + ", ptr " + slot);
+            line("br label %" + endb);
+            label(endb);
+            std::string r = reg();
+            line(r + " = load ptr, ptr " + slot);
+            own(r, cg.t_option(ok_t));
+            return {r, cg.t_option(ok_t)};
+        }
+        switch (ret) {
+            case BT::unit:
+                line("call void @" + std::string(sym) + "(" + args + ")");
+                return {"", cg.t_unit()};
+            case BT::boolean: {
+                std::string c = reg(), r = reg();
+                line(c + " = call i64 @" + std::string(sym) + "(" + args + ")");
+                line(r + " = icmp ne i64 " + c + ", 0");
+                return {r, cg.t_bool()};
+            }
+            case BT::res_i64:
+            case BT::res_f64:
+            case BT::res_dec:
+            case BT::res_str:
+            case BT::res_bool:
+            case BT::res_bytes:
+            case BT::res_file:
+            case BT::res_list_str: {
+                Ty* ok_t = ret == BT::res_f64        ? cg.t_f64()
+                           : ret == BT::res_dec      ? cg.t_dec()
+                           : ret == BT::res_str      ? cg.t_str()
+                           : ret == BT::res_bool     ? cg.t_bool()
+                           : ret == BT::res_bytes    ? cg.t_bytes()
+                           : ret == BT::res_file     ? cg.t_file()
+                           : ret == BT::res_list_str ? cg.t_list(cg.t_str())
+                                                     : cg.t_i64();
+                std::string sr = reg();
+                line(sr + " = call {i64, ptr} @" + std::string(sym) + "(" + args + ")");
+                std::string raw = reg(), errp = reg(), c = reg();
+                line(raw + " = extractvalue {i64, ptr} " + sr + ", 0");
+                line(errp + " = extractvalue {i64, ptr} " + sr + ", 1");
+                line(c + " = icmp eq ptr " + errp + ", null");
+                std::string okb = bb(), errb = bb(), endb = bb();
+                std::string slot = fresh_slot("res", cg.t_str());
+                line("br i1 " + c + ", label %" + okb + ", label %" + errb);
+                label(okb);
+                size_t okmark = temps.size();
+                std::string okv;
+                if (ok_t->k == Ty::i1_) {
+                    okv = reg();
+                    line(okv + " = icmp ne i64 " + raw + ", 0");
+                } else {
+                    okv = from_slot(raw, ok_t);
+                    if (is_rc(ok_t)) own(okv, ok_t); // runtime hands over its ref
+                }
+                std::string ob = box_enum(0, {{okv, ok_t}});
+                consume(ob);
+                line("store ptr " + ob + ", ptr " + slot);
+                flush_temps(okmark);
+                line("br label %" + endb);
+                label(errb);
+                size_t ebmark = temps.size();
+                // err is a ready-made Error object (msg + kind), rc 1, ours
+                own(errp, cg.t_error());
+                std::string eb = box_enum(1, {{errp, cg.t_error()}});
+                consume(eb);
+                line("store ptr " + eb + ", ptr " + slot);
+                flush_temps(ebmark);
+                line("br label %" + endb);
+                label(endb);
+                std::string r = reg();
+                line(r + " = load ptr, ptr " + slot);
+                own(r, cg.t_result(ok_t, cg.t_error()));
+                return {r, cg.t_result(ok_t, cg.t_error())};
+            }
+            default: {
+                Ty* rt2 = bty(ret);
+                std::string r = reg();
+                line(r + " = call " + std::string(ll(rt2)) + " @" + sym + "(" + args +
+                     ")");
+                if (is_rc(rt2)) own(r, rt2);
+                return {r, rt2};
+            }
         }
     }
     EV emit_builtin(const BuiltinMethod& b, const EV& recv, const Expr* e) {
@@ -2151,103 +2299,7 @@ struct FnEmit {
             args += ", i64 " + std::to_string(e->line) + ", i64 " +
                     std::to_string(e->col);
         }
-        if (b.ret == BT::self_recv) {
-            line("call void @" + std::string(b.sym) + "(" + args + ")");
-            return {recv.first, recv.second}; // the receiver, still borrowed
-        }
-        if (b.ret == BT::opt_i64) {
-            std::string sr = reg();
-            line(sr + " = call {i64, i64} @" + std::string(b.sym) + "(" + args + ")");
-            std::string raw = reg(), has = reg(), c = reg();
-            line(raw + " = extractvalue {i64, i64} " + sr + ", 0");
-            line(has + " = extractvalue {i64, i64} " + sr + ", 1");
-            line(c + " = icmp ne i64 " + has + ", 0");
-            std::string someb = bb(), noneb = bb(), endb = bb();
-            std::string slot = fresh_slot("bop", cg.t_str());
-            line("br i1 " + c + ", label %" + someb + ", label %" + noneb);
-            label(someb);
-            std::string sb = box_enum(0, {{raw, cg.t_i64()}});
-            consume(sb);
-            line("store ptr " + sb + ", ptr " + slot);
-            line("br label %" + endb);
-            label(noneb);
-            std::string nb = box_enum(1, {});
-            consume(nb);
-            line("store ptr " + nb + ", ptr " + slot);
-            line("br label %" + endb);
-            label(endb);
-            std::string r = reg();
-            line(r + " = load ptr, ptr " + slot);
-            own(r, cg.t_option(cg.t_i64()));
-            return {r, cg.t_option(cg.t_i64())};
-        }
-        if (b.ret == BT::list_str) {
-            std::string r = reg();
-            line(r + " = call ptr @" + std::string(b.sym) + "(" + args + ")");
-            Ty* lt = cg.t_list(cg.t_str());
-            own(r, lt);
-            return {r, lt};
-        }
-        switch (b.ret) {
-            case BT::unit:
-                line("call void @" + std::string(b.sym) + "(" + args + ")");
-                return {"", cg.t_unit()};
-            case BT::boolean: {
-                std::string c = reg(), r = reg();
-                line(c + " = call i64 @" + std::string(b.sym) + "(" + args + ")");
-                line(r + " = icmp ne i64 " + c + ", 0");
-                return {r, cg.t_bool()};
-            }
-            case BT::res_i64:
-            case BT::res_f64:
-            case BT::res_dec:
-            case BT::res_str: {
-                Ty* ok_t = b.ret == BT::res_f64   ? cg.t_f64()
-                           : b.ret == BT::res_dec ? cg.t_dec()
-                           : b.ret == BT::res_str ? cg.t_str()
-                                                  : cg.t_i64();
-                std::string sr = reg();
-                line(sr + " = call {i64, ptr} @" + std::string(b.sym) + "(" + args + ")");
-                std::string raw = reg(), msg = reg(), c = reg();
-                line(raw + " = extractvalue {i64, ptr} " + sr + ", 0");
-                line(msg + " = extractvalue {i64, ptr} " + sr + ", 1");
-                line(c + " = icmp eq ptr " + msg + ", null");
-                std::string okb = bb(), errb = bb(), endb = bb();
-                std::string slot = fresh_slot("res", cg.t_str());
-                line("br i1 " + c + ", label %" + okb + ", label %" + errb);
-                label(okb);
-                size_t okmark = temps.size();
-                std::string okv = from_slot(raw, ok_t);
-                if (is_rc(ok_t)) own(okv, ok_t); // runtime hands over its ref
-                std::string ob = box_enum(0, {{okv, ok_t}});
-                consume(ob);
-                line("store ptr " + ob + ", ptr " + slot);
-                flush_temps(okmark);
-                line("br label %" + endb);
-                label(errb);
-                size_t ebmark = temps.size();
-                own(msg, cg.t_str()); // runtime hands over the message ref
-                std::string eo = make_error(msg);
-                std::string eb = box_enum(1, {{eo, cg.t_error()}});
-                consume(eb);
-                line("store ptr " + eb + ", ptr " + slot);
-                flush_temps(ebmark);
-                line("br label %" + endb);
-                label(endb);
-                std::string r = reg();
-                line(r + " = load ptr, ptr " + slot);
-                own(r, cg.t_result(ok_t, cg.t_error()));
-                return {r, cg.t_result(ok_t, cg.t_error())};
-            }
-            default: {
-                Ty* ret = bty(b.ret);
-                std::string r = reg();
-                line(r + " = call " + std::string(ll(ret)) + " @" + b.sym + "(" + args +
-                     ")");
-                if (is_rc(ret)) own(r, ret);
-                return {r, ret};
-            }
-        }
+        return emit_bcall(b.sym, b.ret, args, &recv, e);
     }
 
     EV method_call(const Expr* e, EV recv, const std::string& mname) {
@@ -2404,6 +2456,14 @@ struct FnEmit {
                 }
                 break;
             }
+            case Ty::file_: {
+                for (const BuiltinMethod& b : builtin_methods()) {
+                    if (b.recv == BT::file && mname == b.name) {
+                        return emit_builtin(b, recv, e);
+                    }
+                }
+                break;
+            }
             case Ty::list_: {
                 Ty* elem = rt_->args[0];
                 if (mname == "push") {
@@ -2516,6 +2576,25 @@ struct FnEmit {
                          ", i64 " + to_slot(v) + ", i64 " + std::to_string(kind) + ")");
                     line(r + " = icmp ne i64 " + c + ", 0");
                     return {r, cg.t_bool()};
+                }
+                if (mname == "join") {
+                    EV sep = eval(e->args[0].get(), cg.t_str());
+                    // element rendering matches the interpreter's display()
+                    int kind = elem->k == Ty::str_   ? 2
+                               : elem->k == Ty::f64_ ? 1
+                               : elem->k == Ty::dec_ ? 3
+                               : elem->k == Ty::i1_  ? 4
+                               : elem->k == Ty::i64_ ? 0
+                                                     : -1;
+                    if (kind < 0) {
+                        err(e, "joining this");
+                        return {"0", cg.t_i64()};
+                    }
+                    std::string r = reg();
+                    line(r + " = call ptr @beans_list_join(ptr " + recv.first +
+                         ", ptr " + sep.first + ", i64 " + std::to_string(kind) + ")");
+                    own(r, cg.t_str());
+                    return {r, cg.t_str()};
                 }
                 break;
             }
@@ -3388,10 +3467,22 @@ std::string CodeGen::generate() {
         if (b.panics) out += std::string(b.params.empty() ? "" : ", ") + "i64, i64";
         out += ")\n";
     }
+    for (const BuiltinFn& b : builtin_fns()) {
+        out += "declare " + std::string(irty(b.ret)) + " @" + b.sym + "(";
+        for (size_t i = 0; i < b.params.size(); i++) {
+            if (i) out += ", ";
+            out += irty(b.params[i]);
+        }
+        if (b.panics) out += std::string(b.params.empty() ? "" : ", ") + "i64, i64";
+        out += ")\n";
+    }
+    out += "declare void @beans_eprintln(ptr)\n";
+    out += "declare void @beans_eprint(ptr)\n";
     out += "declare void @beans_panic(ptr, i64, i64)\n";
     out += "declare void @beans_panic_index(i64, i64, i64, i64, i64)\n";
     out += "declare i64 @beans_is_a(i64, i64)\n";
     out += "declare ptr @beans_list_new(i64)\n";
+    out += "declare ptr @beans_list_join(ptr, ptr, i64)\n";
     out += "declare void @beans_list_push(ptr, i64)\n";
     out += "declare i64 @beans_f64_round(double)\n";
     out += "declare double @llvm.fabs.f64(double)\n";
@@ -3443,6 +3534,7 @@ const char* CodeGen::runtime_c() {
 // meta bits 0-2 = kind, bits 3-60 = per-kind shape payload:
 //   0 leaf | 1 fixed (bitmask of pointer slots) | 2 list (elem_ptr)
 //   3 map (key_ptr | val_ptr<<1) | 4 chan (elem_ptr) | 5 mutex (inner_ptr)
+//   6 OS resource (shape bit 0: 0 = file — drop closes the fd; 7 reserved)
 // meta bits 61-62 = collector color, bit 63 = in the root buffer.
 // String constants carry an immortal header emitted by the compiler.
 //
@@ -3454,11 +3546,17 @@ const char* CodeGen::runtime_c() {
 // at exit), so the mutator is exactly one thread: ourselves, between
 // statements. Everything is iterative — a million-node ring must not
 // overflow the C stack.
+#include <dirent.h>
+#include <errno.h>
+#include <fcntl.h>
 #include <math.h>
 #include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
+#include <time.h>
+#include <unistd.h>
 
 #define BEANS_IMMORTAL (1LL << 62)
 
@@ -3628,12 +3726,21 @@ static void cc_walk(void* p, long long meta, void (*fn)(void*, void*), void* ctx
     }
 }
 
+typedef struct {
+    long long fd;
+    long long closed;
+} BFile;
+
 // free the box and its side allocations WITHOUT touching child refs
 static void cc_free_shell(void* p, long long meta) {
     long long kind = meta & 7;
     if (kind == 2) free(((BList*)p)->data);
     else if (kind == 3) free(((BMap*)p)->data);
     else if (kind == 4) free(((BChan*)p)->q);
+    else if (kind == 6) { // OS resource (shape bit 0: 0 = file, 1 = mmap later)
+        BFile* f = p;     // dropping the last ref closes the fd — safety net;
+        if (!f->closed && f->fd >= 0) close((int)f->fd); // close() is the API
+    }
     BHead* h = head_of(p);
     long long cls = (h->rc >> RC_CLS_SHIFT) & RC_CLS_MAX;
     if (cls) {
@@ -3902,40 +4009,45 @@ char* beans_str_last(char* s, long long n) {
 }
 long long beans_str_contains(char* s, char* sub) { return strstr(s, sub) != NULL; }
 
+// a ready-made Error box: [vtable null][-1][msg][kind] — the exact 32-byte
+// layout codegen's make_error builds; meta 97 marks slots 2 and 3 as pointers
+static void* mk_error(const char* msg, const char* kind) {
+    long long* e = beans_alloc(32, 97);
+    e[1] = -1;
+    e[2] = (long long)rc_strdup(msg);
+    e[3] = (long long)rc_strdup(kind);
+    return e;
+}
+
 // fallible-builtin ABI: 16 bytes so C and IR both return it in registers.
-// msg null = ok(val); msg set = err — an owned beans string the caller boxes.
+// err null = ok(val); err set = a ready Error object the caller boxes.
 typedef struct {
     long long val;
-    char* msg;
+    void* err;
 } BRes;
+
+static BRes parse_fail(const char* s, const char* what) {
+    size_t n = strlen(s) + 48;
+    char* b = malloc(n);
+    snprintf(b, n, "can't read '%s' as %s", s, what);
+    BRes r = {0, mk_error(b, "")};
+    free(b);
+    return r;
+}
 
 BRes beans_str_to_int(char* s) {
     char* end = NULL;
     long long v = strtoll(s, &end, 10);
-    if (end == s || *end != '\0') {
-        size_t n = strlen(s) + 32;
-        char* b = malloc(n);
-        snprintf(b, n, "can't read '%s' as int", s);
-        char* m = rc_strdup(b);
-        free(b);
-        return (BRes){0, m};
-    }
+    if (end == s || *end != '\0') return parse_fail(s, "int");
     return (BRes){v, NULL};
 }
 
 BRes beans_str_to_float(char* s) {
     char* end = NULL;
     double d = strtod(s, &end);
-    if (end == s || *end != '\0') {
-        size_t n = strlen(s) + 32;
-        char* b = malloc(n);
-        snprintf(b, n, "can't read '%s' as float", s);
-        char* m = rc_strdup(b);
-        free(b);
-        return (BRes){0, m};
-    }
+    if (end == s || *end != '\0') return parse_fail(s, "float");
     BRes r;
-    r.msg = NULL;
+    r.err = NULL;
     memcpy(&r.val, &d, 8);
     return r;
 }
@@ -4177,6 +4289,49 @@ long long beans_map_get(BMap* m, long long key, long long kind, long long* ok) {
     return i >= 0 ? m->data[i * 2 + 1] : 0;
 }
 
+// element rendering matches the interpreter's display(): the kind code says
+// how each slot turns into text (0 int, 1 f64, 2 str, 3 dec, 4 bool)
+char* beans_dec_str(struct BDec* a);
+char* beans_list_join(BList* l, char* sep, long long kind) {
+    long long sl = beans_slen(sep);
+    char** parts = malloc((size_t)(l->len ? l->len : 1) * sizeof(char*));
+    long long total = 0;
+    for (long long i = 0; i < l->len; i++) {
+        long long v = l->data[i];
+        char* s;
+        if (kind == 2) {
+            s = (char*)v;
+        } else if (kind == 0) {
+            s = beans_from_int(v);
+        } else if (kind == 1) {
+            double d;
+            memcpy(&d, &v, 8);
+            s = beans_from_float(d);
+        } else if (kind == 3) {
+            s = beans_dec_str((struct BDec*)v);
+        } else {
+            s = beans_from_bool((int)v);
+        }
+        parts[i] = s;
+        total += beans_slen(s);
+        if (i) total += sl;
+    }
+    char* out = beans_alloc(total + 1, total << 3);
+    char* w = out;
+    for (long long i = 0; i < l->len; i++) {
+        if (i) {
+            memcpy(w, sep, (size_t)sl);
+            w += sl;
+        }
+        long long n = beans_slen(parts[i]);
+        memcpy(w, parts[i], (size_t)n);
+        w += n;
+        if (kind != 2) beans_release(parts[i]); // rendered copies are ours
+    }
+    free(parts);
+    return out;
+}
+
 // ---- string ops that build lists ----
 BList* beans_str_split(char* s, char* sep) {
     BList* l = beans_list_new(1);
@@ -4337,6 +4492,456 @@ char* beans_bytes_to_string(BList* b) {
     while (n < b->len && ((char*)b->data)[n] != 0) n++; // strings are text
     return str_make((char*)b->data, n);
 }
+
+// ---- files (kind 6 resources) -----------------------------------------------
+// errno -> Error.kind slug; the interpreter builds the identical pair
+static const char* fs_kind_of(int err) {
+    switch (err) {
+        case ENOENT: return "not_found";
+        case EACCES:
+        case EPERM: return "permission";
+        case EEXIST: return "exists";
+        case ENOTDIR: return "not_dir";
+        case EISDIR: return "is_dir";
+        case ENOTEMPTY: return "not_empty";
+        default: return "io";
+    }
+}
+static void* fs_err_obj(const char* path, int err) {
+    size_t n = strlen(path) + 96;
+    char* b = malloc(n);
+    snprintf(b, n, "%s: %s", path, strerror(err));
+    void* e = mk_error(b, fs_kind_of(err));
+    free(b);
+    return e;
+}
+static void* op_err_obj(const char* op, int err) {
+    char b[96];
+    snprintf(b, sizeof b, "%s: %s", op, strerror(err));
+    return mk_error(b, fs_kind_of(err));
+}
+static void* closed_err(void) { return mk_error("file is closed", "closed"); }
+
+BRes beans_file_read_at(BFile* f, long long pos, long long n) {
+    if (f->closed) return (BRes){0, closed_err()};
+    if (pos < 0 || n < 0) return (BRes){0, mk_error("negative read", "io")};
+    BList* buf = bytes_mk(n);
+    long long got = 0;
+    while (got < n) {
+        ssize_t r = pread((int)f->fd, (char*)buf->data + got, (size_t)(n - got),
+                          (off_t)(pos + got));
+        if (r < 0) return (BRes){0, op_err_obj("read", errno)};
+        if (r == 0) break; // eof: a short read returns what's there
+        got += r;
+    }
+    buf->len = got;
+    return (BRes){(long long)buf, NULL};
+}
+BRes beans_file_write_at(BFile* f, long long pos, BList* d) {
+    if (f->closed) return (BRes){0, closed_err()};
+    if (pos < 0) return (BRes){0, mk_error("negative write", "io")};
+    long long done = 0;
+    while (done < d->len) {
+        ssize_t r = pwrite((int)f->fd, (char*)d->data + done, (size_t)(d->len - done),
+                           (off_t)(pos + done));
+        if (r < 0) return (BRes){0, op_err_obj("write", errno)};
+        done += r;
+    }
+    return (BRes){done, NULL};
+}
+BRes beans_file_read(BFile* f, long long n) {
+    if (f->closed) return (BRes){0, closed_err()};
+    if (n < 0) return (BRes){0, mk_error("negative read", "io")};
+    BList* buf = bytes_mk(n);
+    long long got = 0;
+    while (got < n) {
+        ssize_t r = read((int)f->fd, (char*)buf->data + got, (size_t)(n - got));
+        if (r < 0) return (BRes){0, op_err_obj("read", errno)};
+        if (r == 0) break;
+        got += r;
+    }
+    buf->len = got;
+    return (BRes){(long long)buf, NULL};
+}
+BRes beans_file_write(BFile* f, BList* d) {
+    if (f->closed) return (BRes){0, closed_err()};
+    long long done = 0;
+    while (done < d->len) {
+        ssize_t r = write((int)f->fd, (char*)d->data + done, (size_t)(d->len - done));
+        if (r < 0) return (BRes){0, op_err_obj("write", errno)};
+        done += r;
+    }
+    return (BRes){done, NULL};
+}
+long long beans_file_seek(BFile* f, long long pos, long long line, long long col) {
+    if (f->closed) beans_panic("file is closed", line, col);
+    off_t r = lseek((int)f->fd, (off_t)pos, SEEK_SET);
+    if (r < 0) {
+        char m[96];
+        snprintf(m, sizeof m, "seek to %lld: %s", pos, strerror(errno));
+        beans_panic(m, line, col);
+    }
+    return (long long)r;
+}
+long long beans_file_seek_end(BFile* f, long long off, long long line, long long col) {
+    if (f->closed) beans_panic("file is closed", line, col);
+    off_t r = lseek((int)f->fd, (off_t)off, SEEK_END);
+    if (r < 0) {
+        char m[96];
+        snprintf(m, sizeof m, "seek to %lld: %s", off, strerror(errno));
+        beans_panic(m, line, col);
+    }
+    return (long long)r;
+}
+long long beans_file_tell(BFile* f, long long line, long long col) {
+    if (f->closed) beans_panic("file is closed", line, col);
+    return (long long)lseek((int)f->fd, 0, SEEK_CUR);
+}
+BRes beans_file_size(BFile* f) {
+    if (f->closed) return (BRes){0, closed_err()};
+    struct stat st;
+    if (fstat((int)f->fd, &st) != 0) return (BRes){0, op_err_obj("size", errno)};
+    return (BRes){(long long)st.st_size, NULL};
+}
+BRes beans_file_truncate(BFile* f, long long n) {
+    if (f->closed) return (BRes){0, closed_err()};
+    if (ftruncate((int)f->fd, (off_t)n) != 0) {
+        return (BRes){0, op_err_obj("truncate", errno)};
+    }
+    return (BRes){1, NULL};
+}
+BRes beans_file_sync(BFile* f) {
+    if (f->closed) return (BRes){0, closed_err()};
+    if (fsync((int)f->fd) != 0) return (BRes){0, op_err_obj("sync", errno)};
+    return (BRes){1, NULL};
+}
+BRes beans_file_close(BFile* f) {
+    if (f->closed) return (BRes){0, mk_error("file already closed", "closed")};
+    f->closed = 1;
+    if (close((int)f->fd) != 0) return (BRes){0, op_err_obj("close", errno)};
+    return (BRes){1, NULL};
+}
+
+BRes beans_file_open(char* path, char* mode) {
+    int flags;
+    if (strcmp(mode, "r") == 0) flags = O_RDONLY;
+    else if (strcmp(mode, "rw") == 0) flags = O_RDWR;
+    else if (strcmp(mode, "create") == 0) flags = O_RDWR | O_CREAT;
+    else if (strcmp(mode, "append") == 0) flags = O_WRONLY | O_CREAT | O_APPEND;
+    else {
+        char m[64];
+        snprintf(m, sizeof m, "bad open mode '%s'", mode);
+        return (BRes){0, mk_error(m, "io")};
+    }
+    int fd = open(path, flags, 0644);
+    if (fd < 0) return (BRes){0, fs_err_obj(path, errno)};
+    BFile* f = beans_alloc(sizeof(BFile), 6);
+    f->fd = fd;
+    f->closed = 0;
+    return (BRes){(long long)f, NULL};
+}
+
+static BRes fs_read_all(char* path, int as_bytes) {
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) return (BRes){0, fs_err_obj(path, errno)};
+    BList* buf = bytes_mk(0);
+    char chunk[65536];
+    while (1) {
+        ssize_t r = read(fd, chunk, sizeof chunk);
+        if (r < 0) {
+            int e = errno;
+            close(fd);
+            return (BRes){0, fs_err_obj(path, e)};
+        }
+        if (r == 0) break;
+        bytes_grow(buf, buf->len + r);
+        memcpy((char*)buf->data + buf->len, chunk, (size_t)r);
+        buf->len += r;
+    }
+    close(fd);
+    if (as_bytes) return (BRes){(long long)buf, NULL};
+    char* s = str_make((char*)buf->data, buf->len);
+    beans_release(buf);
+    return (BRes){(long long)s, NULL};
+}
+BRes beans_file_read_all(char* path) { return fs_read_all(path, 0); }
+BRes beans_file_read_all_b(char* path) { return fs_read_all(path, 1); }
+
+static BRes fs_write_all(char* path, const char* p, long long n, int append) {
+    int flags = O_WRONLY | O_CREAT | (append ? O_APPEND : O_TRUNC);
+    int fd = open(path, flags, 0644);
+    if (fd < 0) return (BRes){0, fs_err_obj(path, errno)};
+    long long done = 0;
+    while (done < n) {
+        ssize_t r = write(fd, p + done, (size_t)(n - done));
+        if (r < 0) {
+            int e = errno;
+            close(fd);
+            return (BRes){0, fs_err_obj(path, e)};
+        }
+        done += r;
+    }
+    close(fd);
+    return (BRes){done, NULL};
+}
+BRes beans_file_write_all(char* path, char* s) {
+    return fs_write_all(path, s, beans_slen(s), 0);
+}
+BRes beans_file_append_all(char* path, char* s) {
+    return fs_write_all(path, s, beans_slen(s), 1);
+}
+BRes beans_file_write_all_b(char* path, BList* b) {
+    return fs_write_all(path, (char*)b->data, b->len, 0);
+}
+BRes beans_file_append_all_b(char* path, BList* b) {
+    return fs_write_all(path, (char*)b->data, b->len, 1);
+}
+long long beans_file_exists(char* path) {
+    struct stat st;
+    return stat(path, &st) == 0 && !S_ISDIR(st.st_mode);
+}
+BRes beans_file_size_p(char* path) {
+    struct stat st;
+    if (stat(path, &st) != 0) return (BRes){0, fs_err_obj(path, errno)};
+    return (BRes){(long long)st.st_size, NULL};
+}
+BRes beans_file_remove(char* path) {
+    struct stat st;
+    if (stat(path, &st) != 0) return (BRes){0, fs_err_obj(path, errno)};
+    int r = S_ISDIR(st.st_mode) ? rmdir(path) : unlink(path);
+    if (r != 0) return (BRes){0, fs_err_obj(path, errno)};
+    return (BRes){1, NULL};
+}
+BRes beans_file_rename(char* from, char* to) {
+    if (rename(from, to) != 0) return (BRes){0, fs_err_obj(from, errno)};
+    return (BRes){1, NULL};
+}
+BRes beans_file_copy(char* from, char* to) {
+    int src = open(from, O_RDONLY);
+    if (src < 0) return (BRes){0, fs_err_obj(from, errno)};
+    int dst = open(to, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (dst < 0) {
+        int e = errno;
+        close(src);
+        return (BRes){0, fs_err_obj(to, e)};
+    }
+    char chunk[65536];
+    long long total = 0;
+    while (1) {
+        ssize_t r = read(src, chunk, sizeof chunk);
+        if (r < 0) {
+            int e = errno;
+            close(src);
+            close(dst);
+            return (BRes){0, fs_err_obj(from, e)};
+        }
+        if (r == 0) break;
+        ssize_t done = 0;
+        while (done < r) {
+            ssize_t w = write(dst, chunk + done, (size_t)(r - done));
+            if (w < 0) {
+                int e = errno;
+                close(src);
+                close(dst);
+                return (BRes){0, fs_err_obj(to, e)};
+            }
+            done += w;
+        }
+        total += r;
+    }
+    close(src);
+    close(dst);
+    return (BRes){total, NULL};
+}
+
+BRes beans_dir_make(char* path) {
+    if (mkdir(path, 0755) != 0) return (BRes){0, fs_err_obj(path, errno)};
+    return (BRes){1, NULL};
+}
+BRes beans_dir_make_all(char* path) {
+    long long n = beans_slen(path);
+    char* cur = malloc((size_t)n + 1);
+    long long i = 0;
+    while (i < n) {
+        long long j = i;
+        while (j < n && path[j] != '/') j++;
+        memcpy(cur, path, (size_t)j);
+        cur[j] = 0;
+        i = j + 1;
+        if (cur[0] == 0) continue;
+        if (mkdir(cur, 0755) != 0 && errno != EEXIST) {
+            BRes r = {0, fs_err_obj(cur, errno)};
+            free(cur);
+            return r;
+        }
+    }
+    free(cur);
+    return (BRes){1, NULL};
+}
+static int name_cmp(const void* a, const void* b) {
+    return strcmp(*(const char* const*)a, *(const char* const*)b);
+}
+BRes beans_dir_list(char* path) {
+    DIR* d = opendir(path);
+    if (!d) return (BRes){0, fs_err_obj(path, errno)};
+    char** names = NULL;
+    long long cnt = 0, cap = 0;
+    struct dirent* de;
+    while ((de = readdir(d)) != NULL) {
+        if (strcmp(de->d_name, ".") == 0 || strcmp(de->d_name, "..") == 0) continue;
+        if (cnt == cap) {
+            cap = cap ? cap * 2 : 16;
+            names = realloc(names, (size_t)cap * sizeof(char*));
+        }
+        names[cnt++] = strdup(de->d_name);
+    }
+    closedir(d);
+    qsort(names, (size_t)cnt, sizeof(char*), name_cmp); // deterministic
+    BList* l = beans_list_new(1);
+    for (long long i = 0; i < cnt; i++) {
+        beans_list_push(l, (long long)rc_strdup(names[i]));
+        free(names[i]);
+    }
+    free(names);
+    return (BRes){(long long)l, NULL};
+}
+BRes beans_dir_remove(char* path) {
+    if (rmdir(path) != 0) return (BRes){0, fs_err_obj(path, errno)};
+    return (BRes){1, NULL};
+}
+static int rm_tree(const char* p) {
+    struct stat st;
+    if (lstat(p, &st) != 0) return -1;
+    if (!S_ISDIR(st.st_mode)) return unlink(p);
+    DIR* d = opendir(p);
+    if (!d) return -1;
+    struct dirent* de;
+    while ((de = readdir(d)) != NULL) {
+        if (strcmp(de->d_name, ".") == 0 || strcmp(de->d_name, "..") == 0) continue;
+        char sub[1024];
+        snprintf(sub, sizeof sub, "%s/%s", p, de->d_name);
+        if (rm_tree(sub) != 0) {
+            closedir(d);
+            return -1;
+        }
+    }
+    closedir(d);
+    return rmdir(p);
+}
+BRes beans_dir_remove_all(char* path) {
+    struct stat st;
+    if (lstat(path, &st) != 0) return (BRes){0, fs_err_obj(path, errno)};
+    if (rm_tree(path) != 0) return (BRes){0, fs_err_obj(path, errno)};
+    return (BRes){1, NULL};
+}
+long long beans_dir_exists(char* path) {
+    struct stat st;
+    return stat(path, &st) == 0 && S_ISDIR(st.st_mode);
+}
+char* beans_dir_temp(void) {
+    const char* t = getenv("TMPDIR");
+    char buf[1024];
+    snprintf(buf, sizeof buf, "%s", t && *t ? t : "/tmp");
+    size_t n = strlen(buf);
+    while (n > 1 && buf[n - 1] == '/') buf[--n] = 0;
+    return rc_strdup(buf);
+}
+BRes beans_dir_sync(char* path) {
+    // the database commit pattern: fsync the directory after a rename
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) return (BRes){0, fs_err_obj(path, errno)};
+    if (fsync(fd) != 0) {
+        int e = errno;
+        close(fd);
+        return (BRes){0, fs_err_obj(path, e)};
+    }
+    close(fd);
+    return (BRes){1, NULL};
+}
+
+// ---- std.os / std.io --------------------------------------------------------
+static int os_argc;
+static char** os_argv;
+__attribute__((constructor)) static void os_capture(int argc, char** argv) {
+    os_argc = argc;
+    os_argv = argv;
+}
+BList* beans_os_args(void) {
+    BList* l = beans_list_new(1);
+    for (int i = 1; i < os_argc; i++) {
+        beans_list_push(l, (long long)rc_strdup(os_argv[i]));
+    }
+    return l;
+}
+BOpt beans_os_env(char* name) {
+    const char* v = getenv(name);
+    if (!v) return (BOpt){0, 0};
+    return (BOpt){(long long)rc_strdup(v), 1};
+}
+void beans_os_exit(long long code) { exit((int)code); }
+long long beans_os_now_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    return (long long)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
+long long beans_os_ticks_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (long long)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
+void beans_os_sleep_ms(long long ms) {
+    if (ms > 0) {
+        struct timespec ts;
+        ts.tv_sec = ms / 1000;
+        ts.tv_nsec = (ms % 1000) * 1000000;
+        nanosleep(&ts, NULL);
+    }
+}
+BOpt beans_io_read_line(void) {
+    char* out = NULL;
+    long long len = 0, cap = 0;
+    int c;
+    int any = 0;
+    while ((c = fgetc(stdin)) != EOF) {
+        any = 1;
+        if (c == '\n') break;
+        if (len == cap) {
+            cap = cap ? cap * 2 : 128;
+            out = realloc(out, (size_t)cap);
+        }
+        out[len++] = (char)c;
+    }
+    if (!any) {
+        free(out);
+        return (BOpt){0, 0};
+    }
+    char* s = str_make(out ? out : "", len);
+    free(out);
+    return (BOpt){(long long)s, 1};
+}
+char* beans_io_read_all(void) {
+    char* out = NULL;
+    long long len = 0, cap = 0;
+    char chunk[65536];
+    size_t r;
+    while ((r = fread(chunk, 1, sizeof chunk, stdin)) > 0) {
+        if (len + (long long)r > cap) {
+            cap = cap ? cap * 2 : 65536;
+            while (cap < len + (long long)r) cap *= 2;
+            out = realloc(out, (size_t)cap);
+        }
+        memcpy(out + len, chunk, r);
+        len += r;
+    }
+    char* s = str_make(out ? out : "", len);
+    free(out);
+    return s;
+}
+void beans_eprintln(char* s) {
+    fputs(s, stderr);
+    fputc('\n', stderr);
+}
+void beans_eprint(char* s) { fputs(s, stderr); }
 
 // ---- threads ----
 typedef struct {
@@ -4529,14 +5134,7 @@ static int dec_valid_c(const char* s) {
 }
 // mirror of Decimal::parse — the two must compute identically
 BRes beans_str_to_decimal(char* s) {
-    if (!dec_valid_c(s)) {
-        size_t n = strlen(s) + 32;
-        char* b = malloc(n);
-        snprintf(b, n, "can't read '%s' as decimal", s);
-        char* m = rc_strdup(b);
-        free(b);
-        return (BRes){0, m};
-    }
+    if (!dec_valid_c(s)) return parse_fail(s, "decimal");
     __int128 coeff = 0;
     long long scale = 0, exp = 0;
     int neg = 0, after_dot = 0;

@@ -74,13 +74,23 @@ TypeId Checker::bt_type(BT t, TypeId recv) {
         case BT::boolean: return t_bool();
         case BT::str: return t_str();
         case BT::bytes: return pool_.named(Type::K::class_, "Bytes");
+        case BT::file: return pool_.named(Type::K::class_, "File");
         case BT::self_recv: return recv ? recv : t_poison();
         case BT::opt_i64: return t_option(t_int());
+        case BT::opt_str: return t_option(t_str());
         case BT::list_str: return pool_.named(Type::K::class_, "List", {t_str()});
         case BT::res_i64: return t_result(t_int(), t_error_class());
         case BT::res_f64: return t_result(t_f64(), t_error_class());
         case BT::res_dec: return t_result(t_dec(), t_error_class());
         case BT::res_str: return t_result(t_str(), t_error_class());
+        case BT::res_bool: return t_result(t_bool(), t_error_class());
+        case BT::res_bytes:
+            return t_result(pool_.named(Type::K::class_, "Bytes"), t_error_class());
+        case BT::res_file:
+            return t_result(pool_.named(Type::K::class_, "File"), t_error_class());
+        case BT::res_list_str:
+            return t_result(pool_.named(Type::K::class_, "List", {t_str()}),
+                            t_error_class());
     }
     return t_poison();
 }
@@ -179,7 +189,8 @@ std::string Checker::as_type_name(const Expr* e) {
         }
         // builtins keep their plain names
         if (builtin_generic_classes_.count(n) || n == "Error" || n == "Option" ||
-            n == "Result" || n == "AtomicInt" || n == "Bytes") {
+            n == "Result" || n == "AtomicInt" || n == "Bytes" || n == "File" ||
+            n == "Dir") {
             return n;
         }
         return "";
@@ -551,6 +562,7 @@ TypeId Checker::resolve_type(const TypeRef* t) {
         if (n == "Error") return t_error_class();
         if (n == "AtomicInt") return pool_.named(Type::K::class_, "AtomicInt");
         if (n == "Bytes") return pool_.named(Type::K::class_, "Bytes");
+        if (n == "File") return pool_.named(Type::K::class_, "File");
     }
 
     if (n == "Option") {
@@ -1351,10 +1363,13 @@ Checker::Member Checker::builtin_member(TypeId recv, const std::string& name) {
         if (name == "round") return method({t_int()}, recv);
         return none;
     }
-    // string and Bytes methods come from the builtin registry (builtins.cpp)
+    // string, Bytes, and File methods come from the builtin registry
     if (recv->k == Type::K::string_ ||
-        (recv->k == Type::K::class_ && recv->name == "Bytes")) {
-        BT want = recv->k == Type::K::string_ ? BT::str : BT::bytes;
+        (recv->k == Type::K::class_ &&
+         (recv->name == "Bytes" || recv->name == "File"))) {
+        BT want = recv->k == Type::K::string_ ? BT::str
+                  : recv->name == "Bytes"     ? BT::bytes
+                                              : BT::file;
         for (const BuiltinMethod& b : builtin_methods()) {
             if (b.recv == want && name == b.name) {
                 std::vector<TypeId> ps;
@@ -1632,7 +1647,8 @@ TypeId Checker::check_call(const Expr* e, TypeId expected) {
             auto pit = pkg_paths_.find(n);
             if (pit != pkg_paths_.end()) {
                 const std::string& path = pit->second;
-                if (path == "std.io" && (mname == "println" || mname == "print")) {
+                if (path == "std.io" && (mname == "println" || mname == "print" ||
+                                         mname == "eprintln" || mname == "eprint")) {
                     callee->resolved = "std.io." + mname;
                     if (e->args.size() != 1) {
                         error_at(e->line, e->col, "io." + mname + " takes 1 argument");
@@ -1645,6 +1661,16 @@ TypeId Checker::check_call(const Expr* e, TypeId expected) {
                         }
                     }
                     return t_unit();
+                }
+                // table-driven std functions (std.os, io.read_line, ...)
+                for (const BuiltinFn& b : builtin_fns()) {
+                    if (path == b.module && mname == b.name) {
+                        callee->resolved = std::string(b.module) + "." + b.name;
+                        std::vector<TypeId> ps;
+                        for (BT p : b.params) ps.push_back(bt_type(p, nullptr));
+                        return check_args_against(ps, bt_type(b.ret, nullptr),
+                                                  "'" + n + "." + mname + "'");
+                    }
                 }
                 if (path == "std.thread" && mname == "spawn") {
                     callee->resolved = "std.thread.spawn";
@@ -1732,16 +1758,16 @@ TypeId Checker::check_call(const Expr* e, TypeId expected) {
                 for (const ExprPtr& a : e->args) check_expr(a.get(), t_int());
                 return pool_.named(Type::K::class_, "AtomicInt");
             }
-            if (n == "Bytes") {
+            if (n == "Bytes" || n == "File" || n == "Dir") {
                 for (const BuiltinStatic& b : builtin_statics()) {
-                    if (mname == b.name) {
+                    if (n == b.cls && mname == b.name) {
                         std::vector<TypeId> ps;
                         for (BT p : b.params) ps.push_back(bt_type(p, nullptr));
                         return check_args_against(ps, bt_type(b.ret, nullptr),
-                                                  "'Bytes." + mname + "'");
+                                                  "'" + n + "." + mname + "'");
                     }
                 }
-                error_at(e->line, e->col, "Bytes has no static '" + mname + "'");
+                error_at(e->line, e->col, n + " has no static '" + mname + "'");
                 for (const ExprPtr& a : e->args) check_expr(a.get(), nullptr);
                 return t_poison();
             }

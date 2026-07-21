@@ -150,12 +150,13 @@ struct MutexVal;
 struct ChannelVal;
 struct AtomicVal;
 struct BytesVal;
+struct FileVal;
 
 struct Value {
     enum class K {
         unit, int_, float_, decimal_, bool_, string_,
         list, map, instance, enum_v, closure, fn_ref, range,
-        thread, mutex, channel, atomic, bytes,
+        thread, mutex, channel, atomic, bytes, file,
     };
     K k = K::unit;
 
@@ -176,6 +177,7 @@ struct Value {
     std::shared_ptr<ChannelVal> chan;
     std::shared_ptr<AtomicVal> atomic;
     std::shared_ptr<BytesVal> bytes;
+    std::shared_ptr<FileVal> file;
 
     static Value unit() { return {}; }
     static Value of_int(int64_t v) { Value x; x.k = K::int_; x.i = v; return x; }
@@ -304,6 +306,14 @@ struct AtomicVal { std::atomic<int64_t> v{0}; };
 // binary-safe byte buffer — the stdlib's Bytes class. Holds no Values, so
 // it never parks in the teardown pile.
 struct BytesVal { std::vector<uint8_t> data; };
+
+// an open OS file — the stdlib's File class. Dropping the last ref closes
+// the fd as a safety net; close() is still the real API (sync first).
+struct FileVal {
+    int fd = -1;
+    bool closed = false;
+    ~FileVal();
+};
 
 // lexical scope chain — closures keep their captured chain alive
 struct Env {

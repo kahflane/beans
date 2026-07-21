@@ -215,8 +215,21 @@ int main(int argc, char** argv) {
         return cmd_build(file, out);
     }
 
+    // `run f.b -- a b` hands everything after -- to the program (os.args)
+    int stop = argc;
+    if (std::strcmp(cmd, "run") == 0) {
+        for (int i = 2; i < argc; i++) {
+            if (std::strcmp(argv[i], "--") == 0) {
+                beans::set_program_args(
+                    std::vector<std::string>(argv + i + 1, argv + argc));
+                stop = i;
+                break;
+            }
+        }
+    }
+
     int rc = 0;
-    for (int i = 2; i < argc; i++) {
+    for (int i = 2; i < stop; i++) {
         if (std::strcmp(cmd, "lex") == 0) rc |= cmd_lex(argv[i]);
         else if (std::strcmp(cmd, "parse") == 0) rc |= cmd_parse(argv[i]);
         else if (std::strcmp(cmd, "check") == 0) rc |= cmd_check(argv[i]);

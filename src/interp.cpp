@@ -956,12 +956,17 @@ Value Interp::eval_call(const Expr* e, std::shared_ptr<Env>& env, Hint hint) {
         const Expr* obj = callee->object.get();
         const std::string& mname = callee->name;
 
-        auto do_println = [&](bool newline) {
+        auto do_println = [&](bool newline, bool err = false) {
             Value v = eval(e->args[0].get(), env);
             std::string out = display(v);
             if (newline) out += "\n";
-            std::fwrite(out.data(), 1, out.size(), stdout);
+            std::fwrite(out.data(), 1, out.size(), err ? stderr : stdout);
             return Value::unit();
+        };
+        auto do_builtin_fn = [&](const BuiltinFn& b) {
+            std::vector<Value> args;
+            for (const ExprPtr& a : e->args) args.push_back(eval(a.get(), env));
+            return b.run(e->line, e->col, args);
         };
         auto do_spawn = [&]() {
             Value f = eval(e->args[0].get(), env);
@@ -990,7 +995,12 @@ Value Interp::eval_call(const Expr* e, std::shared_ptr<Env>& env, Hint hint) {
             const std::string& r = callee->resolved;
             if (r == "std.io.println") return do_println(true);
             if (r == "std.io.print") return do_println(false);
+            if (r == "std.io.eprintln") return do_println(true, true);
+            if (r == "std.io.eprint") return do_println(false, true);
             if (r == "std.thread.spawn") return do_spawn();
+            for (const BuiltinFn& b : builtin_fns()) {
+                if (r == std::string(b.module) + "." + b.name) return do_builtin_fn(b);
+            }
             auto fit = fns_.find(r);
             if (fit != fns_.end()) {
                 return call_fn(fit->second, nullptr, eval_args_hinted(fit->second->params),
@@ -1004,8 +1014,13 @@ Value Interp::eval_call(const Expr* e, std::shared_ptr<Env>& env, Hint hint) {
             // unannotated package call (string-interpolation segments)
             std::string path = binding_path(n);
             if (!path.empty()) {
-                if (path == "std.io" && (mname == "println" || mname == "print")) {
-                    return do_println(mname == "println");
+                if (path == "std.io" && (mname == "println" || mname == "print" ||
+                                         mname == "eprintln" || mname == "eprint")) {
+                    return do_println(mname == "println" || mname == "eprintln",
+                                      mname == "eprintln" || mname == "eprint");
+                }
+                for (const BuiltinFn& b : builtin_fns()) {
+                    if (path == b.module && mname == b.name) return do_builtin_fn(b);
                 }
                 if (path == "std.thread" && mname == "spawn") return do_spawn();
                 auto pfx = prefix_by_path_.find(path);
@@ -1063,9 +1078,9 @@ Value Interp::eval_call(const Expr* e, std::shared_ptr<Env>& env, Hint hint) {
                 v.atomic->v = init.i;
                 return v;
             }
-            if (n == "Bytes") {
+            if (n == "Bytes" || n == "File" || n == "Dir") {
                 for (const BuiltinStatic& b : builtin_statics()) {
-                    if (mname == b.name) {
+                    if (n == b.cls && mname == b.name) {
                         std::vector<Value> args;
                         for (const ExprPtr& a : e->args) args.push_back(eval(a.get(), env));
                         return b.run(e->line, e->col, args);
@@ -1173,6 +1188,14 @@ Value Interp::eval_builtin_method(const Expr* e, Value& recv, const std::string&
         case Value::K::bytes: {
             for (const BuiltinMethod& b : builtin_methods()) {
                 if (b.recv == BT::bytes && name == b.name) {
+                    return b.run(e->line, e->col, recv, args);
+                }
+            }
+            break;
+        }
+        case Value::K::file: {
+            for (const BuiltinMethod& b : builtin_methods()) {
+                if (b.recv == BT::file && name == b.name) {
                     return b.run(e->line, e->col, recv, args);
                 }
             }
@@ -1538,6 +1561,7 @@ std::string Interp::display(const Value& v) {
         }
         case Value::K::map: return "{map}";
         case Value::K::bytes: return "{bytes}";
+        case Value::K::file: return "{file}";
         case Value::K::closure: return "{fn}";
         case Value::K::fn_ref: return "{fn}";
         case Value::K::range: return "{range}";
