@@ -120,9 +120,9 @@ the count must mask with `RC_COUNT`** — a raw `h->rc == 0` is never true for a
 objects come from per-thread size-class freelists over registered slabs; `BEANS_NO_POOL=1` disables
 the pool.
 
-RC is deliberately kept off hot paths — **function arguments, loop variables, and reads borrow; they
-do not retain.** Only frame-owned locals (`Var::owned`) and mid-statement temporaries (`temps`) hold
-refs. When editing `FnEmit`:
+RC is deliberately kept off hot paths — **function arguments, loop variables, reads, and let-aliases
+of never-reassigned locals borrow; they do not retain.** Only frame-owned locals (`Var::owned`) and
+mid-statement temporaries (`temps`) hold refs. When editing `FnEmit`:
 
 - Temporaries created while emitting a statement go on `temps` via `own()`, are removed by `consume()`
   when ownership transfers, and are released by `flush_temps(mark)` at the statement end.

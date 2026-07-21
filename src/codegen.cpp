@@ -882,6 +882,37 @@ struct FnEmit {
         }
         return nullptr;
     }
+
+    // ---- borrow-alias elision ----
+    // `var q: T = p` is a pure alias when neither name is ever reassigned in
+    // this function: q borrows p's ref instead of taking its own pair. The
+    // source outlives q by scoping (it is visible at q's declaration), so the
+    // borrow can't dangle. Closure-captured (boxed) names keep the retain —
+    // their cell owns its value and closures can swap it.
+    std::set<std::string> assigned_names_;
+    bool assigned_scanned_ = false;
+    void scan_assigned(const std::vector<StmtPtr>& stmts) {
+        for (const StmtPtr& sp : stmts) {
+            const Stmt* s = sp.get();
+            if (s->kind == Stmt::Kind::assign && s->target &&
+                s->target->kind == Expr::Kind::ident) {
+                assigned_names_.insert(std::string(s->target->text));
+            }
+            if (s->kind == Stmt::Kind::expr && s->expr &&
+                s->expr->kind == Expr::Kind::match_expr) {
+                for (const MatchArm& a : s->expr->arms) scan_assigned(a.body);
+            }
+            scan_assigned(s->body);
+            scan_assigned(s->else_body);
+        }
+    }
+    bool ever_assigned(const std::string& name) {
+        if (!assigned_scanned_) {
+            assigned_scanned_ = true;
+            scan_assigned(body_ref);
+        }
+        return assigned_names_.count(name) > 0;
+    }
     std::string alloc_slot(const std::string& name, Ty* t, bool entry = false) {
         bool boxed = boxed_names.count(name) > 0;
         std::string slot = "%v" + std::to_string(next_reg++) + "." + name;
@@ -2703,11 +2734,18 @@ struct FnEmit {
             case Stmt::Kind::let_: {
                 Ty* t = rt(s->type.get(), s->line, s->col);
                 if (t->k == Ty::bad_ || t->k == Ty::unit_) return;
+                bool borrow = false;
+                if (is_rc(t) && s->init && s->init->kind == Expr::Kind::ident) {
+                    std::string src(s->init->text);
+                    Var* sv = find_var(src);
+                    borrow = sv && !sv->boxed && !boxed_names.count(s->name) &&
+                             !ever_assigned(src) && !ever_assigned(s->name);
+                }
                 EV v = eval(s->init.get(), t);
-                transfer_in(v);
+                if (!borrow) transfer_in(v);
                 alloc_slot(s->name, t);
                 Var* var = find_var(s->name);
-                var->owned = is_rc(t) || var->boxed;
+                var->owned = !borrow && (is_rc(t) || var->boxed);
                 line("store " + std::string(ll(t)) + " " + v.first + ", ptr " +
                      var_ptr(var));
                 break;
