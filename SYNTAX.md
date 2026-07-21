@@ -268,6 +268,21 @@ pub fn log_line(msg: string) {      // no -> means no return value
 }
 ```
 
+**There is no implicit tail return.** A trailing expression is a statement like any other — its
+value is discarded, not returned. A function with a `->` must say `return`, on every path:
+
+```
+fn wrong() -> int {
+    var sum: int = 0
+    if flag() { sum = 1 }
+    sum                             // error: 'wrong' must return int
+}
+```
+
+The checker rejects a body that can finish without returning. A path counts as returning if it
+ends in `return`, an `if`/`else` where both sides return, a statement `match` whose arms all
+return, or a `for { }` with no `break` (which never finishes at all).
+
 ### Anonymous functions
 
 `fn` without a name is a closure. It captures the variables around it. `fn(int) -> int` is also the type of a function.

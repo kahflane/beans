@@ -803,6 +803,12 @@ void Checker::check_fn_body(const FnDecl& f, ClassInfo* cls, EnumInfo* en) {
     check_block(f.body);
     pop_scope();
 
+    if (f.ret && cur_ret_ != t_unit() && cur_ret_->k != Type::K::poison &&
+        !always_returns(f.body)) {
+        error_at(f.line, f.col, "'" + f.name + "' must return " + type_name(cur_ret_) +
+                                    " — the body can finish without a return");
+    }
+
     cur_class_ = nullptr;
     cur_enum_ = nullptr;
     cur_has_self_ = false;
@@ -812,8 +818,86 @@ void Checker::check_fn_body(const FnDecl& f, ClassInfo* cls, EnumInfo* en) {
 
 void Checker::check_block(const std::vector<StmtPtr>& body) {
     push_scope();
+    block_depth_ += 1;
     for (const StmtPtr& s : body) check_stmt(s.get());
+    block_depth_ -= 1;
     pop_scope();
+}
+
+// ---- missing return --------------------------------------------------------
+
+// beans has no implicit tail-expression return — a value-returning function
+// says `return` (SYNTAX.md, "Functions"). So a `-> T` body that can run off the
+// end has no value to hand back, and the two backends each invented a different
+// one: unit in the interpreter, the type's zero value in codegen, which for a
+// pointer type was a null the caller then dereferenced. Rejecting it here is
+// what keeps the two agreeing.
+//
+// The walk is deliberately conservative: unsure means "does not return", which
+// at worst asks for a `return` the reader can already see is needed.
+
+// A `break` binds to the innermost loop, so this stops at a nested loop instead
+// of counting its breaks as this loop's.
+bool Checker::has_break(const std::vector<StmtPtr>& body) {
+    for (const StmtPtr& s : body) {
+        switch (s->kind) {
+            case Stmt::Kind::brk:
+                return true;
+            case Stmt::Kind::if_:
+                if (has_break(s->body) || has_break(s->else_body)) return true;
+                break;
+            case Stmt::Kind::unsafe_:
+                if (has_break(s->body)) return true;
+                break;
+            case Stmt::Kind::expr:
+                if (s->expr && s->expr->kind == Expr::Kind::match_expr) {
+                    for (const MatchArm& a : s->expr->arms) {
+                        if (a.is_block && has_break(a.body)) return true;
+                    }
+                }
+                break;
+            default:
+                break;
+        }
+    }
+    return false;
+}
+
+bool Checker::stmt_returns(const Stmt* s) {
+    switch (s->kind) {
+        case Stmt::Kind::ret:
+            return true;
+        case Stmt::Kind::if_:
+            // no else and the false path falls straight through
+            return !s->else_body.empty() && always_returns(s->body) &&
+                   always_returns(s->else_body);
+        case Stmt::Kind::for_ever:
+            // `for { }` with no break never finishes, so nothing follows it
+            return !has_break(s->body);
+        case Stmt::Kind::unsafe_:
+            return always_returns(s->body);
+        case Stmt::Kind::expr:
+            // a statement-position match counts when every arm returns —
+            // check_match already proved the arms cover the subject
+            if (s->expr && s->expr->kind == Expr::Kind::match_expr &&
+                !s->expr->arms.empty()) {
+                for (const MatchArm& a : s->expr->arms) {
+                    if (!a.is_block || !always_returns(a.body)) return false;
+                }
+                return true;
+            }
+            return false;
+        default:
+            return false;
+    }
+}
+
+bool Checker::always_returns(const std::vector<StmtPtr>& body) {
+    // any returning statement is enough — whatever follows it is unreachable
+    for (const StmtPtr& s : body) {
+        if (stmt_returns(s.get())) return true;
+    }
+    return false;
 }
 
 void Checker::check_stmt(const Stmt* s) {
@@ -951,6 +1035,13 @@ void Checker::check_stmt(const Stmt* s) {
             break;
         }
         case Stmt::Kind::defer_:
+            // a function-exit hook, not a block-exit one: nested registration
+            // would need runtime capture the native backend does not have, so
+            // the rule is one shape both backends implement identically
+            if (block_depth_ != 1) {
+                error_at(s->line, s->col,
+                         "defer must sit at the top level of a function body");
+            }
             check_expr(s->expr.get(), nullptr);
             break;
         case Stmt::Kind::unsafe_:
@@ -970,13 +1061,17 @@ bool Checker::is_adaptable_literal(const Expr* e) {
 }
 
 TypeId Checker::literal_or(const Expr* e, TypeId expected, TypeId dflt) {
+    TypeId t = dflt;
     if (expected) {
-        if (e->kind == Expr::Kind::int_lit && expected->is_numeric()) return expected;
+        if (e->kind == Expr::Kind::int_lit && expected->is_numeric()) t = expected;
         if (e->kind == Expr::Kind::float_lit &&
             (expected->is_float() || expected->k == Type::K::decimal_))
-            return expected;
+            t = expected;
     }
-    return dflt;
+    // stamp the decision on the node — the interpreter reads it back so a
+    // literal in a decimal/float spot builds the same Value the checker typed
+    e->numk = t->k == Type::K::decimal_ ? 3 : t->is_float() ? 2 : 1;
+    return t;
 }
 
 TypeId Checker::check_expr(const Expr* e, TypeId expected) {
@@ -1180,9 +1275,17 @@ TypeId Checker::check_expr(const Expr* e, TypeId expected) {
                 declare(e->params[i].name, params[i], false,
                         e->params[i].line, e->params[i].col);
             }
+            int saved_depth = block_depth_;
+            block_depth_ = 0; // the closure body is its own frame for defer
             check_block(e->body);
+            block_depth_ = saved_depth;
             pop_scope();
             cur_ret_ = saved_ret;
+            if (e->type && ret != t_unit() && ret->k != Type::K::poison &&
+                !always_returns(e->body)) {
+                error_at(e->line, e->col, "this closure must return " + type_name(ret) +
+                                              " — the body can finish without a return");
+            }
             return pool_.fn(std::move(params), ret);
         }
         case Expr::Kind::if_expr: {

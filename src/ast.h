@@ -137,6 +137,13 @@ struct Expr {
     // package line — "util.hello" on a call, "util.User" on an init,
     // "std.io.println" on a std call. Empty = resolve locally as before.
     mutable std::string resolved;
+
+    // filled by the checker on number literals: the type the literal took from
+    // its spot (1 = int family, 2 = float, 3 = decimal). 0 = never checked —
+    // only re-parsed interpolation segments; interp falls back to runtime
+    // hints there. Without this the interpreter guessed from the lexeme and a
+    // decimal-typed argument silently became a float Value.
+    mutable uint8_t numk = 0;
 };
 
 struct MatchArm {

@@ -94,6 +94,11 @@ private:
     void check_block(const std::vector<StmtPtr>& body);
     void check_stmt(const Stmt* s);
 
+    // ---- missing return ----
+    bool always_returns(const std::vector<StmtPtr>& body);
+    bool stmt_returns(const Stmt* s);
+    bool has_break(const std::vector<StmtPtr>& body);
+
     // ---- expressions ----
     TypeId check_expr(const Expr* e, TypeId expected);
     TypeId check_call(const Expr* e, TypeId expected);
@@ -151,6 +156,9 @@ private:
     TypeId cur_ret_ = nullptr;
     bool cur_has_self_ = false;
     std::set<std::string> cur_type_params_;
+    // block nesting inside the current fn body (1 = top level) — defer is a
+    // function-exit hook and is only legal at depth 1
+    int block_depth_ = 0;
 
     // shorthands
     TypeId t_int() { return pool_.prim(Type::K::int_); }
