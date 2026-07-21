@@ -6,12 +6,14 @@
 //   beansc check <file.b>...   parse + type-check
 
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <sstream>
 #include <string>
 
 #include "checker.h"
+#include "codegen.h"
 #include "interp.h"
 #include "lexer.h"
 #include "parser.h"
@@ -144,14 +146,99 @@ int cmd_run(const char* path) {
     return interp.run();
 }
 
+int cmd_build(const char* path, const char* out_path) {
+    std::string source;
+    if (!read_file(path, source)) {
+        std::fprintf(stderr, "error: can't open %s\n", path);
+        return 1;
+    }
+    beans::Lexer lexer(source);
+    std::vector<beans::Token> tokens = lexer.scan_all();
+    for (const beans::LexError& e : lexer.errors()) {
+        std::fprintf(stderr, "%s:%u:%u: error: %s\n", path, e.line, e.col, e.msg.c_str());
+    }
+    beans::Parser parser(std::move(tokens));
+    beans::Module mod = parser.parse_module();
+    for (const beans::ParseError& e : parser.errors()) {
+        std::fprintf(stderr, "%s:%u:%u: error: %s\n", path, e.line, e.col, e.msg.c_str());
+    }
+    if (!lexer.errors().empty() || !parser.errors().empty()) return 1;
+
+    beans::Checker checker(mod);
+    checker.run();
+    for (const beans::CheckError& e : checker.errors()) {
+        std::fprintf(stderr, "%s:%u:%u: error: %s\n", path, e.line, e.col, e.msg.c_str());
+    }
+    if (!checker.errors().empty()) return 1;
+
+    beans::CodeGen cg(mod);
+    std::string ir = cg.generate();
+    for (const beans::CGError& e : cg.errors()) {
+        std::fprintf(stderr, "%s:%u:%u: error: %s\n", path, e.line, e.col, e.msg.c_str());
+    }
+    if (ir.empty()) return 1;
+
+    // work out names: build/<stem>.ll, binary at out_path or build/<stem>
+    std::string stem(path);
+    size_t slash = stem.find_last_of('/');
+    if (slash != std::string::npos) stem = stem.substr(slash + 1);
+    size_t dot = stem.find_last_of('.');
+    if (dot != std::string::npos) stem = stem.substr(0, dot);
+
+    std::system("mkdir -p build");
+    std::string ll_path = "build/" + stem + ".ll";
+    std::string rt_path = "build/beans_rt.c";
+    std::string bin = out_path ? out_path : "build/" + stem;
+
+    {
+        std::ofstream f(ll_path, std::ios::binary);
+        f << ir;
+    }
+    {
+        std::ofstream f(rt_path, std::ios::binary);
+        f << beans::CodeGen::runtime_c();
+    }
+
+    std::string cmd = "clang -O2 -Wno-override-module " + ll_path + " " + rt_path +
+                      " -o " + bin;
+    int rc = std::system(cmd.c_str());
+    if (rc != 0) {
+        std::fprintf(stderr, "error: clang failed on the generated IR (%s)\n",
+                     ll_path.c_str());
+        return 1;
+    }
+    std::printf("built %s\n", bin.c_str());
+    return 0;
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
     if (argc < 3) {
-        std::fprintf(stderr, "usage: %s <lex|parse|check|run> <file.b>...\n", argv[0]);
+        std::fprintf(stderr,
+                     "usage: %s <lex|parse|check|run> <file.b>...\n"
+                     "       %s build <file.b> [-o out]\n",
+                     argv[0], argv[0]);
         return 2;
     }
     const char* cmd = argv[1];
+    if (std::strcmp(cmd, "build") == 0) {
+        const char* out = nullptr;
+        const char* file = nullptr;
+        for (int i = 2; i < argc; i++) {
+            if (std::strcmp(argv[i], "-o") == 0 && i + 1 < argc) {
+                out = argv[++i];
+            } else {
+                file = argv[i];
+            }
+        }
+        if (!file) {
+            std::fprintf(stderr, "usage: %s build <file.b> [-o out]\n", argv[0]);
+            return 2;
+        }
+        return cmd_build(file, out);
+    }
+
     int rc = 0;
     for (int i = 2; i < argc; i++) {
         if (std::strcmp(cmd, "lex") == 0) rc |= cmd_lex(argv[i]);
