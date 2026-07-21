@@ -354,6 +354,10 @@ struct CG2 {
             fi.decl = &f;
             fi.ty = resolve(f.type.get(), im->env, f.line, f.col);
             fi.offset = 16 + 8 * static_cast<int>(im->fields.size());
+            if (fi.offset / 8 > 57) {
+                // pointer-slot masks stop at meta bit 60 — collector owns 61-63
+                err(f.line, f.col, "class '" + decl->name + "' has too many fields");
+            }
             im->fields.push_back(std::move(fi));
         }
         cur_pkg = saved_pkg;
@@ -983,6 +987,7 @@ struct FnEmit {
              std::to_string(meta) + ")");
         return r;
     }
+    // mask bits land in meta bits 3..60; 61-63 belong to the cycle collector
     static long long fixed_meta(long long mask) { return 1 | (mask << 3); }
     void store_at(const std::string& base, int offset, const std::string& val, Ty* t) {
         std::string p = reg();
@@ -3213,13 +3218,23 @@ std::string CodeGen::generate() {
 }
 
 const char* CodeGen::runtime_c() {
-    return R"RT(// beans native runtime v3 — reference-counted heap.
+    return R"RT(// beans native runtime — reference-counted heap + cycle collector.
 // Every heap value has a 16-byte header just before its payload:
 //   { atomic long long rc, long long meta }
-// meta low 3 bits = kind, upper bits = per-kind payload:
+// meta bits 0-2 = kind, bits 3-60 = per-kind shape payload:
 //   0 leaf | 1 fixed (bitmask of pointer slots) | 2 list (elem_ptr)
 //   3 map (key_ptr | val_ptr<<1) | 4 chan (elem_ptr) | 5 mutex (inner_ptr)
+// meta bits 61-62 = collector color, bit 63 = in the root buffer.
 // String constants carry an immortal header emitted by the compiler.
+//
+// Cycles: plain RC can't free A<->B. The collector is Bacon-Rajan trial
+// deletion (Nim's ORC family): a decrement that doesn't reach zero parks the
+// object as a possible cycle root; a collection trial-deletes each root's
+// subgraph, restores whatever still has external counts, frees the rest.
+// It only runs when no worker threads are live (checked in beans_alloc and
+// at exit), so the mutator is exactly one thread: ourselves, between
+// statements. Everything is iterative — a million-node ring must not
+// overflow the C stack.
 #include <math.h>
 #include <pthread.h>
 #include <stdio.h>
@@ -3228,14 +3243,33 @@ const char* CodeGen::runtime_c() {
 
 #define BEANS_IMMORTAL (1LL << 62)
 
+// meta layout
+#define CC_SHAPE ((1LL << 61) - 1)
+#define CC_COLOR (3LL << 61)
+#define CC_BLACK 0LL
+#define CC_GRAY (1LL << 61)
+#define CC_WHITE (2LL << 61)
+#define CC_PURPLE (3LL << 61)
+#define CC_BUF ((long long)(1ULL << 63))
+
 typedef struct {
     _Atomic long long rc;
     long long meta;
 } BHead;
 
 static BHead* head_of(void* p) { return (BHead*)((char*)p - 16); }
+static long long cc_color(BHead* h) { return h->meta & CC_COLOR; }
+static void cc_set_color(BHead* h, long long c) { h->meta = (h->meta & ~CC_COLOR) | c; }
+
+static _Atomic long long cc_threads;  // live worker threads; collect only at 0
+static _Atomic int cc_pending;
+static int cc_collecting;
+static void cc_collect(void);
 
 void* beans_alloc(long long size, long long meta) {
+    // allocation is the one safe point: never inside a release cascade,
+    // and every stored reference is already counted
+    if (cc_pending && !cc_collecting && cc_threads == 0) cc_collect();
     BHead* h = calloc(1, 16 + (size_t)size);
     h->rc = 1;
     h->meta = meta;
@@ -3271,38 +3305,75 @@ typedef struct {
     long long inner;
 } BMutex;
 
-static void destroy(void* p, long long meta) {
+// one shape-walker for destruction and all collector phases
+static void cc_walk(void* p, long long meta, void (*fn)(void*, void*), void* ctx) {
     long long kind = meta & 7;
-    long long extra = meta >> 3;
-    if (kind == 1) { // fixed: release marked 8-byte slots
-        for (int i = 0; i < 60 && (extra >> i); i++) {
-            if ((extra >> i) & 1) beans_release(*(void**)((char*)p + 8 * i));
+    long long extra = (meta & CC_SHAPE) >> 3;
+    if (kind == 1) { // fixed: marked 8-byte slots
+        for (int i = 0; i < 58 && (extra >> i); i++) {
+            if ((extra >> i) & 1) {
+                void* c = *(void**)((char*)p + 8 * i);
+                if (c) fn(c, ctx);
+            }
         }
     } else if (kind == 2) {
         BList* l = p;
         if (extra & 1) {
-            for (long long i = 0; i < l->len; i++) beans_release((void*)l->data[i]);
+            for (long long i = 0; i < l->len; i++) {
+                if (l->data[i]) fn((void*)l->data[i], ctx);
+            }
         }
-        free(l->data);
     } else if (kind == 3) {
         BMap* m = p;
         for (long long i = 0; i < m->len; i++) {
-            if (extra & 1) beans_release((void*)m->data[i * 2]);
-            if (extra & 2) beans_release((void*)m->data[i * 2 + 1]);
+            if ((extra & 1) && m->data[i * 2]) fn((void*)m->data[i * 2], ctx);
+            if ((extra & 2) && m->data[i * 2 + 1]) fn((void*)m->data[i * 2 + 1], ctx);
         }
-        free(m->data);
     } else if (kind == 4) {
         BChan* c = p;
         if (extra & 1) {
             for (long long i = 0; i < c->count; i++) {
-                beans_release((void*)c->q[(c->head + i) % c->cap]);
+                long long v = c->q[(c->head + i) % c->cap];
+                if (v) fn((void*)v, ctx);
             }
         }
-        free(c->q);
     } else if (kind == 5) {
         BMutex* mu = p;
-        if (extra & 1) beans_release((void*)mu->inner);
+        if ((extra & 1) && mu->inner) fn((void*)mu->inner, ctx);
     }
+}
+
+static void cc_visit_release(void* c, void* ctx) { (void)ctx; beans_release(c); }
+static void cc_release_children(void* p, long long meta) {
+    cc_walk(p, meta, cc_visit_release, NULL);
+}
+// free the box and its side allocations WITHOUT touching child refs
+static void cc_free_shell(void* p, long long meta) {
+    long long kind = meta & 7;
+    if (kind == 2) free(((BList*)p)->data);
+    else if (kind == 3) free(((BMap*)p)->data);
+    else if (kind == 4) free(((BChan*)p)->q);
+    free(head_of(p));
+}
+
+// ---- possible-root buffer ----
+static void** cc_roots;
+static long long cc_len, cc_cap;
+static long long cc_threshold = 256;
+static pthread_mutex_t cc_mu = PTHREAD_MUTEX_INITIALIZER;
+
+static void cc_possible_root(void* p) {
+    BHead* h = head_of(p);
+    long long old = __atomic_fetch_or(&h->meta, CC_PURPLE | CC_BUF, __ATOMIC_RELAXED);
+    if (old & CC_BUF) return; // already parked
+    pthread_mutex_lock(&cc_mu);
+    if (cc_len == cc_cap) {
+        cc_cap = cc_cap ? cc_cap * 2 : 1024;
+        cc_roots = realloc(cc_roots, (size_t)cc_cap * sizeof(void*));
+    }
+    cc_roots[cc_len++] = p;
+    if (cc_len >= cc_threshold) cc_pending = 1;
+    pthread_mutex_unlock(&cc_mu);
 }
 
 void beans_release(void* p) {
@@ -3310,10 +3381,157 @@ void beans_release(void* p) {
     BHead* h = head_of(p);
     if (h->rc >= BEANS_IMMORTAL) return;
     if (--h->rc == 0) {
-        destroy(p, h->meta);
-        free(h);
+        long long meta = h->meta;
+        cc_release_children(p, meta);
+        if (meta & CC_BUF) {
+            // parked — the buffer still points here, so the collector frees
+            // the shell later; mark black so it knows this is a dead husk
+            __atomic_and_fetch(&h->meta, ~CC_COLOR, __ATOMIC_RELAXED);
+        } else {
+            cc_free_shell(p, meta);
+        }
+    } else {
+        // could this shape sit on a cycle? leaves and pointer-free
+        // containers never can — keeps the hot path clean
+        long long meta = h->meta;
+        long long kind = meta & 7;
+        int cyclic = kind == 1 || (kind == 3 && (meta & (3LL << 3))) ||
+                     ((kind == 2 || kind == 4 || kind == 5) && (meta & (1LL << 3)));
+        if (cyclic) cc_possible_root(p);
     }
 }
+
+// ---- the collector (single mutator: us) ----
+typedef struct {
+    void** v;
+    long long len, cap;
+} CCStack;
+static void cc_push(CCStack* s, void* p) {
+    if (s->len == s->cap) {
+        s->cap = s->cap ? s->cap * 2 : 4096;
+        s->v = realloc(s->v, (size_t)s->cap * sizeof(void*));
+    }
+    s->v[s->len++] = p;
+}
+
+static void cc_visit_dec_push(void* c, void* ctx) {
+    BHead* h = head_of(c);
+    if (h->rc >= BEANS_IMMORTAL) return;
+    h->rc -= 1; // trial deletion: one decrement per internal edge
+    cc_push(ctx, c);
+}
+static void cc_mark_gray(void* root, CCStack* st) {
+    cc_push(st, root);
+    while (st->len) {
+        void* p = st->v[--st->len];
+        BHead* h = head_of(p);
+        if (cc_color(h) == CC_GRAY) continue;
+        cc_set_color(h, CC_GRAY);
+        cc_walk(p, h->meta, cc_visit_dec_push, st);
+    }
+}
+
+static void cc_visit_inc_push(void* c, void* ctx) {
+    BHead* h = head_of(c);
+    if (h->rc >= BEANS_IMMORTAL) return;
+    h->rc += 1; // undo the trial deletion along this edge
+    if (cc_color(h) != CC_BLACK) {
+        cc_set_color(h, CC_BLACK);
+        cc_push(ctx, c);
+    }
+}
+static void cc_scan_black(void* root, CCStack* st) {
+    cc_set_color(head_of(root), CC_BLACK);
+    cc_push(st, root);
+    while (st->len) {
+        void* p = st->v[--st->len];
+        cc_walk(p, head_of(p)->meta, cc_visit_inc_push, st);
+    }
+}
+
+static void cc_visit_push(void* c, void* ctx) {
+    BHead* h = head_of(c);
+    if (h->rc >= BEANS_IMMORTAL) return;
+    cc_push(ctx, c);
+}
+static void cc_scan(void* root, CCStack* st, CCStack* aux) {
+    cc_push(st, root);
+    while (st->len) {
+        void* p = st->v[--st->len];
+        BHead* h = head_of(p);
+        if (cc_color(h) != CC_GRAY) continue;
+        if (h->rc > 0) {
+            cc_scan_black(p, aux); // externally referenced — restore it all
+        } else {
+            cc_set_color(h, CC_WHITE);
+            cc_walk(p, h->meta, cc_visit_push, st);
+        }
+    }
+}
+
+static void cc_collect_white(void* root, CCStack* st, CCStack* dead) {
+    cc_push(st, root);
+    while (st->len) {
+        void* p = st->v[--st->len];
+        BHead* h = head_of(p);
+        if (cc_color(h) != CC_WHITE || (h->meta & CC_BUF)) continue;
+        cc_set_color(h, CC_BLACK); // visited; prevents duplicate frees
+        cc_walk(p, h->meta, cc_visit_push, st);
+        cc_push(dead, p);
+    }
+}
+
+static void cc_collect(void) {
+    if (cc_collecting) return;
+    cc_collecting = 1;
+    pthread_mutex_lock(&cc_mu);
+
+    // keep only live purple candidates; zombies (released while parked)
+    // just need their shells freed, everything else drops out
+    long long n = 0;
+    for (long long i = 0; i < cc_len; i++) {
+        void* p = cc_roots[i];
+        BHead* h = head_of(p);
+        if (cc_color(h) == CC_PURPLE && h->rc > 0) {
+            cc_roots[n++] = p;
+        } else {
+            __atomic_and_fetch(&h->meta, ~CC_BUF, __ATOMIC_RELAXED);
+            if (h->rc == 0) cc_free_shell(p, h->meta);
+        }
+    }
+    cc_len = n;
+
+    CCStack st = {0, 0, 0}, aux = {0, 0, 0}, dead = {0, 0, 0};
+    for (long long i = 0; i < cc_len; i++) cc_mark_gray(cc_roots[i], &st);
+    for (long long i = 0; i < cc_len; i++) cc_scan(cc_roots[i], &st, &aux);
+    for (long long i = 0; i < cc_len; i++) {
+        BHead* h = head_of(cc_roots[i]);
+        __atomic_and_fetch(&h->meta, ~CC_BUF, __ATOMIC_RELAXED);
+        cc_collect_white(cc_roots[i], &st, &dead);
+    }
+    cc_len = 0;
+    // nothing was freed while walking, so no stale pointer was ever read;
+    // now the whole white set goes at once
+    for (long long i = 0; i < dead.len; i++) {
+        cc_free_shell(dead.v[i], head_of(dead.v[i])->meta);
+    }
+    // unproductive collections back off — a big live cyclic-looking graph
+    // shouldn't be re-walked every few allocations
+    cc_threshold = dead.len ? 256
+                            : (cc_threshold * 2 > (1LL << 20) ? (1LL << 20)
+                                                              : cc_threshold * 2);
+    free(st.v);
+    free(aux.v);
+    free(dead.v);
+    cc_pending = 0;
+    pthread_mutex_unlock(&cc_mu);
+    cc_collecting = 0;
+}
+
+static void cc_at_exit(void) {
+    if (cc_threads == 0) cc_collect();
+}
+__attribute__((constructor)) static void cc_setup(void) { atexit(cc_at_exit); }
 
 void beans_panic(const char* msg, long long line, long long col) {
     fprintf(stderr, "runtime panic at %lld:%lld: %s\n", line, col, msg);
@@ -3448,7 +3666,7 @@ static long long map_find(BMap* m, long long key, long long kind) {
 void beans_map_set(BMap* m, long long key, long long val, long long kind) {
     long long i = map_find(m, key, kind);
     if (i >= 0) {
-        long long flags = head_of(m)->meta >> 3;
+        long long flags = (head_of(m)->meta & CC_SHAPE) >> 3;
         if (flags & 1) beans_release((void*)key); // duplicate key not stored
         if (flags & 2) beans_release((void*)m->data[i * 2 + 1]);
         m->data[i * 2 + 1] = val;
@@ -3482,6 +3700,8 @@ static void* thread_main(void* arg) {
     t->result = t->thunk(t->env);
     beans_release(t->env);
     beans_release(t); // the running thread's own ref on the handle
+    // last heap touch is done — the cycle collector may run again
+    cc_threads -= 1;
     return NULL;
 }
 BThread* beans_thread_spawn(void* thunk, void* env) {
@@ -3489,6 +3709,7 @@ BThread* beans_thread_spawn(void* thunk, void* env) {
     t->thunk = (long long (*)(void*))thunk;
     t->env = env; // ownership of the closure box moves to the thread
     beans_retain(t); // one ref for the handle, one for the running thread
+    cc_threads += 1;
     pthread_create(&t->th, NULL, thread_main, t);
     return t;
 }

@@ -123,8 +123,20 @@ refs. When editing `FnEmit`:
 - **Release branch-local temporaries inside their own branch.** LLVM's verifier rejects the IR
   otherwise, and it is right — the value is not live on the other path.
 - **A captured parameter needs a retain going into its heap cell**, or it is over-released.
-- Known gaps, documented on purpose: reference cycles leak (a Nim-style collector is the eventual
-  answer), and a `?` early return can hold mid-statement temporaries slightly longer than needed.
+- Known gap, documented on purpose: a `?` early return can hold mid-statement temporaries slightly
+  longer than needed.
+
+Reference cycles are collected by trial deletion (Bacon–Rajan) in the C runtime, all `cc_`-prefixed:
+meta bits 61-62 are the color, bit 63 the in-buffer flag, so **shape reads must mask with `CC_SHAPE`**
+(a raw `meta >> 3` sign-extends garbage once a color is set). A dec-to-nonzero on a pointer-bearing
+shape parks the object in `cc_roots`; `cc_collect()` runs from `beans_alloc` (never inside a release
+cascade — a mid-destroy object would be freed under the walker) and only when `cc_threads == 0`
+(worker threads are mutators the collector cannot pause), plus an `atexit` sweep. All phases are
+iterative over an explicit stack, whites are batch-freed after all walking so no stale pointer is
+ever read, and `destroy` was split into `cc_release_children` + `cc_free_shell` so a parked object
+released to rc 0 becomes a black husk whose shell the collector frees later. `examples/cycles.b`
+is the diff-test for all of this; pointer-slot masks stop at meta bit 60 (≈55 fields), enforced in
+`request_impl`.
 
 ## Conventions in this codebase
 

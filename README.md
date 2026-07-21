@@ -16,7 +16,7 @@ A small OOP language: Java-style objects, Go-sized grammar, C++-level access, bu
 | module loader | done (v5) — `beans.mod`, multi-file packages, git imports |
 | type checker | done (v2) — whole-program, package-aware, `pub` enforced |
 | interpreter | done (v2) — `beansc run` |
-| LLVM native backend | v5 — whole language native + reference-counted memory |
+| LLVM native backend | v6 — whole language native, RC + cycle collector |
 
 ## Build
 
@@ -39,9 +39,13 @@ The native backend emits textual LLVM IR and hands it to clang — no LLVM libra
 
 ## Memory
 
-Native binaries use automatic reference counting — no GC, no pauses. Every heap value carries a 16-byte header (atomic count + shape info); the compiler emits retains and releases at ownership boundaries and a generic destructor walks nested structures. String constants are immortal. Verified with Apple's `leaks` tool: **0 leaked bytes** on every test program, and a 1M-iteration allocation stress test (object + interpolated strings + decimal math per pass) runs in **1.4MB flat**.
+Native binaries use automatic reference counting **plus a cycle collector** — no tracing GC, no pauses on the straight-line path. Every heap value carries a 16-byte header (atomic count + shape info); the compiler emits retains and releases at ownership boundaries and a generic destructor walks nested structures. String constants are immortal.
 
-The design keeps RC off hot paths: function arguments, loop variables, and reads borrow instead of retaining, so the benchmark numbers above are measured *with* RC enabled. Known limits: reference cycles leak (cycle detection later, Nim-style), and a `?` early-return can hold mid-statement temporaries a little longer.
+Reference cycles (`a.next = some(b); b.next = some(a)`) are caught by trial deletion (Bacon–Rajan, the Nim ORC family): a decrement that doesn't hit zero parks the object as a possible cycle root; when enough roots pile up, the collector trial-deletes each root's subgraph, restores anything still externally referenced, and frees the rest. It runs only between statements when no worker threads are live, and once more at exit. All walks are iterative — a 300k-node dropped ring is fine.
+
+Verified with Apple's `leaks` tool: **0 leaked bytes** on every test program — including [examples/cycles.b](examples/cycles.b), which drops 400k cycle pairs, a self-cycle, a 300k ring, and a closure that captures its own cell. **2M dropped cycle pairs run in 1.4MB flat**, same as the acyclic stress test, and live rings survive collections untouched.
+
+The design keeps RC off hot paths: function arguments, loop variables, and reads borrow instead of retaining, so the benchmark numbers above are measured *with* RC and the collector enabled. Known limits: collection is deferred while worker threads run (a program that churns cycles forever while never letting its threads drain will grow until they do), and a `?` early-return can hold mid-statement temporaries a little longer.
 
 ## Benchmarks (Apple Silicon, clang 21 -O2 vs go 1.26.4)
 
