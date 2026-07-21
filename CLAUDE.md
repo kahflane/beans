@@ -94,6 +94,16 @@ smaller `Ty` inside `codegen.cpp` for lowering. They are separate structures; a 
 to both. Likewise `Decimal` in `value.h` (used by the interpreter *and* for compile-time constant
 folding in codegen) is mirrored by `BDec` in the C runtime — the two must compute identically.
 
+### Adding a builtin method
+
+Monomorphic builtins (string methods, the growing stdlib) live in the registry
+(`src/builtins.h/.cpp`): one table row carries the signature, the C runtime symbol, and the
+interpreter body. The checker types from the row, codegen auto-declares the symbol and emits the
+call — fallible rows return the 16-byte `BRes {val, msg}` ABI (msg null = ok; both sides return it
+in registers, which is why it must stay ≤ 16 bytes) and get boxed into `Result` generically. Adding
+one builtin = one row + one C function in `runtime_c()` + the row's `run` fn. Generic containers
+(List/Map/Option/...) stay hand-written in all three stages.
+
 ### Inside codegen.cpp
 
 The single largest file. Structure, top to bottom:

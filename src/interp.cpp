@@ -6,6 +6,7 @@
 #include <cstring>
 #include <utility>
 
+#include "builtins.h"
 #include "lexer.h"
 #include "parser.h"
 
@@ -1152,34 +1153,10 @@ Value Interp::eval_builtin_method(const Expr* e, Value& recv, const std::string&
                 return Value::of_dec(recv.dec.round_to(static_cast<int32_t>(args[0].i)));
             break;
         case Value::K::string_: {
-            const std::string& s = *recv.s;
-            if (name == "len") return Value::of_int(static_cast<int64_t>(s.size()));
-            if (name == "to_int") {
-                const char* p = s.c_str();
-                char* end = nullptr;
-                long long v = std::strtoll(p, &end, 10);
-                Value x;
-                x.k = Value::K::enum_v;
-                x.en = std::make_shared<EnumVal>();
-                x.en->enum_name = "Result";
-                if (end == p || *end != '\0') {
-                    x.en->variant = "err";
-                    x.en->payload.push_back(make_err("can't read '" + s + "' as int"));
-                } else {
-                    x.en->variant = "ok";
-                    x.en->payload.push_back(Value::of_int(v));
-                }
-                return x;
+            // string methods live in the builtin registry (builtins.cpp)
+            for (const BuiltinMethod& b : builtin_methods()) {
+                if (b.recv == BT::str && name == b.name) return b.run(recv, args);
             }
-            if (name == "last") {
-                int64_t n = args[0].i;
-                if (n < 0) n = 0;
-                size_t take = static_cast<size_t>(n) > s.size() ? s.size()
-                                                                : static_cast<size_t>(n);
-                return Value::of_str(s.substr(s.size() - take));
-            }
-            if (name == "contains")
-                return Value::of_bool(s.find(*args[0].s) != std::string::npos);
             break;
         }
         case Value::K::list: {

@@ -1,8 +1,8 @@
 CXX      := clang++
 CXXFLAGS := -std=c++20 -Wall -Wextra -O2
 
-SRC := src/token.cpp src/lexer.cpp src/parser.cpp src/ast_print.cpp src/loader.cpp src/checker.cpp src/codegen.cpp src/interp.cpp src/main.cpp
-HDR := src/token.h src/lexer.h src/ast.h src/parser.h src/types.h src/loader.h src/checker.h src/value.h src/interp.h src/codegen.h
+SRC := src/token.cpp src/lexer.cpp src/parser.cpp src/ast_print.cpp src/loader.cpp src/checker.cpp src/builtins.cpp src/codegen.cpp src/interp.cpp src/main.cpp
+HDR := src/token.h src/lexer.h src/ast.h src/parser.h src/types.h src/loader.h src/checker.h src/value.h src/builtins.h src/interp.h src/codegen.h
 BIN := build/beansc
 
 $(BIN): $(SRC) $(HDR)

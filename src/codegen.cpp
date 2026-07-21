@@ -8,6 +8,7 @@
 #include <set>
 #include <utility>
 
+#include "builtins.h"
 #include "lexer.h"
 #include "parser.h"
 #include "value.h" // for Decimal::parse at compile time
@@ -437,9 +438,11 @@ struct CG2 {
     // the value handed around points 16 bytes past the header
     std::string intern_string(const std::string& bytes) {
         std::string name = "@.str" + std::to_string(next_str++);
+        // meta shape bits carry the byte length, same as heap strings
         globals += name + " = private unnamed_addr constant {i64, i64, [" +
                    std::to_string(bytes.size() + 1) +
-                   " x i8]} {i64 4611686018427387904, i64 0, [" +
+                   " x i8]} {i64 4611686018427387904, i64 " +
+                   std::to_string(static_cast<long long>(bytes.size()) << 3) + ", [" +
                    std::to_string(bytes.size() + 1) + " x i8] c\"";
         for (unsigned char c : bytes) {
             if (c >= 0x20 && c <= 0x7E && c != '"' && c != '\\') {
@@ -1147,6 +1150,35 @@ struct FnEmit {
             case Expr::Kind::index: {
                 EV obj = eval(e->object.get());
                 EV idx = eval(e->index_expr.get());
+                if (obj.second->k == Ty::map_) {
+                    // map read: the value, or a panic naming the missing key —
+                    // message byte-identical to the interpreter's
+                    Ty* K = obj.second->args[0];
+                    Ty* V = obj.second->args[1];
+                    int kind = K->k == Ty::str_ ? 1 : 0;
+                    std::string okf = fresh_slot("mgok", cg.t_i64());
+                    std::string raw = reg();
+                    line(raw + " = call i64 @beans_map_get(ptr " + obj.first + ", i64 " +
+                         to_slot(idx) + ", i64 " + std::to_string(kind) + ", ptr " + okf +
+                         ")");
+                    std::string okv = reg(), c = reg();
+                    line(okv + " = load i64, ptr " + okf);
+                    line(c + " = icmp ne i64 " + okv + ", 0");
+                    std::string okb = bb(), badb = bb();
+                    line("br i1 " + c + ", label %" + okb + ", label %" + badb);
+                    label(badb);
+                    std::string ks = to_str(idx, e->index_expr.get());
+                    consume(ks); // branch-local, and the panic never returns
+                    std::string m = reg();
+                    line(m + " = call ptr @beans_concat(ptr " +
+                         cg.intern_string("map key not found: ") + ", ptr " + ks + ")");
+                    line("call void @beans_panic(ptr " + m + ", i64 " +
+                         std::to_string(e->line) + ", i64 " + std::to_string(e->col) +
+                         ")");
+                    line("unreachable");
+                    label(okb);
+                    return {from_slot(raw, V), V}; // borrowed from the map, like lists
+                }
                 if (obj.second->k != Ty::list_) {
                     err(e, "indexing this");
                     return {"0", cg.t_i64()};
@@ -2068,6 +2100,87 @@ struct FnEmit {
         return o;
     }
 
+    // table-driven builtin method (builtins.cpp): eval args per signature,
+    // call the C symbol, box fallible returns from the BRes {val, msg} ABI —
+    // 16 bytes so both C and IR return it in registers; msg null = ok
+    Ty* bty(BT t) {
+        switch (t) {
+            case BT::f64: return cg.t_f64();
+            case BT::dec: return cg.t_dec();
+            case BT::boolean: return cg.t_bool();
+            case BT::str: return cg.t_str();
+            default: return cg.t_i64();
+        }
+    }
+    EV emit_builtin(const BuiltinMethod& b, const EV& recv, const Expr* e) {
+        std::string args = "ptr " + recv.first;
+        for (size_t i = 0; i < b.params.size() && i < e->args.size(); i++) {
+            Ty* pt = bty(b.params[i]);
+            EV a = eval(e->args[i].get(), pt);
+            args += ", " + std::string(ll(pt)) + " " + a.first;
+        }
+        switch (b.ret) {
+            case BT::unit:
+                line("call void @" + std::string(b.sym) + "(" + args + ")");
+                return {"", cg.t_unit()};
+            case BT::boolean: {
+                std::string c = reg(), r = reg();
+                line(c + " = call i64 @" + std::string(b.sym) + "(" + args + ")");
+                line(r + " = icmp ne i64 " + c + ", 0");
+                return {r, cg.t_bool()};
+            }
+            case BT::res_i64:
+            case BT::res_f64:
+            case BT::res_dec:
+            case BT::res_str: {
+                Ty* ok_t = b.ret == BT::res_f64   ? cg.t_f64()
+                           : b.ret == BT::res_dec ? cg.t_dec()
+                           : b.ret == BT::res_str ? cg.t_str()
+                                                  : cg.t_i64();
+                std::string sr = reg();
+                line(sr + " = call {i64, ptr} @" + std::string(b.sym) + "(" + args + ")");
+                std::string raw = reg(), msg = reg(), c = reg();
+                line(raw + " = extractvalue {i64, ptr} " + sr + ", 0");
+                line(msg + " = extractvalue {i64, ptr} " + sr + ", 1");
+                line(c + " = icmp eq ptr " + msg + ", null");
+                std::string okb = bb(), errb = bb(), endb = bb();
+                std::string slot = fresh_slot("res", cg.t_str());
+                line("br i1 " + c + ", label %" + okb + ", label %" + errb);
+                label(okb);
+                size_t okmark = temps.size();
+                std::string okv = from_slot(raw, ok_t);
+                if (is_rc(ok_t)) own(okv, ok_t); // runtime hands over its ref
+                std::string ob = box_enum(0, {{okv, ok_t}});
+                consume(ob);
+                line("store ptr " + ob + ", ptr " + slot);
+                flush_temps(okmark);
+                line("br label %" + endb);
+                label(errb);
+                size_t ebmark = temps.size();
+                own(msg, cg.t_str()); // runtime hands over the message ref
+                std::string eo = make_error(msg);
+                std::string eb = box_enum(1, {{eo, cg.t_error()}});
+                consume(eb);
+                line("store ptr " + eb + ", ptr " + slot);
+                flush_temps(ebmark);
+                line("br label %" + endb);
+                label(endb);
+                std::string r = reg();
+                line(r + " = load ptr, ptr " + slot);
+                own(r, cg.t_result(ok_t, cg.t_error()));
+                return {r, cg.t_result(ok_t, cg.t_error())};
+            }
+            default: {
+                Ty* ret = bty(b.ret);
+                std::string r = reg();
+                line(r + " = call " + std::string(ll(ret)) + " @" + b.sym + "(" + args +
+                     ")");
+                if (is_rc(ret)) own(r, ret);
+                return {r, ret};
+            }
+        }
+    }
+
     EV method_call(const Expr* e, EV recv, const std::string& mname) {
         Ty* rt_ = recv.second;
 
@@ -2207,64 +2320,10 @@ struct FnEmit {
                 }
                 break;
             case Ty::str_: {
-                if (mname == "len") {
-                    std::string r = reg();
-                    line(r + " = call i64 @beans_str_len(ptr " + recv.first + ")");
-                    return {r, cg.t_i64()};
-                }
-                if (mname == "last") {
-                    EV n = eval(e->args[0].get());
-                    std::string r = reg();
-                    line(r + " = call ptr @beans_str_last(ptr " + recv.first + ", i64 " +
-                         n.first + ")");
-                    own(r, cg.t_str());
-                    return {r, cg.t_str()};
-                }
-                if (mname == "contains") {
-                    EV n = eval(e->args[0].get());
-                    std::string c = reg(), r = reg();
-                    line(c + " = call i64 @beans_str_contains(ptr " + recv.first +
-                         ", ptr " + n.first + ")");
-                    line(r + " = icmp ne i64 " + c + ", 0");
-                    return {r, cg.t_bool()};
-                }
-                if (mname == "to_int") {
-                    std::string okp = fresh_slot("okf", cg.t_i64());
-                    std::string v = reg();
-                    line(v + " = call i64 @beans_parse_int(ptr " + recv.first + ", ptr " +
-                         okp + ")");
-                    std::string okv = reg(), c = reg();
-                    line(okv + " = load i64, ptr " + okp);
-                    line(c + " = icmp ne i64 " + okv + ", 0");
-                    std::string okb = bb(), errb = bb(), endb = bb();
-                    std::string slot = fresh_slot("res", cg.t_str());
-                    line("br i1 " + c + ", label %" + okb + ", label %" + errb);
-                    label(okb);
-                    std::string ob = box_enum(0, {{v, cg.t_i64()}});
-                    consume(ob);
-                    line("store ptr " + ob + ", ptr " + slot);
-                    line("br label %" + endb);
-                    label(errb);
-                    size_t ebmark = temps.size();
-                    // message matches the interpreter exactly
-                    std::string m1 = reg(), m2 = reg();
-                    line(m1 + " = call ptr @beans_concat(ptr " +
-                         cg.intern_string("can't read '") + ", ptr " + recv.first + ")");
-                    own(m1, cg.t_str());
-                    line(m2 + " = call ptr @beans_concat(ptr " + m1 + ", ptr " +
-                         cg.intern_string("' as int") + ")");
-                    own(m2, cg.t_str());
-                    std::string eo = make_error(m2);
-                    std::string eb = box_enum(1, {{eo, cg.t_error()}});
-                    consume(eb);
-                    line("store ptr " + eb + ", ptr " + slot);
-                    flush_temps(ebmark);
-                    line("br label %" + endb);
-                    label(endb);
-                    std::string r = reg();
-                    line(r + " = load ptr, ptr " + slot);
-                    own(r, cg.t_result(cg.t_i64(), cg.t_error()));
-                    return {r, cg.t_result(cg.t_i64(), cg.t_error())};
+                for (const BuiltinMethod& b : builtin_methods()) {
+                    if (b.recv == BT::str && mname == b.name) {
+                        return emit_builtin(b, recv, e);
+                    }
                 }
                 break;
             }
@@ -3219,10 +3278,25 @@ std::string CodeGen::generate() {
     out += "declare void @beans_println(ptr)\n";
     out += "declare void @beans_print(ptr)\n";
     out += "declare i32 @beans_str_cmp(ptr, ptr)\n";
-    out += "declare i64 @beans_str_len(ptr)\n";
-    out += "declare ptr @beans_str_last(ptr, i64)\n";
-    out += "declare i64 @beans_str_contains(ptr, ptr)\n";
-    out += "declare i64 @beans_parse_int(ptr, ptr)\n";
+    // registry rows declare themselves — one row, one declare, one C symbol
+    for (const BuiltinMethod& b : builtin_methods()) {
+        auto irty = [](BT t) -> const char* {
+            switch (t) {
+                case BT::unit: return "void";
+                case BT::f64: return "double";
+                case BT::dec: return "ptr";
+                case BT::str: return "ptr";
+                case BT::res_i64:
+                case BT::res_f64:
+                case BT::res_dec:
+                case BT::res_str: return "{i64, ptr}";
+                default: return "i64"; // i64, boolean
+            }
+        };
+        out += "declare " + std::string(irty(b.ret)) + " @" + b.sym + "(ptr";
+        for (BT p : b.params) out += std::string(", ") + irty(p);
+        out += ")\n";
+    }
     out += "declare void @beans_panic(ptr, i64, i64)\n";
     out += "declare void @beans_panic_index(i64, i64, i64, i64, i64)\n";
     out += "declare i64 @beans_is_a(i64, i64)\n";
@@ -3694,9 +3768,13 @@ void beans_panic_index(long long i, long long len, long long has_len,
 }
 
 // ---- strings (leaf allocations) ----
+// a string's byte length lives in its meta shape bits (kind 0 uses none of
+// bits 3-60), so len is O(1) and never strlen. Read through beans_slen —
+// masking with CC_SHAPE is mandatory, colors share the word.
+static long long beans_slen(char* s) { return (head_of(s)->meta & CC_SHAPE) >> 3; }
 static char* rc_strdup(const char* s) {
     size_t n = strlen(s);
-    char* r = beans_alloc((long long)n + 1, 0);
+    char* r = beans_alloc((long long)n + 1, (long long)n << 3);
     memcpy(r, s, n + 1);
     return r;
 }
@@ -3712,8 +3790,8 @@ char* beans_from_float(double v) {
 }
 char* beans_from_bool(int v) { return rc_strdup(v ? "true" : "false"); }
 char* beans_concat(char* a, char* b) {
-    size_t la = strlen(a), lb = strlen(b);
-    char* r = beans_alloc((long long)(la + lb + 1), 0);
+    size_t la = (size_t)beans_slen(a), lb = (size_t)beans_slen(b);
+    char* r = beans_alloc((long long)(la + lb + 1), (long long)(la + lb) << 3);
     memcpy(r, a, la);
     memcpy(r + la, b, lb + 1);
     return r;
@@ -3724,19 +3802,34 @@ void beans_println(char* s) {
 }
 void beans_print(char* s) { fputs(s, stdout); }
 int beans_str_cmp(char* a, char* b) { return strcmp(a, b); }
-long long beans_str_len(char* s) { return (long long)strlen(s); }
+long long beans_str_len(char* s) { return beans_slen(s); }
 char* beans_str_last(char* s, long long n) {
-    long long len = (long long)strlen(s);
+    long long len = beans_slen(s);
     if (n < 0) n = 0;
     if (n > len) n = len;
     return rc_strdup(s + (len - n));
 }
 long long beans_str_contains(char* s, char* sub) { return strstr(s, sub) != NULL; }
-long long beans_parse_int(char* s, long long* ok) {
+
+// fallible-builtin ABI: 16 bytes so C and IR both return it in registers.
+// msg null = ok(val); msg set = err — an owned beans string the caller boxes.
+typedef struct {
+    long long val;
+    char* msg;
+} BRes;
+
+BRes beans_str_to_int(char* s) {
     char* end = NULL;
     long long v = strtoll(s, &end, 10);
-    *ok = (end != s && *end == '\0');
-    return v;
+    if (end == s || *end != '\0') {
+        size_t n = strlen(s) + 32;
+        char* b = malloc(n);
+        snprintf(b, n, "can't read '%s' as int", s);
+        char* m = rc_strdup(b);
+        free(b);
+        return (BRes){0, m};
+    }
+    return (BRes){v, NULL};
 }
 long long beans_f64_round(double v) { return llround(v); }
 
@@ -3802,10 +3895,14 @@ BMap* beans_map_new(long long key_ptr, long long val_ptr) {
     m->data = calloc(8, 8);
     return m;
 }
+static int str_eq(char* a, char* b) {
+    long long n = beans_slen(a);
+    return n == beans_slen(b) && memcmp(a, b, (size_t)n) == 0;
+}
 static long long map_find(BMap* m, long long key, long long kind) {
     for (long long i = 0; i < m->len; i++) {
         long long k = m->data[i * 2];
-        if (kind == 1 ? strcmp((char*)k, (char*)key) == 0 : k == key) return i;
+        if (kind == 1 ? str_eq((char*)k, (char*)key) : k == key) return i;
     }
     return -1;
 }

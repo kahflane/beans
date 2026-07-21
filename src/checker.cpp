@@ -3,6 +3,7 @@
 #include <functional>
 #include <utility>
 
+#include "builtins.h"
 #include "lexer.h"
 #include "parser.h"
 
@@ -1329,10 +1330,29 @@ Checker::Member Checker::builtin_member(TypeId recv, const std::string& name) {
         return none;
     }
     if (recv->k == Type::K::string_) {
-        if (name == "len") return method({}, t_int());
-        if (name == "to_int") return method({}, t_result(t_int(), t_error_class()));
-        if (name == "last") return method({t_int()}, t_str());
-        if (name == "contains") return method({t_str()}, t_bool());
+        // string methods come from the builtin registry (builtins.cpp)
+        auto bt_type = [&](BT t) -> TypeId {
+            switch (t) {
+                case BT::unit: return t_unit();
+                case BT::i64: return t_int();
+                case BT::f64: return t_f64();
+                case BT::dec: return t_dec();
+                case BT::boolean: return t_bool();
+                case BT::str: return t_str();
+                case BT::res_i64: return t_result(t_int(), t_error_class());
+                case BT::res_f64: return t_result(t_f64(), t_error_class());
+                case BT::res_dec: return t_result(t_dec(), t_error_class());
+                case BT::res_str: return t_result(t_str(), t_error_class());
+            }
+            return t_poison();
+        };
+        for (const BuiltinMethod& b : builtin_methods()) {
+            if (b.recv == BT::str && name == b.name) {
+                std::vector<TypeId> ps;
+                for (BT p : b.params) ps.push_back(bt_type(p));
+                return method(std::move(ps), bt_type(b.ret));
+            }
+        }
         return none;
     }
     if (recv->k == Type::K::class_) {
