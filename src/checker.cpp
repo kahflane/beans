@@ -394,7 +394,7 @@ void Checker::check_hierarchy(ClassInfo& c) {
     std::map<std::string, bool> inh_concrete_self;
     std::map<std::string, TypeId> inh_sigs;       // iface signatures without bodies
 
-    std::set<std::string> seen = {d->name};
+    std::set<std::string> seen = {d->qualname}; // supers are qualified keys
     std::vector<std::string> work = c.supers;
     for (const std::string& s : c.supers) {
         auto it = classes_.find(s);
@@ -412,7 +412,7 @@ void Checker::check_hierarchy(ClassInfo& c) {
         std::string n = work.back();
         work.pop_back();
         if (!seen.insert(n).second) {
-            if (n == d->name) error_at(d->line, d->col, "inheritance cycle involving '" + n + "'");
+            if (n == d->qualname) error_at(d->line, d->col, "inheritance cycle involving '" + n + "'");
             continue;
         }
         auto it = classes_.find(n);
@@ -1580,9 +1580,10 @@ TypeId Checker::check_call(const Expr* e, TypeId expected) {
             return t_result(ok_t, err_t);
         }
 
-        auto fit = top_fns_.find(name);
-        if (fit != top_fns_.end()) {
-            return call_generic_fn(top_fn_decls_[name], fit->second, "'" + name + "'");
+        std::string fkey = resolve_fn_key(name);
+        if (!fkey.empty()) {
+            callee->resolved = fkey;
+            return call_generic_fn(top_fn_decls_[fkey], top_fns_[fkey], "'" + name + "'");
         }
 
         error_at(e->line, e->col, "unknown function '" + name + "'");
@@ -1848,6 +1849,7 @@ TypeId Checker::check_init(const Expr* e, TypeId expected) {
     // all settable fields: own (with generic subst) plus everything inherited
     std::map<std::string, TypeId> all_fields;
     std::map<std::string, const FieldDecl*> all_field_decls;
+    std::map<std::string, std::string> all_field_owner; // declaring class's key
     {
         std::set<std::string> seen;
         std::vector<const ClassInfo*> work = {&c};
@@ -1855,11 +1857,12 @@ TypeId Checker::check_init(const Expr* e, TypeId expected) {
         while (!work.empty()) {
             const ClassInfo* cc = work.back();
             work.pop_back();
-            if (!seen.insert(cc->decl->name).second) continue;
+            if (!seen.insert(cc->decl->qualname).second) continue;
             for (const auto& [fname, ftype] : cc->fields) {
                 if (!all_fields.count(fname)) {
                     all_fields[fname] = own ? subst(ftype, env) : ftype;
                     all_field_decls[fname] = cc->field_decls.at(fname);
+                    all_field_owner[fname] = cc->decl->qualname;
                 }
             }
             for (const std::string& s : cc->supers) {
@@ -1869,6 +1872,14 @@ TypeId Checker::check_init(const Expr* e, TypeId expected) {
             own = false;
         }
     }
+    // a field is settable here if its declaring class's package wrote it pub
+    // (initializers must not reach private fields another package hid)
+    auto field_visible = [&](const std::string& fname) {
+        const std::string& owner_key = all_field_owner[fname];
+        size_t dot = owner_key.find('.');
+        std::string owner = dot == std::string::npos ? "" : owner_key.substr(0, dot);
+        return owner == cur_pkg_ || all_field_decls[fname]->is_pub;
+    };
 
     std::set<std::string> given;
     for (const InitEntry& en : e->entries) {
@@ -1883,6 +1894,13 @@ TypeId Checker::check_init(const Expr* e, TypeId expected) {
             check_expr(en.value.get(), nullptr);
             continue;
         }
+        if (!field_visible(en.name)) {
+            error_at(e->line, e->col, "field '" + cname + "." + en.name +
+                                          "' isn't pub in package '" +
+                                          all_field_owner[en.name].substr(
+                                              0, all_field_owner[en.name].find('.')) +
+                                          "'");
+        }
         given.insert(en.name);
         TypeId want = fit->second;
         TypeId got = check_expr(en.value.get(), want);
@@ -1894,7 +1912,12 @@ TypeId Checker::check_init(const Expr* e, TypeId expected) {
     }
     for (const auto& [fname, fdecl] : all_field_decls) {
         if (!fdecl->def && !given.count(fname)) {
-            error_at(e->line, e->col, "missing field '" + fname + "' (it has no default)");
+            if (!field_visible(fname)) {
+                error_at(e->line, e->col, "can't build '" + cname + "' here — field '" +
+                                              fname + "' isn't pub and has no default");
+            } else {
+                error_at(e->line, e->col, "missing field '" + fname + "' (it has no default)");
+            }
         }
     }
     return pool_.named(Type::K::class_, cname, std::move(targs));

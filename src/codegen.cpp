@@ -1559,6 +1559,9 @@ struct FnEmit {
             int kind = K->k == Ty::str_ ? 1 : 0;
             EV k = eval(s->target->index_expr.get(), K);
             EV v = eval(s->value.get(), V);
+            // the map owns both refs — storing borrows here corrupted the heap
+            transfer_in(k);
+            transfer_in(v);
             line("call void @beans_map_set(ptr " + obj.first + ", i64 " + to_slot(k) +
                  ", i64 " + to_slot(v) + ", i64 " + std::to_string(kind) + ")");
             return;
@@ -2521,10 +2524,22 @@ struct FnEmit {
     EV eval_match(const Expr* e, Ty* hint) {
         EV subj = eval(e->subject.get());
         std::string endb = bb();
-        Ty* result = hint;
-        bool unit_result = false;
+        // any block arm means statement position (checker-enforced): the whole
+        // match is valueless and expr-arm values die as arm-local temps —
+        // merging some arms into the slot while others flip unit leaked them
+        bool has_block = false;
+        for (const MatchArm& a : e->arms) has_block |= a.is_block;
+        Ty* result = has_block ? nullptr : hint;
+        bool unit_result = has_block;
         std::string slot;
-        if (result && result->k != Ty::unit_) slot = fresh_slot("mat", result);
+        // rc slots start null and are cleared after the merge load: a unit arm
+        // stores nothing, and a re-entered match (loops) must not release the
+        // previous iteration's already-dead pointer
+        auto make_slot = [&] {
+            slot = fresh_slot("mat", result);
+            if (is_rc(result)) entry_inits += "  store ptr null, ptr " + slot + "\n";
+        };
+        if (result && result->k != Ty::unit_) make_slot();
 
         for (size_t ai = 0; ai < e->arms.size(); ai++) {
             const MatchArm& arm = e->arms[ai];
@@ -2555,7 +2570,7 @@ struct FnEmit {
                 if (v.second->k == Ty::unit_) unit_result = true;
                 else {
                     result = v.second;
-                    slot = fresh_slot("mat", result);
+                    make_slot();
                 }
             }
             if (result && !unit_result && v.second->k != Ty::unit_) {
@@ -2572,6 +2587,7 @@ struct FnEmit {
         if (unit_result || !result) return {"", cg.t_unit()};
         std::string r = reg();
         line(r + " = load " + std::string(ll(result)) + ", ptr " + slot);
+        if (is_rc(result)) line("store ptr null, ptr " + slot);
         own(r, result);
         return {r, result};
     }
@@ -3343,10 +3359,6 @@ static void cc_walk(void* p, long long meta, void (*fn)(void*, void*), void* ctx
     }
 }
 
-static void cc_visit_release(void* c, void* ctx) { (void)ctx; beans_release(c); }
-static void cc_release_children(void* p, long long meta) {
-    cc_walk(p, meta, cc_visit_release, NULL);
-}
 // free the box and its side allocations WITHOUT touching child refs
 static void cc_free_shell(void* p, long long meta) {
     long long kind = meta & 7;
@@ -3354,6 +3366,24 @@ static void cc_free_shell(void* p, long long meta) {
     else if (kind == 3) free(((BMap*)p)->data);
     else if (kind == 4) free(((BChan*)p)->q);
     free(head_of(p));
+}
+
+// explicit work stack, shared by release cascades and all collector phases
+typedef struct {
+    void** v;
+    long long len, cap;
+} CCStack;
+static void cc_push(CCStack* s, void* p) {
+    if (s->len == s->cap) {
+        s->cap = s->cap ? s->cap * 2 : 4096;
+        s->v = realloc(s->v, (size_t)s->cap * sizeof(void*));
+    }
+    s->v[s->len++] = p;
+}
+static void cc_visit_push(void* c, void* ctx) {
+    BHead* h = head_of(c);
+    if (h->rc >= BEANS_IMMORTAL) return;
+    cc_push(ctx, c);
 }
 
 // ---- possible-root buffer ----
@@ -3376,43 +3406,46 @@ static void cc_possible_root(void* p) {
     pthread_mutex_unlock(&cc_mu);
 }
 
+// iterative: a dropped million-node chain pushes children on an explicit
+// stack instead of recursing the C stack. The stack stays empty (no malloc)
+// unless a death actually cascades.
 void beans_release(void* p) {
     if (!p) return;
-    BHead* h = head_of(p);
-    if (h->rc >= BEANS_IMMORTAL) return;
-    if (--h->rc == 0) {
-        long long meta = h->meta;
-        cc_release_children(p, meta);
-        if (meta & CC_BUF) {
-            // parked — the buffer still points here, so the collector frees
-            // the shell later; mark black so it knows this is a dead husk
-            __atomic_and_fetch(&h->meta, ~CC_COLOR, __ATOMIC_RELAXED);
-        } else {
-            cc_free_shell(p, meta);
+    CCStack st = {0, 0, 0};
+    void* cur = p;
+    for (;;) {
+        BHead* h = head_of(cur);
+        if (h->rc < BEANS_IMMORTAL) {
+            if (--h->rc == 0) {
+                long long meta = h->meta;
+                cc_walk(cur, meta, cc_visit_push, &st);
+                if (meta & CC_BUF) {
+                    // parked — the buffer still points here, so the collector
+                    // frees the shell later; mark black: this is a dead husk
+                    __atomic_and_fetch(&h->meta, ~CC_COLOR, __ATOMIC_RELAXED);
+                } else {
+                    cc_free_shell(cur, meta);
+                }
+            } else {
+                // could this shape sit on a cycle? leaves, pointer-free
+                // containers, and objects with an empty pointer mask never can
+                // — a cycle member needs an outgoing edge — which keeps
+                // int-field churn off the buffer
+                long long meta = h->meta;
+                long long kind = meta & 7;
+                int cyclic = (kind == 1 && ((meta & CC_SHAPE) >> 3) != 0) ||
+                             (kind == 3 && (meta & (3LL << 3))) ||
+                             ((kind == 2 || kind == 4 || kind == 5) && (meta & (1LL << 3)));
+                if (cyclic) cc_possible_root(cur);
+            }
         }
-    } else {
-        // could this shape sit on a cycle? leaves and pointer-free
-        // containers never can — keeps the hot path clean
-        long long meta = h->meta;
-        long long kind = meta & 7;
-        int cyclic = kind == 1 || (kind == 3 && (meta & (3LL << 3))) ||
-                     ((kind == 2 || kind == 4 || kind == 5) && (meta & (1LL << 3)));
-        if (cyclic) cc_possible_root(p);
+        if (!st.len) break;
+        cur = st.v[--st.len];
     }
+    free(st.v);
 }
 
 // ---- the collector (single mutator: us) ----
-typedef struct {
-    void** v;
-    long long len, cap;
-} CCStack;
-static void cc_push(CCStack* s, void* p) {
-    if (s->len == s->cap) {
-        s->cap = s->cap ? s->cap * 2 : 4096;
-        s->v = realloc(s->v, (size_t)s->cap * sizeof(void*));
-    }
-    s->v[s->len++] = p;
-}
 
 static void cc_visit_dec_push(void* c, void* ctx) {
     BHead* h = head_of(c);
@@ -3449,11 +3482,6 @@ static void cc_scan_black(void* root, CCStack* st) {
     }
 }
 
-static void cc_visit_push(void* c, void* ctx) {
-    BHead* h = head_of(c);
-    if (h->rc >= BEANS_IMMORTAL) return;
-    cc_push(ctx, c);
-}
 static void cc_scan(void* root, CCStack* st, CCStack* aux) {
     cc_push(st, root);
     while (st->len) {
@@ -3488,7 +3516,7 @@ static void cc_collect(void) {
 
     // keep only live purple candidates; zombies (released while parked)
     // just need their shells freed, everything else drops out
-    long long n = 0;
+    long long n = 0, husks = 0;
     for (long long i = 0; i < cc_len; i++) {
         void* p = cc_roots[i];
         BHead* h = head_of(p);
@@ -3496,7 +3524,10 @@ static void cc_collect(void) {
             cc_roots[n++] = p;
         } else {
             __atomic_and_fetch(&h->meta, ~CC_BUF, __ATOMIC_RELAXED);
-            if (h->rc == 0) cc_free_shell(p, h->meta);
+            if (h->rc == 0) {
+                cc_free_shell(p, h->meta);
+                husks += 1;
+            }
         }
     }
     cc_len = n;
@@ -3516,10 +3547,12 @@ static void cc_collect(void) {
         cc_free_shell(dead.v[i], head_of(dead.v[i])->meta);
     }
     // unproductive collections back off — a big live cyclic-looking graph
-    // shouldn't be re-walked every few allocations
-    cc_threshold = dead.len ? 256
-                            : (cc_threshold * 2 > (1LL << 20) ? (1LL << 20)
-                                                              : cc_threshold * 2);
+    // shouldn't be re-walked every few allocations. Husk shells freed in the
+    // filter count as productive: pure husk churn must keep the base cadence,
+    // or dead shells pile up to the threshold cap (~80MB seen at 1M)
+    cc_threshold = dead.len || husks ? 256
+                                     : (cc_threshold * 2 > (1LL << 20) ? (1LL << 20)
+                                                                       : cc_threshold * 2);
     free(st.v);
     free(aux.v);
     free(dead.v);

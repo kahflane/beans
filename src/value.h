@@ -188,8 +188,53 @@ struct Value {
     }
 };
 
-struct ListVal { std::vector<Value> items; };
-struct MapVal { std::vector<std::pair<Value, Value>> entries; };
+// ---- iterative teardown -----------------------------------------------------
+// Dropping a long unique chain (a 400k-node linked list) must not recurse
+// ~Value through the C++ stack. The four container shapes park their
+// chain-capable children here instead of destroying them inline; the
+// outermost destructor drains the pile iteratively. Envs get the same
+// treatment for closure-capture parent chains.
+struct Env;
+struct TeardownPile {
+    std::vector<Value> values;
+    std::vector<std::shared_ptr<Env>> envs;
+    bool draining = false;
+};
+inline thread_local TeardownPile g_teardown;
+inline void drain_teardown(); // defined after Env
+
+// chains only flow through these four kinds — everything else dies inline
+// at bounded depth once the containers are cut
+inline void teardown_park(Value& v) {
+    switch (v.k) {
+        case Value::K::list:
+        case Value::K::map:
+        case Value::K::instance:
+        case Value::K::enum_v:
+            g_teardown.values.push_back(std::move(v));
+            break;
+        default:
+            break;
+    }
+}
+
+struct ListVal {
+    std::vector<Value> items;
+    ~ListVal() {
+        for (Value& v : items) teardown_park(v);
+        drain_teardown();
+    }
+};
+struct MapVal {
+    std::vector<std::pair<Value, Value>> entries;
+    ~MapVal() {
+        for (auto& [k, v] : entries) {
+            teardown_park(k);
+            teardown_park(v);
+        }
+        drain_teardown();
+    }
+};
 
 struct InstanceVal {
     const ClassDecl* cls = nullptr;
@@ -201,12 +246,20 @@ struct InstanceVal {
         }
         return nullptr;
     }
+    ~InstanceVal() {
+        for (auto& [n, v] : fields) teardown_park(v);
+        drain_teardown();
+    }
 };
 
 struct EnumVal {
     std::string enum_name;   // "Option", "Result", or a user enum
     std::string variant;
     std::vector<Value> payload;
+    ~EnumVal() {
+        for (Value& v : payload) teardown_park(v);
+        drain_teardown();
+    }
 };
 
 struct Env;
@@ -262,6 +315,28 @@ struct Env {
     void declare(const std::string& name, Value v) {
         vars.emplace_back(name, std::move(v));
     }
+    ~Env() {
+        if (parent) {
+            g_teardown.envs.push_back(std::move(parent));
+            drain_teardown();
+        }
+    }
 };
+
+inline void drain_teardown() {
+    if (g_teardown.draining) return; // an outer drain is already running
+    g_teardown.draining = true;
+    while (!g_teardown.values.empty() || !g_teardown.envs.empty()) {
+        if (!g_teardown.values.empty()) {
+            Value v = std::move(g_teardown.values.back());
+            g_teardown.values.pop_back();
+            // v dies at scope end; nested containers park, they don't recurse
+        } else {
+            std::shared_ptr<Env> e = std::move(g_teardown.envs.back());
+            g_teardown.envs.pop_back();
+        }
+    }
+    g_teardown.draining = false;
+}
 
 } // namespace beans

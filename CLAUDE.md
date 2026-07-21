@@ -123,6 +123,12 @@ refs. When editing `FnEmit`:
 - **Release branch-local temporaries inside their own branch.** LLVM's verifier rejects the IR
   otherwise, and it is right — the value is not live on the other path.
 - **A captured parameter needs a retain going into its heap cell**, or it is over-released.
+- **Runtime calls that store take ownership** — `beans_map_set` owns key and value; every call site
+  must `transfer_in` both first. A borrowed pointer stored in a container was the one heap-corruption
+  bug this codebase has had.
+- Release cascades are **iterative**: `beans_release` drains an explicit stack (and the interpreter's
+  `~Value` parks children in `TeardownPile`), so a dropped 400k-node chain cannot smash the C stack.
+  `examples/deep.b` is the regression test; keep both paths non-recursive.
 - Known gap, documented on purpose: a `?` early return can hold mid-statement temporaries slightly
   longer than needed.
 

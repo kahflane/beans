@@ -64,6 +64,7 @@ import gitlab.com/tools/csv as csvlib
 
 - Last path segment is the name you use (`http.get(...)`). `as` renames the binding.
 - Cross-package access: `util.some_fn()`, `util.User`, `util.User.new(...)`, `util.color.red` — anything `pub`. Methods of a `pub interface` travel with it (an interface is its method set).
+- `pub` is enforced in initializers too: `util.User { hidden: 1 }` is an error unless `hidden` is `pub`. A class whose non-`pub` field has no default can only be built inside its own package.
 - A git import needs `host/owner/repo`; the repo must carry its own `beans.mod`. First build clones (`--depth 1`, `--branch` if pinned) into `$BEANS_HOME/src` (default `~/.beans/src`) and reuses the cache after.
 - No `beans.mod` above the file = single-file mode: `std.*` and git imports still work, local packages don't.
 - Two packages can't share a final name in one program (`a/json` + `b/json`) — rename one directory. `beans.lock` with exact hashes: later.

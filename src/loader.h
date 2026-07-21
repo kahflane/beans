@@ -34,8 +34,10 @@ public:
 
 private:
     struct ModuleCtx {
-        std::string name; // module name from beans.mod
-        std::string root; // directory that holds beans.mod
+        std::string name;  // module name from beans.mod
+        std::string root;  // directory that holds beans.mod
+        std::string canon; // git modules: host/owner/repo — canonical base for
+                           // their internal imports; empty for the app module
     };
 
     // returns the package's prefix-qualified key, or "" on error

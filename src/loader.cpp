@@ -148,8 +148,8 @@ bool Loader::parse_file(Package& pkg, const std::string& path) {
 }
 
 void Loader::resolve_imports(Package& pkg, const ModuleCtx& ctx) {
-    for (const auto& pf : pkg.files) {
-        for (const ImportDecl& imp : pf->mod.imports) {
+    for (auto& pf : pkg.files) {
+        for (ImportDecl& imp : pf->mod.imports) {
             const std::string& p = imp.path;
             if (p.rfind("std.", 0) == 0) continue; // builtins, no package behind them
 
@@ -166,7 +166,13 @@ void Loader::resolve_imports(Package& pkg, const ModuleCtx& ctx) {
                     if (c == '.') c = '/';
                 }
                 dir += "/" + sub;
-                load_package(p, dir, last_segment(p), ctx, pf->path, imp.line, imp.col);
+                // inside a git checkout, `dep.sub` and the app's
+                // `github.com/x/dep/sub` are the same directory — one canonical
+                // identity, or the loader sees two packages named 'sub'
+                std::string prefix = last_segment(p);
+                std::string key = ctx.canon.empty() ? p : ctx.canon + "/" + sub;
+                imp.path = key; // checker/interp/codegen bind by the canonical path
+                load_package(key, dir, prefix, ctx, pf->path, imp.line, imp.col);
                 continue;
             }
 
@@ -193,6 +199,7 @@ void Loader::resolve_imports(Package& pkg, const ModuleCtx& ctx) {
                 if (ctx_it == remote_ctx_.end()) {
                     ModuleCtx rc;
                     rc.root = checkout;
+                    rc.canon = repo; // its own imports canonicalize onto host/owner/repo
                     if (!read_beans_mod(checkout, rc.name, pf->path, imp.line, imp.col)) continue;
                     ctx_it = remote_ctx_.emplace(checkout, std::move(rc)).first;
                 }
