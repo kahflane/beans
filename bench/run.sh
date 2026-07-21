@@ -11,7 +11,7 @@ ROOT=$PWD
 OUT=build/bench
 mkdir -p "$OUT"
 
-BENCHES="fib loops shapes churn"
+BENCHES="fib loops shapes churn trees maps mandel strings"
 RUNS=3
 
 # time one command, print seconds (best of $RUNS)

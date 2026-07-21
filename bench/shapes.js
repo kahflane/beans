@@ -11,6 +11,7 @@ class Square {
 const shapes = [new Circle(1.5), new Square(2.0)];
 let total = 0;
 for (let i = 0; i < 50_000_000; i++) {
-    for (const s of shapes) total += s.area();
+    // indexed loop: the fast-path idiom for hot JS array walks
+    for (let j = 0; j < shapes.length; j++) total += shapes[j].area();
 }
 console.log(Math.round(total));

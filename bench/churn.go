@@ -5,7 +5,7 @@ import "fmt"
 type P struct{ A, B int64 }
 
 func main() {
-	keep := []*P{}
+	keep := make([]*P, 0, 5000) // 1 in 1000 of 5M survives
 	var sum int64
 	for i := int64(0); i < 5000000; i++ {
 		p := &P{A: i, B: i + 1}
