@@ -13,10 +13,12 @@ struct CGError {
     uint32_t col;
 };
 
-// Native backend v1: emits textual LLVM IR, compiled by clang.
-// Covers the numeric/string/control-flow core of beans — int, float, bool,
-// string (+interpolation), top-level functions, if/for/match-free code.
-// Everything else reports "not in the native backend yet".
+// Native backend: emits textual LLVM IR, compiled by clang.
+// v2 covers classes (vtable dispatch, inheritance, statics, interface
+// defaults), enums + match, Option/Result + ?, decimal, lists, strings with
+// interpolation, and all control flow. Not yet native: closures/fn values,
+// threads, maps, generic functions — those report a clear error and keep
+// working under `beansc run`.
 class CodeGen {
 public:
     explicit CodeGen(const Module& mod);
@@ -29,16 +31,9 @@ public:
     static const char* runtime_c();
 
 private:
-    struct Fn; // per-function emitter (in codegen.cpp)
-
     const Module& mod_;
     std::vector<CGError> errors_;
 
-    std::string globals_;       // string constants
-    int next_str_ = 0;
-
-    friend struct Fn;
-    std::string intern_string(const std::string& bytes);
     void error_at(uint32_t line, uint32_t col, std::string msg);
 };
 
