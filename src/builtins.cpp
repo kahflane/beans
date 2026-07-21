@@ -10,6 +10,8 @@
 
 #include <dirent.h>
 #include <fcntl.h>
+#include <sys/file.h>
+#include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -20,6 +22,10 @@ namespace beans {
 
 FileVal::~FileVal() {
     if (fd >= 0 && !closed) close(fd); // safety net; close() is the real API
+}
+
+MMapVal::~MMapVal() {
+    if (ptr && !closed) munmap(ptr, static_cast<size_t>(len)); // same safety net
 }
 
 namespace {
@@ -594,6 +600,155 @@ Value file_close(uint32_t, uint32_t, Value& recv, std::vector<Value>&) {
     return res_ok(Value::of_bool(true));
 }
 
+// advisory flock — single-writer databases; try_lock's ok(false) means "held
+// by someone else", every other failure is a real error
+Value file_lock(uint32_t, uint32_t, Value& recv, std::vector<Value>&) {
+    if (recv.file->closed) return closed_err();
+    if (flock(recv.file->fd, LOCK_EX) != 0) {
+        return res_err(std::string("lock: ") + strerror(errno), fs_kind_of(errno));
+    }
+    return res_ok(Value::of_bool(true));
+}
+
+Value file_try_lock(uint32_t, uint32_t, Value& recv, std::vector<Value>&) {
+    if (recv.file->closed) return closed_err();
+    if (flock(recv.file->fd, LOCK_EX | LOCK_NB) != 0) {
+        if (errno == EWOULDBLOCK) return res_ok(Value::of_bool(false));
+        return res_err(std::string("try_lock: ") + strerror(errno), fs_kind_of(errno));
+    }
+    return res_ok(Value::of_bool(true));
+}
+
+Value file_unlock(uint32_t, uint32_t, Value& recv, std::vector<Value>&) {
+    if (recv.file->closed) return closed_err();
+    if (flock(recv.file->fd, LOCK_UN) != 0) {
+        return res_err(std::string("unlock: ") + strerror(errno), fs_kind_of(errno));
+    }
+    return res_ok(Value::of_bool(true));
+}
+
+// ---- MMap -------------------------------------------------------------------
+// whole-file shared mapping; the fd is closed right after mapping — the
+// mapping outlives it. get/put/read/write panic on a closed or short map,
+// flush/close report errors as Results like File does.
+
+Value mmap_closed_res() { return res_err("mmap is closed", "closed"); }
+
+Value mmap_len(uint32_t, uint32_t, Value& recv, std::vector<Value>&) {
+    return Value::of_int(recv.mm->len);
+}
+
+Value mmap_get_w(uint32_t line, uint32_t col, Value& recv, std::vector<Value>& args,
+                 const char* what, int64_t w) {
+    MMapVal& m = *recv.mm;
+    if (m.closed) bpanic(line, col, "mmap is closed");
+    int64_t pos = args[0].i;
+    if (pos < 0 || pos + w > m.len) {
+        bpanic(line, col, std::string(what) + " read at " + std::to_string(pos) +
+                              " out of range (len " + std::to_string(m.len) + ")");
+    }
+    uint64_t v = 0;
+    memcpy(&v, static_cast<char*>(m.ptr) + pos, static_cast<size_t>(w));
+    return Value::of_int(static_cast<int64_t>(v));
+}
+
+Value mmap_put_w(uint32_t line, uint32_t col, Value& recv, std::vector<Value>& args,
+                 const char* what, int64_t w) {
+    MMapVal& m = *recv.mm;
+    if (m.closed) bpanic(line, col, "mmap is closed");
+    if (!m.writable) bpanic(line, col, "mmap is read-only");
+    int64_t pos = args[0].i;
+    if (pos < 0 || pos + w > m.len) {
+        bpanic(line, col, std::string(what) + " write at " + std::to_string(pos) +
+                              " out of range (len " + std::to_string(m.len) + ")");
+    }
+    uint64_t v = static_cast<uint64_t>(args[1].i);
+    memcpy(static_cast<char*>(m.ptr) + pos, &v, static_cast<size_t>(w));
+    return recv;
+}
+
+Value mmap_get_u8(uint32_t l, uint32_t c, Value& r, std::vector<Value>& a) { return mmap_get_w(l, c, r, a, "u8", 1); }
+Value mmap_get_u16(uint32_t l, uint32_t c, Value& r, std::vector<Value>& a) { return mmap_get_w(l, c, r, a, "u16", 2); }
+Value mmap_get_u32(uint32_t l, uint32_t c, Value& r, std::vector<Value>& a) { return mmap_get_w(l, c, r, a, "u32", 4); }
+Value mmap_get_u64(uint32_t l, uint32_t c, Value& r, std::vector<Value>& a) { return mmap_get_w(l, c, r, a, "u64", 8); }
+Value mmap_get_i64(uint32_t l, uint32_t c, Value& r, std::vector<Value>& a) { return mmap_get_w(l, c, r, a, "i64", 8); }
+Value mmap_put_u8(uint32_t l, uint32_t c, Value& r, std::vector<Value>& a) { return mmap_put_w(l, c, r, a, "u8", 1); }
+Value mmap_put_u16(uint32_t l, uint32_t c, Value& r, std::vector<Value>& a) { return mmap_put_w(l, c, r, a, "u16", 2); }
+Value mmap_put_u32(uint32_t l, uint32_t c, Value& r, std::vector<Value>& a) { return mmap_put_w(l, c, r, a, "u32", 4); }
+Value mmap_put_u64(uint32_t l, uint32_t c, Value& r, std::vector<Value>& a) { return mmap_put_w(l, c, r, a, "u64", 8); }
+Value mmap_put_i64(uint32_t l, uint32_t c, Value& r, std::vector<Value>& a) { return mmap_put_w(l, c, r, a, "i64", 8); }
+
+Value mmap_read(uint32_t line, uint32_t col, Value& recv, std::vector<Value>& args) {
+    MMapVal& m = *recv.mm;
+    if (m.closed) bpanic(line, col, "mmap is closed");
+    int64_t pos = args[0].i, n = args[1].i;
+    if (pos < 0 || n < 0 || pos + n > m.len) {
+        bpanic(line, col, "read " + std::to_string(n) + " at " + std::to_string(pos) +
+                              " out of range (len " + std::to_string(m.len) + ")");
+    }
+    Value v;
+    v.k = Value::K::bytes;
+    v.bytes = std::make_shared<BytesVal>();
+    const uint8_t* p = static_cast<const uint8_t*>(m.ptr) + pos;
+    v.bytes->data.assign(p, p + n);
+    return v;
+}
+
+Value mmap_write(uint32_t line, uint32_t col, Value& recv, std::vector<Value>& args) {
+    MMapVal& m = *recv.mm;
+    if (m.closed) bpanic(line, col, "mmap is closed");
+    if (!m.writable) bpanic(line, col, "mmap is read-only");
+    auto& d = args[1].bytes->data;
+    int64_t pos = args[0].i;
+    if (pos < 0 || pos + static_cast<int64_t>(d.size()) > m.len) {
+        bpanic(line, col, "write " + std::to_string(d.size()) + " at " +
+                              std::to_string(pos) + " out of range (len " +
+                              std::to_string(m.len) + ")");
+    }
+    memcpy(static_cast<char*>(m.ptr) + pos, d.data(), d.size());
+    return recv;
+}
+
+Value mmap_flush(uint32_t, uint32_t, Value& recv, std::vector<Value>&) {
+    MMapVal& m = *recv.mm;
+    if (m.closed) return mmap_closed_res();
+    if (m.len > 0 && msync(m.ptr, static_cast<size_t>(m.len), MS_SYNC) != 0) {
+        return res_err(std::string("flush: ") + strerror(errno), fs_kind_of(errno));
+    }
+    return res_ok(Value::of_bool(true));
+}
+
+Value mmap_flush_range(uint32_t, uint32_t, Value& recv, std::vector<Value>& args) {
+    MMapVal& m = *recv.mm;
+    if (m.closed) return mmap_closed_res();
+    int64_t pos = args[0].i, n = args[1].i;
+    if (pos < 0 || n < 0 || pos + n > m.len) {
+        return res_err("flush " + std::to_string(n) + " at " + std::to_string(pos) +
+                           " out of range (len " + std::to_string(m.len) + ")",
+                       "io");
+    }
+    if (n > 0) {
+        int64_t page = static_cast<int64_t>(getpagesize());
+        int64_t start = pos - pos % page; // msync wants a page-aligned base
+        if (msync(static_cast<char*>(m.ptr) + start,
+                  static_cast<size_t>(pos + n - start), MS_SYNC) != 0) {
+            return res_err(std::string("flush: ") + strerror(errno),
+                           fs_kind_of(errno));
+        }
+    }
+    return res_ok(Value::of_bool(true));
+}
+
+Value mmap_close(uint32_t, uint32_t, Value& recv, std::vector<Value>&) {
+    MMapVal& m = *recv.mm;
+    if (m.closed) return res_err("mmap already closed", "closed");
+    m.closed = true;
+    if (m.ptr && munmap(m.ptr, static_cast<size_t>(m.len)) != 0) {
+        return res_err(std::string("close: ") + strerror(errno), fs_kind_of(errno));
+    }
+    return res_ok(Value::of_bool(true));
+}
+
 // ---- statics ---------------------------------------------------------------
 
 Value bytes_new(uint32_t line, uint32_t col, std::vector<Value>& args) {
@@ -854,6 +1009,38 @@ Value dir_sync_s(uint32_t, uint32_t, std::vector<Value>& args) {
     return res_ok(Value::of_bool(true));
 }
 
+Value mmap_open_s(uint32_t, uint32_t, std::vector<Value>& args) {
+    const std::string& path = *args[0].s;
+    bool writable = args[1].b;
+    int fd = open(path.c_str(), writable ? O_RDWR : O_RDONLY);
+    if (fd < 0) return fs_err(path, errno);
+    struct stat st;
+    if (fstat(fd, &st) != 0) {
+        int e = errno;
+        close(fd);
+        return fs_err(path, e);
+    }
+    auto mv = std::make_shared<MMapVal>();
+    mv->len = static_cast<int64_t>(st.st_size);
+    mv->writable = writable;
+    if (mv->len > 0) {
+        void* p = mmap(nullptr, static_cast<size_t>(mv->len),
+                       writable ? PROT_READ | PROT_WRITE : PROT_READ, MAP_SHARED,
+                       fd, 0);
+        if (p == MAP_FAILED) {
+            int e = errno;
+            close(fd);
+            return fs_err(path, e);
+        }
+        mv->ptr = p;
+    }
+    close(fd); // the mapping outlives the fd
+    Value v;
+    v.k = Value::K::mmap;
+    v.mm = std::move(mv);
+    return res_ok(std::move(v));
+}
+
 // ---- std.os / std.io --------------------------------------------------------
 
 Value os_args(uint32_t, uint32_t, std::vector<Value>&) {
@@ -911,6 +1098,85 @@ Value io_read_all(uint32_t, uint32_t, std::vector<Value>&) {
     char chunk[65536];
     size_t r;
     while ((r = fread(chunk, 1, sizeof chunk, stdin)) > 0) out.append(chunk, r);
+    return Value::of_str(std::move(out));
+}
+
+// ---- std.fmt ----------------------------------------------------------------
+// pure text rendering; the C runtime mirrors each of these byte for byte
+
+Value fmt_pad_left(uint32_t, uint32_t, std::vector<Value>& args) {
+    const std::string& s = *args[0].s;
+    int64_t w = args[1].i;
+    if (w <= static_cast<int64_t>(s.size())) return args[0];
+    return Value::of_str(std::string(static_cast<size_t>(w) - s.size(), ' ') + s);
+}
+
+Value fmt_pad_right(uint32_t, uint32_t, std::vector<Value>& args) {
+    const std::string& s = *args[0].s;
+    int64_t w = args[1].i;
+    if (w <= static_cast<int64_t>(s.size())) return args[0];
+    return Value::of_str(s + std::string(static_cast<size_t>(w) - s.size(), ' '));
+}
+
+Value fmt_float(uint32_t, uint32_t, std::vector<Value>& args) {
+    int64_t p = args[1].i;
+    if (p < 0) p = 0;
+    if (p > 100) p = 100;
+    char buf[512];
+    std::snprintf(buf, sizeof buf, "%.*f", static_cast<int>(p), args[0].f);
+    return Value::of_str(buf);
+}
+
+// exact places: round (half away from zero) when narrowing, zero-pad the
+// rendered string when widening — no coefficient blow-up on large `places`
+Value fmt_dec(uint32_t, uint32_t, std::vector<Value>& args) {
+    Decimal d = args[0].dec;
+    int64_t p = args[1].i;
+    if (p < 0) p = 0;
+    if (p > 60) p = 60;
+    if (static_cast<int32_t>(p) < d.scale) d = d.round_to(static_cast<int32_t>(p));
+    std::string s = d.to_string();
+    int64_t frac = d.scale;
+    if (p > frac) {
+        if (frac == 0) s += '.';
+        s.append(static_cast<size_t>(p - frac), '0');
+    }
+    return Value::of_str(std::move(s));
+}
+
+Value fmt_hex(uint32_t, uint32_t, std::vector<Value>& args) {
+    char buf[24];
+    std::snprintf(buf, sizeof buf, "%llx", static_cast<unsigned long long>(args[0].i));
+    return Value::of_str(buf);
+}
+
+Value fmt_bin(uint32_t, uint32_t, std::vector<Value>& args) {
+    unsigned long long u = static_cast<unsigned long long>(args[0].i);
+    if (u == 0) return Value::of_str("0");
+    char buf[65];
+    int n = 0;
+    bool seen = false;
+    for (int i = 63; i >= 0; i--) {
+        bool bit = (u >> i) & 1;
+        if (bit) seen = true;
+        if (seen) buf[n++] = bit ? '1' : '0';
+    }
+    return Value::of_str(std::string(buf, static_cast<size_t>(n)));
+}
+
+Value fmt_group(uint32_t, uint32_t, std::vector<Value>& args) {
+    int64_t v = args[0].i;
+    const std::string& sep = *args[1].s;
+    unsigned long long m = v < 0 ? 0ULL - static_cast<unsigned long long>(v)
+                                 : static_cast<unsigned long long>(v);
+    std::string digits = std::to_string(m);
+    std::string out;
+    if (v < 0) out += '-';
+    size_t n = digits.size();
+    for (size_t i = 0; i < n; i++) {
+        if (i && (n - i) % 3 == 0) out += sep;
+        out += digits[i];
+    }
     return Value::of_str(std::move(out));
 }
 
@@ -977,6 +1243,26 @@ const std::vector<BuiltinMethod>& builtin_methods() {
         {BT::file, "truncate", {BT::i64}, BT::res_bool, "beans_file_truncate", false, file_truncate},
         {BT::file, "sync", {}, BT::res_bool, "beans_file_sync", false, file_sync},
         {BT::file, "close", {}, BT::res_bool, "beans_file_close", false, file_close},
+        {BT::file, "lock", {}, BT::res_bool, "beans_file_lock", false, file_lock},
+        {BT::file, "try_lock", {}, BT::res_bool, "beans_file_try_lock", false, file_try_lock},
+        {BT::file, "unlock", {}, BT::res_bool, "beans_file_unlock", false, file_unlock},
+        // MMap — bounds-checked words over a shared whole-file mapping
+        {BT::mmap, "len", {}, BT::i64, "beans_mmap_len", false, mmap_len},
+        {BT::mmap, "get_u8", {BT::i64}, BT::i64, "beans_mmap_get_u8", true, mmap_get_u8},
+        {BT::mmap, "get_u16", {BT::i64}, BT::i64, "beans_mmap_get_u16", true, mmap_get_u16},
+        {BT::mmap, "get_u32", {BT::i64}, BT::i64, "beans_mmap_get_u32", true, mmap_get_u32},
+        {BT::mmap, "get_u64", {BT::i64}, BT::i64, "beans_mmap_get_u64", true, mmap_get_u64},
+        {BT::mmap, "get_i64", {BT::i64}, BT::i64, "beans_mmap_get_i64", true, mmap_get_i64},
+        {BT::mmap, "put_u8", {BT::i64, BT::i64}, BT::self_recv, "beans_mmap_put_u8", true, mmap_put_u8},
+        {BT::mmap, "put_u16", {BT::i64, BT::i64}, BT::self_recv, "beans_mmap_put_u16", true, mmap_put_u16},
+        {BT::mmap, "put_u32", {BT::i64, BT::i64}, BT::self_recv, "beans_mmap_put_u32", true, mmap_put_u32},
+        {BT::mmap, "put_u64", {BT::i64, BT::i64}, BT::self_recv, "beans_mmap_put_u64", true, mmap_put_u64},
+        {BT::mmap, "put_i64", {BT::i64, BT::i64}, BT::self_recv, "beans_mmap_put_i64", true, mmap_put_i64},
+        {BT::mmap, "read", {BT::i64, BT::i64}, BT::bytes, "beans_mmap_read", true, mmap_read},
+        {BT::mmap, "write", {BT::i64, BT::bytes}, BT::self_recv, "beans_mmap_write", true, mmap_write},
+        {BT::mmap, "flush", {}, BT::res_bool, "beans_mmap_flush", false, mmap_flush},
+        {BT::mmap, "flush_range", {BT::i64, BT::i64}, BT::res_bool, "beans_mmap_flush_range", false, mmap_flush_range},
+        {BT::mmap, "close", {}, BT::res_bool, "beans_mmap_close", false, mmap_close},
     };
     return table;
 }
@@ -1005,6 +1291,7 @@ const std::vector<BuiltinStatic>& builtin_statics() {
         {"Dir", "exists", {BT::str}, BT::boolean, "beans_dir_exists", false, dir_exists_s},
         {"Dir", "temp", {}, BT::str, "beans_dir_temp", false, dir_temp_s},
         {"Dir", "sync", {BT::str}, BT::res_bool, "beans_dir_sync", false, dir_sync_s},
+        {"MMap", "open", {BT::str, BT::boolean}, BT::res_mmap, "beans_mmap_open", false, mmap_open_s},
     };
     return table;
 }
@@ -1019,6 +1306,13 @@ const std::vector<BuiltinFn>& builtin_fns() {
         {"std.os", "sleep_ms", {BT::i64}, BT::unit, "beans_os_sleep_ms", false, os_sleep_ms},
         {"std.io", "read_line", {}, BT::opt_str, "beans_io_read_line", false, io_read_line},
         {"std.io", "read_all", {}, BT::str, "beans_io_read_all", false, io_read_all},
+        {"std.fmt", "pad_left", {BT::str, BT::i64}, BT::str, "beans_fmt_pad_left", false, fmt_pad_left},
+        {"std.fmt", "pad_right", {BT::str, BT::i64}, BT::str, "beans_fmt_pad_right", false, fmt_pad_right},
+        {"std.fmt", "float", {BT::f64, BT::i64}, BT::str, "beans_fmt_float", false, fmt_float},
+        {"std.fmt", "dec", {BT::dec, BT::i64}, BT::str, "beans_fmt_dec", false, fmt_dec},
+        {"std.fmt", "hex", {BT::i64}, BT::str, "beans_fmt_hex", false, fmt_hex},
+        {"std.fmt", "bin", {BT::i64}, BT::str, "beans_fmt_bin", false, fmt_bin},
+        {"std.fmt", "group", {BT::i64, BT::str}, BT::str, "beans_fmt_group", false, fmt_group},
     };
     return table;
 }

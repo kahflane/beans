@@ -104,6 +104,7 @@ self, so page-building chains work: `Bytes.new(4096).put_u32(0, root).put_u64(8,
 - `get_u8/u16/u32/u64/i64(pos)` / `put_...(pos, v)` — fixed width, little-endian, panics out of range
 - `slice(from, to)`, `copy_from(src, at)`, `append(other)`, `append_str(s)`
 - `to_string()` — as text, stops at an embedded NUL
+- `==` / `!=` compare by value: length, then contents
 
 ## Files and the OS (v0.5, implemented)
 
@@ -119,6 +120,9 @@ Class-first, like everything builtin. Errors are `Result<T>`; `Error.kind` carri
   (return the new position, panic on a closed file), `tell`, `size`, `truncate`, `sync` (fsync —
   the durability call), `close` (double close is an error result). Dropping the last reference
   closes the fd as a safety net; `close()` is still the API.
+- **File locks**: `lock()` (blocking, exclusive), `try_lock()` (`ok(false)` means someone else
+  holds it), `unlock()` — advisory flock, owned by the open file description, so two handles on
+  one file contend. Single-writer databases.
 - **Dir statics**: `make`, `make_all`, `list` → `Result<List<string>>` (sorted), `remove`
   (empty only), `remove_all` (recursive), `exists`, `temp`, `sync` — fsync a directory, the
   rename-commit pattern's second half.
@@ -127,8 +131,42 @@ Class-first, like everything builtin. Errors are `Result<T>`; `Error.kind` carri
 - **std.io**: `println`/`print`, `eprintln`/`eprint` (stderr), `read_line()` → `Option<string>`
   (none at EOF), `read_all()`.
 
+**What prints** (same rule for `io.println` and `{x}` interpolation): numbers, bools, strings;
+enums, as `variant` or `variant(payload, ...)`; lists of printable things, as `[a, b, c]`,
+nesting included — and `join(sep)` renders the same way. Maps and class instances don't print
+yet — give them a string form first. (`Result` carries an `Error` object, so it stays
+unprintable too — match on it.)
+
 [examples/kv.b](examples/kv.b) is the proof: an append-only KV store with binary records and a
 durable compaction (write temp, sync, rename over, sync the parent dir).
+
+## MMap (v0.5, implemented)
+
+A shared mapping of a whole file — the page-cache path a database wants. One writer, no
+collector interaction: the mapped region is not beans heap, only the handle is.
+
+- `MMap.open(path, writable)` → `Result<MMap>` — maps the entire file (`MAP_SHARED`); the fd
+  is closed right after mapping, the mapping outlives it (and the path — unlink while mapped
+  is fine). An empty file maps with `len() == 0`.
+- `len()`; `get_u8/u16/u32/u64/i64(pos)` and `put_...(pos, v)` — little-endian, bounds-checked
+  panics; `put` panics on a read-only map; `put`/`write` return self for chains.
+- `read(pos, n)` → `Bytes` (copy out), `write(pos, b)` — panics out of range.
+- `flush()` / `flush_range(pos, n)` → `Result<bool>` (msync — the durability call),
+  `close()` → `Result<bool>` (double close is an error; access after close panics).
+- Dropping the last reference unmaps as a safety net. Growing a file means close + reopen in v1.
+
+## std.fmt (v0.5, implemented)
+
+Interpolation assembles, fmt formats. No printf — the language has no varargs.
+
+- `pad_left(s, width)` / `pad_right(s, width)` — spaces, byte width; already-wide input
+  comes back unchanged.
+- `float(x, places)` — fixed decimals (`3.14`), places clamped to 0..100.
+- `dec(d, places)` — exact decimals: rounds half away from zero when narrowing, zero-pads
+  when widening. `fmt.dec(19.995, 2)` is `"20.00"`.
+- `hex(n)` / `bin(n)` — the 64-bit two's-complement pattern, lowercase, no prefix:
+  `hex(-1)` is 16 f's.
+- `group(n, sep)` — thousands grouping: `group(1234567, ",")` is `"1,234,567"`.
 
 ## Variables
 
@@ -179,6 +217,18 @@ var m: Map<string, int> = {"a": 1, "b": 2}
 xs.push(4)
 let n: Option<int> = m.get("a")     // no null, no panic
 ```
+
+**List methods (v0.5, implemented):** `push`, `pop`/`first`/`last`/`get(i)` → `Option<T>`,
+`len`, `max`/`min` → `Option<T>` (ordered elements: numbers, strings, bools — or a generic
+param, trusting its constraint), `contains`, `index_of` → `Option<int>`, `insert(i, v)` and
+`remove(i) -> T` (panic out of range), `reverse`, `clear`, `slice(from, to)` (copy, half-open,
+panics), `sort` (ordered elements), `sort_by(fn(a: T, b: T) -> bool)` (any `T`; the predicate
+is strict less-than), `join(sep)`. Sorts are **stable**, and both backends run the identical
+merge, so the order matches even under a predicate that isn't a proper ordering.
+
+**Map methods (v0.5, implemented):** `get` → `Option<V>`, `set` (also `m[k] = v` sugar),
+`len`, `contains`, `remove(k) -> bool`, `keys` → `List<K>`, `values` → `List<V>`, `clear`.
+Maps keep insertion order — `keys`/`values` walk it, `remove` preserves it.
 
 Everything has methods:
 
@@ -459,6 +509,7 @@ import as defer unsafe self true false
 
 ## Decided
 
+- Stdlib v0.5 phase 3 (implemented): the List/Map method set with **stable** sorts (`sort_by` takes a less-than closure; both backends run the identical merge), `Bytes` value `==`, advisory file locks, `MMap` (whole-file, shared, drop unmaps, grow = close + reopen), `std.fmt`, and printing widened to enums and lists — `variant(payload)` / `[a, b]` — everywhere strings interpolate; maps, class instances, and `Result` stay unprintable
 - Stdlib v0.5: the string method set, `Bytes`, `File`/`Dir`, `std.os`, and the `std.io` console set (implemented); byte semantics, panics carry positions, mutators return self for chaining, fs errors carry kind slugs
 - Modules: `beans.mod`, one folder = one package, git imports with a global cache (v0.4, implemented)
 - Block-bodied match arms in statement position (v0.4, implemented)

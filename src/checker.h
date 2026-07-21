@@ -88,6 +88,7 @@ private:
     bool assignable(TypeId from, TypeId to);
     bool is_subclass_of(const std::string& cls, const std::string& super);
     bool printable(TypeId t);
+    bool printable_rec(TypeId t, std::set<TypeId>& seen);
 
     // ---- statements ----
     void check_block(const std::vector<StmtPtr>& body);

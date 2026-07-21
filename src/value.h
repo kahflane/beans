@@ -151,12 +151,13 @@ struct ChannelVal;
 struct AtomicVal;
 struct BytesVal;
 struct FileVal;
+struct MMapVal;
 
 struct Value {
     enum class K {
         unit, int_, float_, decimal_, bool_, string_,
         list, map, instance, enum_v, closure, fn_ref, range,
-        thread, mutex, channel, atomic, bytes, file,
+        thread, mutex, channel, atomic, bytes, file, mmap,
     };
     K k = K::unit;
 
@@ -178,6 +179,7 @@ struct Value {
     std::shared_ptr<AtomicVal> atomic;
     std::shared_ptr<BytesVal> bytes;
     std::shared_ptr<FileVal> file;
+    std::shared_ptr<MMapVal> mm;
 
     static Value unit() { return {}; }
     static Value of_int(int64_t v) { Value x; x.k = K::int_; x.i = v; return x; }
@@ -313,6 +315,16 @@ struct FileVal {
     int fd = -1;
     bool closed = false;
     ~FileVal();
+};
+
+// a memory-mapped file — the stdlib's MMap class. Same drop-closes-it net;
+// the fd is closed right after mapping, the mapping itself survives it.
+struct MMapVal {
+    void* ptr = nullptr;
+    int64_t len = 0;
+    bool writable = false;
+    bool closed = false;
+    ~MMapVal();
 };
 
 // lexical scope chain — closures keep their captured chain alive

@@ -823,7 +823,8 @@ Value Interp::eval_binary(const Expr* e, std::shared_ptr<Env>& env) {
             }
             return Value::of_bool(false);
         }
-        case Value::K::enum_v: {
+        case Value::K::enum_v:
+        case Value::K::bytes: {
             bool same = value_eq(l, r);
             return Value::of_bool(op == TokenKind::eq ? same : !same);
         }
@@ -1078,7 +1079,7 @@ Value Interp::eval_call(const Expr* e, std::shared_ptr<Env>& env, Hint hint) {
                 v.atomic->v = init.i;
                 return v;
             }
-            if (n == "Bytes" || n == "File" || n == "Dir") {
+            if (n == "Bytes" || n == "File" || n == "Dir" || n == "MMap") {
                 for (const BuiltinStatic& b : builtin_statics()) {
                     if (n == b.cls && mname == b.name) {
                         std::vector<Value> args;
@@ -1161,6 +1162,42 @@ Value Interp::eval_call(const Expr* e, std::shared_ptr<Env>& env, Hint hint) {
 
 // ---- builtin methods --------------------------------------------------------
 
+// ordering for sort/min/max — the checker only lets ordered element types in
+static bool value_less(const Value& a, const Value& b) {
+    switch (a.k) {
+        case Value::K::int_: return a.i < b.i;
+        case Value::K::float_: return a.f < b.f;
+        case Value::K::decimal_: return a.dec.cmp(b.dec) < 0;
+        case Value::K::string_: return *a.s < *b.s;
+        case Value::K::bool_: return a.b < b.b;
+        default: return false;
+    }
+}
+
+// bottom-up stable merge — structurally identical to the C runtime's
+// list_merge_sort, so both backends produce the same order for ANY
+// predicate, even one that is not a strict weak ordering
+template <typename Less>
+static void stable_merge(std::vector<Value>& v, Less less) {
+    size_t n = v.size();
+    if (n < 2) return;
+    std::vector<Value> buf(n);
+    for (size_t w = 1; w < n; w *= 2) {
+        for (size_t lo = 0; lo < n; lo += 2 * w) {
+            size_t mid = std::min(lo + w, n), hi = std::min(lo + 2 * w, n);
+            if (mid >= hi) continue;
+            size_t i = lo, j = mid, o = lo;
+            while (i < mid && j < hi) {
+                if (!less(v[j], v[i])) buf[o++] = v[i++];
+                else buf[o++] = v[j++];
+            }
+            while (i < mid) buf[o++] = v[i++];
+            while (j < hi) buf[o++] = v[j++];
+            for (size_t k = lo; k < hi; k++) v[k] = std::move(buf[k]);
+        }
+    }
+}
+
 Value Interp::eval_builtin_method(const Expr* e, Value& recv, const std::string& name,
                                   std::vector<Value>& args) {
     switch (recv.k) {
@@ -1196,6 +1233,14 @@ Value Interp::eval_builtin_method(const Expr* e, Value& recv, const std::string&
         case Value::K::file: {
             for (const BuiltinMethod& b : builtin_methods()) {
                 if (b.recv == BT::file && name == b.name) {
+                    return b.run(e->line, e->col, recv, args);
+                }
+            }
+            break;
+        }
+        case Value::K::mmap: {
+            for (const BuiltinMethod& b : builtin_methods()) {
+                if (b.recv == BT::mmap && name == b.name) {
                     return b.run(e->line, e->col, recv, args);
                 }
             }
@@ -1243,6 +1288,85 @@ Value Interp::eval_builtin_method(const Expr* e, Value& recv, const std::string&
                 }
                 return Value::of_str(std::move(out));
             }
+            if (name == "first") {
+                if (items.empty()) return none();
+                return some(items.front());
+            }
+            if (name == "last") {
+                if (items.empty()) return none();
+                return some(items.back());
+            }
+            if (name == "min") {
+                if (items.empty()) return none();
+                Value best = items[0];
+                for (const Value& v : items) {
+                    if (value_less(v, best)) best = v;
+                }
+                return some(std::move(best));
+            }
+            if (name == "index_of") {
+                for (size_t i = 0; i < items.size(); i++) {
+                    if (value_eq(items[i], args[0])) {
+                        return some(Value::of_int(static_cast<int64_t>(i)));
+                    }
+                }
+                return none();
+            }
+            if (name == "insert") {
+                int64_t i = args[0].i;
+                if (i < 0 || i > static_cast<int64_t>(items.size())) {
+                    panic(e, "insert at " + std::to_string(i) + " out of range (len " +
+                                 std::to_string(items.size()) + ")");
+                }
+                items.insert(items.begin() + i, args[1]);
+                return Value::unit();
+            }
+            if (name == "remove") {
+                int64_t i = args[0].i;
+                if (i < 0 || i >= static_cast<int64_t>(items.size())) {
+                    panic(e, "list index " + std::to_string(i) + " out of range (len " +
+                                 std::to_string(items.size()) + ")");
+                }
+                Value v = std::move(items[static_cast<size_t>(i)]);
+                items.erase(items.begin() + i);
+                return v;
+            }
+            if (name == "reverse") {
+                std::reverse(items.begin(), items.end());
+                return Value::unit();
+            }
+            if (name == "clear") {
+                items.clear();
+                return Value::unit();
+            }
+            if (name == "slice") {
+                int64_t from = args[0].i, to = args[1].i;
+                if (from < 0 || to < from || to > static_cast<int64_t>(items.size())) {
+                    panic(e, "slice " + std::to_string(from) + ".." + std::to_string(to) +
+                                 " out of range (len " + std::to_string(items.size()) + ")");
+                }
+                Value out;
+                out.k = Value::K::list;
+                out.list = std::make_shared<ListVal>();
+                out.list->items.assign(items.begin() + from, items.begin() + to);
+                return out;
+            }
+            if (name == "sort") {
+                stable_merge(items, value_less);
+                return Value::unit();
+            }
+            if (name == "sort_by") {
+                Value f = args[0];
+                stable_merge(items, [&](const Value& a, const Value& b) -> bool {
+                    if (f.k == Value::K::closure) {
+                        return call_closure(*f.clo, {a, b}).b;
+                    }
+                    return call_fn(f.fnr->decl, nullptr, {a, b},
+                                   pkg_of(f.fnr->decl->qualname))
+                        .b;
+                });
+                return Value::unit();
+            }
             break;
         }
         case Value::K::map: {
@@ -1266,6 +1390,28 @@ Value Interp::eval_builtin_method(const Expr* e, Value& recv, const std::string&
                     if (value_eq(k, args[0])) return Value::of_bool(true);
                 }
                 return Value::of_bool(false);
+            }
+            if (name == "remove") {
+                for (size_t i = 0; i < entries.size(); i++) {
+                    if (value_eq(entries[i].first, args[0])) {
+                        entries.erase(entries.begin() + i);
+                        return Value::of_bool(true);
+                    }
+                }
+                return Value::of_bool(false);
+            }
+            if (name == "keys" || name == "values") {
+                Value out;
+                out.k = Value::K::list;
+                out.list = std::make_shared<ListVal>();
+                for (auto& [k, v] : entries) {
+                    out.list->items.push_back(name == "keys" ? k : v);
+                }
+                return out;
+            }
+            if (name == "clear") {
+                entries.clear();
+                return Value::unit();
             }
             break;
         }
@@ -1562,6 +1708,7 @@ std::string Interp::display(const Value& v) {
         case Value::K::map: return "{map}";
         case Value::K::bytes: return "{bytes}";
         case Value::K::file: return "{file}";
+        case Value::K::mmap: return "{mmap}";
         case Value::K::closure: return "{fn}";
         case Value::K::fn_ref: return "{fn}";
         case Value::K::range: return "{range}";

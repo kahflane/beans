@@ -75,6 +75,7 @@ TypeId Checker::bt_type(BT t, TypeId recv) {
         case BT::str: return t_str();
         case BT::bytes: return pool_.named(Type::K::class_, "Bytes");
         case BT::file: return pool_.named(Type::K::class_, "File");
+        case BT::mmap: return pool_.named(Type::K::class_, "MMap");
         case BT::self_recv: return recv ? recv : t_poison();
         case BT::opt_i64: return t_option(t_int());
         case BT::opt_str: return t_option(t_str());
@@ -88,6 +89,8 @@ TypeId Checker::bt_type(BT t, TypeId recv) {
             return t_result(pool_.named(Type::K::class_, "Bytes"), t_error_class());
         case BT::res_file:
             return t_result(pool_.named(Type::K::class_, "File"), t_error_class());
+        case BT::res_mmap:
+            return t_result(pool_.named(Type::K::class_, "MMap"), t_error_class());
         case BT::res_list_str:
             return t_result(pool_.named(Type::K::class_, "List", {t_str()}),
                             t_error_class());
@@ -190,7 +193,7 @@ std::string Checker::as_type_name(const Expr* e) {
         // builtins keep their plain names
         if (builtin_generic_classes_.count(n) || n == "Error" || n == "Option" ||
             n == "Result" || n == "AtomicInt" || n == "Bytes" || n == "File" ||
-            n == "Dir") {
+            n == "Dir" || n == "MMap") {
             return n;
         }
         return "";
@@ -563,6 +566,7 @@ TypeId Checker::resolve_type(const TypeRef* t) {
         if (n == "AtomicInt") return pool_.named(Type::K::class_, "AtomicInt");
         if (n == "Bytes") return pool_.named(Type::K::class_, "Bytes");
         if (n == "File") return pool_.named(Type::K::class_, "File");
+        if (n == "MMap") return pool_.named(Type::K::class_, "MMap");
     }
 
     if (n == "Option") {
@@ -673,10 +677,37 @@ bool Checker::assignable(TypeId from, TypeId to) {
 }
 
 bool Checker::printable(TypeId t) {
+    std::set<TypeId> seen;
+    return printable_rec(t, seen);
+}
+
+// lists print as [a, b], enums as variant(payload...) — printable when every
+// piece is. Class payloads stay out: their display would need the dynamic
+// class name, which the native backend does not carry. That excludes Result.
+bool Checker::printable_rec(TypeId t, std::set<TypeId>& seen) {
     if (!t) return false;
     if (t->k == Type::K::poison) return true;
     if (t->is_numeric() || t->k == Type::K::bool_ || t->k == Type::K::string_) return true;
-    if (t->k == Type::K::enum_ && t->args.empty()) return true; // plain enums print their name
+    if (t->k == Type::K::class_ && t->name == "List" && t->args.size() == 1) {
+        return printable_rec(t->args[0], seen);
+    }
+    if (t->k == Type::K::enum_) {
+        if (seen.count(t)) return true; // self-recursive enums hold finite values
+        seen.insert(t);
+        auto it = enums_.find(t->name);
+        if (it == enums_.end()) return false;
+        const EnumInfo& ei = it->second;
+        std::map<std::string, TypeId> env;
+        for (size_t i = 0; i < ei.generic_params.size() && i < t->args.size(); i++) {
+            env[ei.generic_params[i]] = t->args[i];
+        }
+        for (const auto& [vn, payload] : ei.variants) {
+            for (TypeId p : payload) {
+                if (!printable_rec(subst(p, env), seen)) return false;
+            }
+        }
+        return true;
+    }
     return false;
 }
 
@@ -1196,7 +1227,8 @@ TypeId Checker::check_binary(const Expr* e) {
             bool comparable =
                 l == r && (l->is_numeric() || l->k == Type::K::bool_ ||
                            l->k == Type::K::string_ ||
-                           (l->k == Type::K::enum_ && l->args.empty()));
+                           (l->k == Type::K::enum_ && l->args.empty()) ||
+                           (l->k == Type::K::class_ && l->name == "Bytes"));
             if (!comparable) {
                 error_at(e->line, e->col, "can't compare " + type_name(l) + " with " +
                                               type_name(r));
@@ -1363,12 +1395,13 @@ Checker::Member Checker::builtin_member(TypeId recv, const std::string& name) {
         if (name == "round") return method({t_int()}, recv);
         return none;
     }
-    // string, Bytes, and File methods come from the builtin registry
+    // string, Bytes, File, and MMap methods come from the builtin registry
     if (recv->k == Type::K::string_ ||
         (recv->k == Type::K::class_ &&
-         (recv->name == "Bytes" || recv->name == "File"))) {
+         (recv->name == "Bytes" || recv->name == "File" || recv->name == "MMap"))) {
         BT want = recv->k == Type::K::string_ ? BT::str
                   : recv->name == "Bytes"     ? BT::bytes
+                  : recv->name == "MMap"      ? BT::mmap
                                               : BT::file;
         for (const BuiltinMethod& b : builtin_methods()) {
             if (b.recv == want && name == b.name) {
@@ -1382,12 +1415,26 @@ Checker::Member Checker::builtin_member(TypeId recv, const std::string& name) {
     if (recv->k == Type::K::class_) {
         if (recv->name == "List" && recv->args.size() == 1) {
             TypeId T = recv->args[0];
+            // min/max/sort need an ordering; everything else takes any T.
+            // A type param passes — generic bodies trust their constraint.
+            bool ordered = T->is_numeric() || T->k == Type::K::bool_ ||
+                           T->k == Type::K::string_ ||
+                           T->k == Type::K::type_param;
             if (name == "push") return method({T}, t_unit());
             if (name == "pop") return method({}, t_option(T));
             if (name == "get") return method({t_int()}, t_option(T));
+            if (name == "first" || name == "last") return method({}, t_option(T));
             if (name == "len") return method({}, t_int());
-            if (name == "max") return method({}, t_option(T));
+            if (name == "max" || name == "min")
+                return ordered ? method({}, t_option(T)) : none;
             if (name == "contains") return method({T}, t_bool());
+            if (name == "index_of") return method({T}, t_option(t_int()));
+            if (name == "insert") return method({t_int(), T}, t_unit());
+            if (name == "remove") return method({t_int()}, T);
+            if (name == "reverse" || name == "clear") return method({}, t_unit());
+            if (name == "slice") return method({t_int(), t_int()}, recv);
+            if (name == "sort") return ordered ? method({}, t_unit()) : none;
+            if (name == "sort_by") return method({pool_.fn({T, T}, t_bool())}, t_unit());
             if (name == "join") return method({t_str()}, t_str());
             return none;
         }
@@ -1397,6 +1444,12 @@ Checker::Member Checker::builtin_member(TypeId recv, const std::string& name) {
             if (name == "set") return method({K, V}, t_unit());
             if (name == "len") return method({}, t_int());
             if (name == "contains") return method({K}, t_bool());
+            if (name == "remove") return method({K}, t_bool());
+            if (name == "keys")
+                return method({}, pool_.named(Type::K::class_, "List", {K}));
+            if (name == "values")
+                return method({}, pool_.named(Type::K::class_, "List", {V}));
+            if (name == "clear") return method({}, t_unit());
             return none;
         }
         if (recv->name == "Thread" && recv->args.size() == 1) {
@@ -1758,7 +1811,7 @@ TypeId Checker::check_call(const Expr* e, TypeId expected) {
                 for (const ExprPtr& a : e->args) check_expr(a.get(), t_int());
                 return pool_.named(Type::K::class_, "AtomicInt");
             }
-            if (n == "Bytes" || n == "File" || n == "Dir") {
+            if (n == "Bytes" || n == "File" || n == "Dir" || n == "MMap") {
                 for (const BuiltinStatic& b : builtin_statics()) {
                     if (n == b.cls && mname == b.name) {
                         std::vector<TypeId> ps;

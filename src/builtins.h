@@ -20,6 +20,7 @@ enum class BT : uint8_t {
     str,
     bytes,
     file,
+    mmap,
     self_recv, // return: the receiver itself, borrowed — chaining mutators
     opt_i64,   // Option<...>: C side returns BOpt {val, has}
     opt_str,
@@ -31,6 +32,7 @@ enum class BT : uint8_t {
     res_bool,
     res_bytes,
     res_file,
+    res_mmap,
     res_list_str,
 };
 
