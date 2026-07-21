@@ -1,0 +1,111 @@
+#pragma once
+
+#include <map>
+#include <memory>
+#include <mutex>
+#include <string>
+#include <vector>
+
+#include "ast.h"
+#include "value.h"
+
+namespace beans {
+
+// Thrown for beans runtime errors (index out of range, expect() failure, ...).
+struct BeansPanic {
+    std::string msg;
+    uint32_t line = 0, col = 0;
+};
+
+// Tree-walking interpreter. Assumes the module already passed the checker —
+// it does not re-validate types, it just runs.
+class Interp {
+public:
+    explicit Interp(const Module& mod);
+
+    // find fn main and run it. returns the process exit code.
+    int run();
+
+private:
+    // control-flow signals
+    struct ReturnSignal { Value v; };
+    struct BreakSignal {};
+    struct ContinueSignal {};
+
+    // number-literal hint so decimal literals parse exactly from source text
+    enum class NumHint { none, dec, flt };
+    struct Hint {
+        const TypeRef* tref;
+        NumHint num;
+        Hint() : tref(nullptr), num(NumHint::none) {}
+        static Hint of(const TypeRef* t);
+        static Hint decimal() { Hint h; h.num = NumHint::dec; return h; }
+        static Hint floating() { Hint h; h.num = NumHint::flt; return h; }
+        bool wants_dec() const;
+        bool wants_float() const;
+        const TypeRef* arg(size_t i) const;
+    };
+
+    // execution
+    Value call_fn(const FnDecl* fn, Value* self, std::vector<Value> args);
+    Value call_closure(const ClosureVal& c, std::vector<Value> args);
+    void exec_block(const std::vector<StmtPtr>& body, std::shared_ptr<Env> env);
+    void exec_stmt(const Stmt* s, std::shared_ptr<Env>& env);
+
+    // Evaluate one beans AST node. (Named like every interpreter textbook's
+    // eval — it walks our own type-checked AST only; it never executes
+    // arbitrary strings or host code, so the usual eval() risk doesn't apply.)
+    Value eval(const Expr* e, std::shared_ptr<Env>& env, Hint hint = {});
+    Value eval_call(const Expr* e, std::shared_ptr<Env>& env, Hint hint);
+    Value eval_binary(const Expr* e, std::shared_ptr<Env>& env);
+    Value eval_init(const Expr* e, std::shared_ptr<Env>& env, Hint hint);
+    Value eval_match(const Expr* e, std::shared_ptr<Env>& env, Hint hint);
+    Value eval_builtin_method(const Expr* e, Value& recv, const std::string& name,
+                              std::vector<Value>& args);
+    Value eval_string(const Expr* e, std::shared_ptr<Env>& env);
+
+    bool match_pattern(const Pattern* p, const Value& v, Env& bind_env,
+                       std::shared_ptr<Env>& outer);
+
+    // assignment targets
+    void assign_to(const Expr* target, Value v, std::shared_ptr<Env>& env);
+    Value* lvalue_slot(const Expr* target, std::shared_ptr<Env>& env);
+
+    // helpers
+    Value make_instance(const ClassDecl* cls,
+                        const std::vector<InitEntry>& entries,
+                        std::shared_ptr<Env>& env);
+    const FnDecl* find_method(const ClassDecl* cls, const std::string& name) const;
+    const ClassDecl* find_class(const std::string& name) const;
+    bool class_is(const ClassDecl* cls, const std::string& super) const;
+    void collect_fields(const ClassDecl* cls, std::vector<const FieldDecl*>& out) const;
+
+    Value coerce_arg(Value v, const TypeRef* want);
+    static bool value_eq(const Value& a, const Value& b);
+    static std::string display(const Value& v);
+    [[noreturn]] void panic(const Expr* e, std::string msg);
+
+    Value make_err(std::string msg);
+    Value some(Value v);
+    Value none();
+
+    // interpolated strings, split and parsed once
+    struct StrPart {
+        std::string text;    // literal piece (already unescaped)
+        ExprPtr expr;        // or an expression piece
+        std::shared_ptr<std::string> src; // owns the segment text the expr's
+                                          // string_views point into
+    };
+    const std::vector<StrPart>& string_parts(const Expr* e);
+
+    const Module& mod_;
+    std::map<std::string, const ClassDecl*> classes_;
+    std::map<std::string, const EnumDecl*> enums_;
+    std::map<std::string, const FnDecl*> fns_;
+    std::map<std::string, std::string> pkg_paths_;
+
+    std::mutex str_cache_mu_;
+    std::map<const Expr*, std::vector<StrPart>> str_cache_;
+};
+
+} // namespace beans
