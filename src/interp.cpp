@@ -78,6 +78,19 @@ const TypeRef* Interp::Hint::arg(size_t i) const {
 // which package's code this thread is currently running (parallel to g_frames)
 thread_local std::string g_pkg;
 
+// the interp running on this thread — the instance deleter needs it to run
+// deinit, and a deleter can fire on whichever thread drops the last reference
+static thread_local Interp* g_interp_tl = nullptr;
+
+// deleter for instances of classes with a deinit anywhere in their chain:
+// user code runs first (fields still alive), then the normal teardown
+struct DeinitDeleter {
+    void operator()(InstanceVal* p) const {
+        if (g_interp_tl && !g_beans_panicking) g_interp_tl->run_deinit(p);
+        delete p;
+    }
+};
+
 Interp::Interp(const Program& prog) {
     for (const auto& pkg : prog.packages) {
         prefix_by_path_[pkg->import_path] = pkg->prefix;
@@ -129,6 +142,7 @@ std::string Interp::binding_path(const std::string& binding) const {
 }
 
 int Interp::run() {
+    g_interp_tl = this;
     auto it = fns_.find("main");
     if (it == fns_.end()) {
         std::fprintf(stderr, "error: no fn main\n");
@@ -154,6 +168,7 @@ int Interp::run() {
 }
 
 void Interp::panic(const Expr* e, std::string msg) {
+    g_beans_panicking = true; // suppress deinit while this unwinds
     BeansPanic p;
     p.msg = std::move(msg);
     if (e) { p.line = e->line; p.col = e->col; }
@@ -245,7 +260,10 @@ Value Interp::make_instance(const ClassDecl* cls,
                             std::shared_ptr<Env>& env) {
     Value v;
     v.k = Value::K::instance;
-    v.inst = std::make_shared<InstanceVal>();
+    // classes with a deinit in their chain pay for the custom deleter;
+    // everything else keeps the plain single-allocation shared_ptr
+    v.inst = needs_deinit(cls) ? std::shared_ptr<InstanceVal>(new InstanceVal, DeinitDeleter{})
+                               : std::make_shared<InstanceVal>();
     v.inst->cls = cls;
 
     std::vector<const FieldDecl*> fields;
@@ -270,6 +288,84 @@ Value Interp::make_instance(const ClassDecl* cls,
         if (Value* slot = v.inst->field(en.name)) *slot = std::move(val);
     }
     return v;
+}
+
+// ---- init / deinit ----------------------------------------------------------
+
+const ClassDecl* Interp::parent_of(const ClassDecl* c) const {
+    const std::vector<std::string>& sup =
+        c->supers_resolved.size() == c->supers.size() ? c->supers_resolved : c->supers;
+    for (const std::string& s : sup) {
+        const ClassDecl* p = find_class(s);
+        if (p && !p->is_interface) return p;
+    }
+    return nullptr;
+}
+
+static const FnDecl* own_deinit(const ClassDecl* c) {
+    for (const FnDecl& m : c->methods) {
+        if (m.has_self && m.name == "deinit") return &m;
+    }
+    return nullptr;
+}
+
+bool Interp::needs_deinit(const ClassDecl* c) const {
+    for (const ClassDecl* k = c; k; k = parent_of(k)) {
+        if (own_deinit(k)) return true;
+    }
+    return false;
+}
+
+Value Interp::construct(const ClassDecl* cls, const Expr* e, std::shared_ptr<Env>& env) {
+    // the constructor may be inherited: nearest class up the chain with an
+    // init builds this class (anything between adds no required fields)
+    const FnDecl* ini = nullptr;
+    const ClassDecl* owner = nullptr;
+    for (const ClassDecl* k = cls; k && !ini; k = parent_of(k)) {
+        for (const FnDecl& m : k->methods) {
+            if (m.has_self && m.name == "init") { ini = &m; owner = k; }
+        }
+    }
+    if (!ini) panic(e, "'" + cls->name + "' has no init"); // checker stops this earlier
+    std::vector<Value> args;
+    for (size_t i = 0; i < e->args.size(); i++) {
+        Hint h = i < ini->params.size() ? Hint::of(ini->params[i].type.get()) : Hint();
+        args.push_back(eval(e->args[i].get(), env, h));
+    }
+    Value v = make_instance(cls, {}, env); // cls, not owner: the child's layout
+    call_fn(ini, &v, std::move(args), pkg_of(owner->qualname));
+    return v;
+}
+
+void Interp::run_deinit(InstanceVal* inst) {
+    // non-owning alias: deinit sees self, and when the alias count hits zero
+    // again nothing happens — the object is deleted right after regardless,
+    // which is also why self must not escape (spec: use-after-free)
+    Value self;
+    self.k = Value::K::instance;
+    self.inst = std::shared_ptr<InstanceVal>(inst, [](InstanceVal*) {});
+
+    // deaths inside deinit must land immediately, like the native runtime
+    // releasing at the deinit frame's exit — not queue behind the outer drain.
+    // Recursion depth here is user deinit-nesting, same as native.
+    bool saved = g_teardown.draining;
+    g_teardown.draining = false;
+
+    try {
+        // subclass first, then up the chain — each class's own deinit once
+        for (const ClassDecl* k = inst->cls; k; k = parent_of(k)) {
+            if (const FnDecl* d = own_deinit(k)) {
+                call_fn(d, &self, {}, pkg_of(k->qualname));
+            }
+        }
+    } catch (const BeansPanic& p) {
+        // fatal, exactly like the native runtime's beans_panic mid-release
+        std::fflush(stdout);
+        std::fprintf(stderr, "runtime panic at %u:%u: %s\n", p.line, p.col, p.msg.c_str());
+        std::exit(3);
+    }
+
+    g_teardown.draining = saved;
 }
 
 // ---- calls -----------------------------------------------------------------
@@ -967,6 +1063,18 @@ Value Interp::eval_call(const Expr* e, std::shared_ptr<Env>& env, Hint hint) {
             return call_fn(fit->second, nullptr, eval_args_hinted(fit->second->params),
                            pkg_of(fit->second->qualname));
         }
+
+        // a class name called like a function: construction through init.
+        // Resolution mirrors eval_init — checker key first, then the plain
+        // name, then the current package (re-parsed interpolation segments).
+        if (!callee->resolved.empty()) {
+            if (const ClassDecl* cls = find_class(callee->resolved)) {
+                return construct(cls, e, env);
+            }
+        } else {
+            if (const ClassDecl* cls = find_class(name)) return construct(cls, e, env);
+            if (const ClassDecl* cls = find_class(qual(name))) return construct(cls, e, env);
+        }
         panic(e, "unknown function '" + name + "'");
     }
 
@@ -1002,12 +1110,15 @@ Value Interp::eval_call(const Expr* e, std::shared_ptr<Env>& env, Hint hint) {
             beans_threads_inc(); // a File closed on another thread now defers
                                  // its real fd close until its handle drops
             tv.thread->th = std::thread([this, clo, result, panic_slot]() {
+                g_interp_tl = this; // deinit can fire on this thread too
                 try {
                     *result = call_closure(clo, {});
                 } catch (const BeansPanic& p) {
                     *panic_slot = p.msg.empty() ? "panic" : p.msg;
+                    g_beans_panicking = false; // stored, this thread lives on
                 } catch (...) {
                     *panic_slot = "unknown panic";
+                    g_beans_panicking = false;
                 }
                 beans_threads_dec();
             });
@@ -1030,6 +1141,30 @@ Value Interp::eval_call(const Expr* e, std::shared_ptr<Env>& env, Hint hint) {
                 return call_fn(fit->second, nullptr, eval_args_hinted(fit->second->params),
                                pkg_of(fit->second->qualname));
             }
+            // super.init(...): the checker resolved the ancestor class — run
+            // its init on the live self, construction is not restarted
+            if (mname == "init" && obj->kind == Expr::Kind::ident &&
+                obj->text == "super") {
+                const ClassDecl* anc = find_class(r);
+                const FnDecl* ini = nullptr;
+                if (anc) {
+                    for (const FnDecl& m : anc->methods) {
+                        if (m.has_self && m.name == "init") ini = &m;
+                    }
+                }
+                Value* self = env->find("self");
+                if (!ini || !self) panic(e, "super.init here");
+                std::vector<Value> args;
+                for (size_t i = 0; i < e->args.size(); i++) {
+                    Hint h = i < ini->params.size() ? Hint::of(ini->params[i].type.get())
+                                                    : Hint();
+                    args.push_back(eval(e->args[i].get(), env, h));
+                }
+                Value sv = *self;
+                return call_fn(ini, &sv, std::move(args), pkg_of(anc->qualname));
+            }
+            // pkg.Class(args) — the checker pinned the class key
+            if (const ClassDecl* cls = find_class(r)) return construct(cls, e, env);
         }
 
         if (obj->kind == Expr::Kind::ident && !env->find(std::string(obj->text))) {

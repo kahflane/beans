@@ -320,6 +320,82 @@ let u: User = User.new("jul")
 - `ClassName { field: value }` is the raw initializer. `fn new(...)` is a convention, not a keyword.
 - Want two ways to build it? Write `new` and `from_json`. No overloading magic.
 
+### init and deinit (v0.6, implemented)
+
+`init` is the constructor — a method literally named `init`, no new keyword. Declaring one
+changes how the class is built: call the class like a function, and the raw `{ }` form becomes
+an error for that class. One way in, so its invariants always hold.
+
+```
+class Conn {
+    host: string
+    hits: int = 0
+
+    pub fn init(self, host: string) {
+        self.host = host
+    }
+
+    fn deinit(self) {
+        io.println("closing {self.host}")
+    }
+}
+
+let c: Conn = Conn("db1")
+```
+
+- `init` returns nothing and runs on a fresh object: fields with defaults start at them, the
+  rest start unassigned. **Until every field is assigned, the body is a straight-line prefix**:
+  each statement either assigns a field (`self.f = ...`) or touches `self` only by reading
+  fields already assigned — no method calls, no passing `self` on, no `return`, and no string
+  interpolation (its pieces are checked too late to prove them safe). The checker proves all
+  of it, so a half-built object can never escape. After the last field, anything goes.
+- Construction that can fail stays a static — `fn new(...) -> Result<Conn>` validates, then
+  calls `Conn(...)`.
+- Generic classes take their type arguments from the spot: `let s: Stack<int> = Stack()`.
+- `pub fn init` is what lets another package write `Conn(...)` — the usual visibility rule.
+
+**init and inheritance** work through `super.init(...)`, in Swift's order — own fields first:
+
+```
+class Dog : Animal {
+    breed: string
+    fn init(self, breed: string, name: string) {
+        self.breed = breed        // 1. this class's own fields
+        super.init(name)          // 2. the parent's constructor, exactly once
+        self.bark()               // 3. everything is assigned — anything goes
+    }
+}
+```
+
+- The order is what makes construction safe, not taste: a parent's init may call a method the
+  subclass overrides, and by then the subclass's fields are already assigned. No vtable
+  switching, no half-built reads — the checker just proves the order.
+- Before `super.init`, parent fields don't exist yet — not even defaulted ones (the parent's
+  init may be about to overwrite them). Assigning one is an error; `super.init` owns them.
+- `super.init` runs exactly once, as a top-level statement, only inside `init`, and it is
+  mandatory whenever a class above declares an init. `return` before it is an error.
+- `super` is not a keyword (still 23): the checker recognizes only the exact form
+  `super.init(...)`. General `super.method()` calls: later.
+- A subclass that adds **no required fields** inherits the constructor — `Pup(args)` runs the
+  nearest ancestor init on a Pup. A subclass that adds required fields must declare its own
+  init. Either way `{ }` stays banned while any ancestor has an init.
+- A class whose parent has *no* init may still declare one; its prefix then covers the
+  inherited fields too, under the raw form's visibility rules.
+
+`deinit` is the destructor. It runs exactly once, on whichever thread drops the last
+reference, the moment the count hits zero — and before the fields are released, so the body
+can still read them. Deterministic, like C++/Swift: no GC pause, no "sometime later".
+
+- No parameters, no return value, never called by hand: construction calls `init`, death
+  calls `deinit`.
+- A subclass `deinit` runs first, then its parent's, automatically — no `override`, ever.
+- `self` must not escape a `deinit`. The object is being destroyed; storing `self` anywhere
+  is use-after-free by definition.
+- A panic inside `deinit` is fatal (same rule as defer).
+- An object that dies **inside a reference cycle** does not get its `deinit` — a cycle never
+  drops to zero on its own, so if it owns a resource, break the cycle by hand. (`weak`
+  references: later.)
+
 ## Inheritance and interfaces
 
 Single inheritance, many interfaces, one syntax — a colon list:
@@ -553,6 +629,13 @@ import as defer unsafe self true false
 
 ## Decided
 
+- `super.init` v0.6 (implemented): Swift order — own fields, then the parent's constructor,
+  then full self; exactly once, top level, mandatory when an ancestor has init; `super` is
+  contextual, not a keyword; a subclass adding no required fields inherits the constructor
+- `init`/`deinit` v0.6 (implemented): constructor by method name, `ClassName(args)` call form,
+  straight-line-prefix field assignment proof, no init with inheritance yet; destructor runs at
+  refcount zero before fields release, subclass-then-parent chain, skipped for cycle garbage,
+  panic inside it fatal, `self` must not escape
 - Stdlib v0.5 phase 4 (implemented): `BufReader` line reading over positional I/O, format specs in interpolation (`{x:8.2}` — first top-level `:` in the braces; the same rendering as `std.fmt`), `chars()` for UTF-8, varint + crc32 on `Bytes`, `MMap.resize` (the handle keeps its fd), `Dir.walk` (recursive, sorted, relative), and `Path` string statics
 - Stdlib v0.5 phase 3 (implemented): the List/Map method set with **stable** sorts (`sort_by` takes a less-than closure; both backends run the identical merge), `Bytes` value `==`, advisory file locks, `MMap` (whole-file, shared, drop unmaps, grow = close + reopen), `std.fmt`, and printing widened to enums and lists — `variant(payload)` / `[a, b]` — everywhere strings interpolate; maps, class instances, and `Result` stay unprintable
 - Stdlib v0.5: the string method set, `Bytes`, `File`/`Dir`, `std.os`, and the `std.io` console set (implemented); byte semantics, panics carry positions, mutators return self for chaining, fs errors carry kind slugs

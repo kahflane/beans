@@ -391,6 +391,11 @@ void Checker::resolve_enum_members(EnumInfo& e) {
         e.variant_order.push_back(v.name);
     }
     for (const FnDecl& m : e.decl->methods) {
+        if (m.name == "init" || m.name == "deinit") {
+            // enums are values, not identities — nothing to construct or tear down
+            error_at(m.line, m.col, "'" + m.name + "' belongs to classes, not enums");
+            continue;
+        }
         if (e.methods.count(m.name)) {
             error_at(m.line, m.col, "method '" + m.name + "' defined twice");
             continue;
@@ -424,9 +429,61 @@ bool Checker::is_subclass_of(const std::string& cls, const std::string& super) {
     return false;
 }
 
+const FnDecl* Checker::class_init(const ClassInfo& c) {
+    auto it = c.method_decls.find("init");
+    return it != c.method_decls.end() && it->second->has_self ? it->second : nullptr;
+}
+
+const ClassInfo* Checker::parent_class_of(const ClassInfo& c) {
+    for (const std::string& s : c.supers) {
+        auto it = classes_.find(s);
+        if (it != classes_.end() && !it->second.decl->is_interface) return &it->second;
+    }
+    return nullptr;
+}
+
+const FnDecl* Checker::chain_init(const ClassInfo& c, const ClassInfo** owner) {
+    for (const ClassInfo* k = &c; k; k = parent_class_of(*k)) {
+        if (const FnDecl* ini = class_init(*k)) {
+            if (owner) *owner = k;
+            return ini;
+        }
+    }
+    if (owner) *owner = nullptr;
+    return nullptr;
+}
+
 void Checker::check_hierarchy(ClassInfo& c) {
     const ClassDecl* d = c.decl;
     int class_parents = 0;
+
+    // ---- init / deinit shape rules ----
+    for (const auto& [mname, mdecl] : c.method_decls) {
+        bool is_init = mname == "init";
+        if (!is_init && mname != "deinit") continue;
+        if (d->is_interface) {
+            error_at(mdecl->line, mdecl->col,
+                     "'" + mname + "' can't be declared in an interface");
+            continue;
+        }
+        if (!mdecl->has_self) {
+            error_at(mdecl->line, mdecl->col, "'" + mname + "' takes self — it's not a static");
+        }
+        if (mdecl->ret) {
+            error_at(mdecl->line, mdecl->col, "'" + mname + "' returns nothing");
+        }
+        if (!mdecl->generics.empty()) {
+            error_at(mdecl->line, mdecl->col, "'" + mname + "' can't take type parameters");
+        }
+        if (mdecl->is_override) {
+            error_at(mdecl->line, mdecl->col,
+                     is_init ? "init can't be marked override"
+                             : "deinit chains to the parent automatically — drop the override");
+        }
+        if (!is_init && !mdecl->params.empty()) {
+            error_at(mdecl->line, mdecl->col, "deinit takes no parameters");
+        }
+    }
 
     // collect inherited members
     std::map<std::string, TypeId> inh_concrete;   // concrete method or iface default
@@ -472,6 +529,23 @@ void Checker::check_hierarchy(ClassInfo& c) {
         for (const std::string& s : p.supers) work.push_back(s);
     }
 
+    // constructor chain completeness: with an init somewhere above, every
+    // class either declares its own init (and calls super.init) or adds no
+    // required fields, so the inherited constructor still covers everything
+    if (!d->is_interface && !class_init(c)) {
+        const ClassInfo* p = parent_class_of(c);
+        if (p && chain_init(*p, nullptr)) {
+            for (const FieldDecl& f : d->fields) {
+                if (!f.def) {
+                    error_at(d->line, d->col,
+                             "'" + d->name + "' adds required field '" + f.name +
+                                 "' but has no init — declare fn init(self, ...) and "
+                                 "call super.init(...)");
+                }
+            }
+        }
+    }
+
     // override rules
     for (const auto& [mname, mdecl] : c.method_decls) {
         if (!mdecl->has_self) continue;
@@ -492,7 +566,9 @@ void Checker::check_hierarchy(ClassInfo& c) {
                              type_name(inh_sigs[mname]) + ", this is " + type_name(own));
             }
         } else {
-            if (has_concrete) {
+            if (has_concrete && mname != "deinit" && mname != "init") {
+                // deinit never overrides (subclass runs, then parent's), and a
+                // subclass init calls super.init — both are composition
                 error_at(mdecl->line, mdecl->col,
                          "'" + mname + "' hides an inherited method — mark it override");
             } else if (has_sig && inh_sigs[mname] != own) {
@@ -785,9 +861,14 @@ TypeId Checker::class_type_of(const ClassInfo& c) {
 void Checker::check_fn_body(const FnDecl& f, ClassInfo* cls, EnumInfo* en) {
     if (!f.has_body) return;
 
+    // the constructor's straight-line-prefix proof runs before type checking,
+    // so "assign the fields first" lands ahead of any knock-on type errors
+    if (cls && f.has_self && f.name == "init") check_init_body(f, *cls);
+
     cur_class_ = cls;
     cur_enum_ = en;
     cur_has_self_ = f.has_self;
+    in_init_body_ = cls && f.has_self && f.name == "init";
     cur_type_params_.clear();
     if (cls) for (const std::string& g : cls->generic_params) cur_type_params_.insert(g);
     if (en) for (const std::string& g : en->generic_params) cur_type_params_.insert(g);
@@ -812,6 +893,7 @@ void Checker::check_fn_body(const FnDecl& f, ClassInfo* cls, EnumInfo* en) {
     cur_class_ = nullptr;
     cur_enum_ = nullptr;
     cur_has_self_ = false;
+    in_init_body_ = false;
     cur_ret_ = nullptr;
     cur_type_params_.clear();
 }
@@ -1792,6 +1874,12 @@ TypeId Checker::check_call(const Expr* e, TypeId expected) {
             return call_generic_fn(top_fn_decls_[fkey], top_fns_[fkey], "'" + name + "'");
         }
 
+        // a class name called like a function is construction through init
+        std::string ckey = resolve_class_key(name, e->line, e->col);
+        if (!ckey.empty()) {
+            return check_ctor_call(e, ckey, name, expected);
+        }
+
         error_at(e->line, e->col, "unknown function '" + name + "'");
         for (const ExprPtr& a : e->args) check_expr(a.get(), nullptr);
         return t_poison();
@@ -1804,6 +1892,19 @@ TypeId Checker::check_call(const Expr* e, TypeId expected) {
 
         if (obj->kind == Expr::Kind::ident && !find_local(std::string(obj->text))) {
             std::string n(obj->text);
+
+            // super.init(...) — contextual, not a keyword: only this exact
+            // form, only inside an init whose ancestor declares one
+            if (n == "super") {
+                if (mname != "init") {
+                    error_at(e->line, e->col,
+                             "only super.init(...) exists for now — call parent "
+                             "methods on self");
+                    for (const ExprPtr& a : e->args) check_expr(a.get(), nullptr);
+                    return t_poison();
+                }
+                return check_super_init(e);
+            }
 
             // package call
             auto pit = pkg_paths_.find(n);
@@ -1859,6 +1960,13 @@ TypeId Checker::check_call(const Expr* e, TypeId expected) {
                         callee->resolved = key;
                         return call_generic_fn(top_fn_decls_[key], fit->second,
                                                "'" + n + "." + mname + "'");
+                    }
+                    // pkg.Class(args): construction through the class's init
+                    auto cit2 = classes_.find(key);
+                    if (cit2 != classes_.end()) {
+                        check_pub(key, cit2->second.decl && cit2->second.decl->is_pub,
+                                  e->line, e->col, "type", n + "." + mname);
+                        return check_ctor_call(e, key, n + "." + mname, expected);
                     }
                 }
                 error_at(e->line, e->col,
@@ -1965,6 +2073,15 @@ TypeId Checker::check_call(const Expr* e, TypeId expected) {
             for (const ExprPtr& a : e->args) check_expr(a.get(), nullptr);
             return t_poison();
         }
+        if (t->k == Type::K::class_ && (mname == "init" || mname == "deinit")) {
+            error_at(e->line, e->col,
+                     mname == "init" ? "init runs when the object is built — call the class: " +
+                                           type_name(t) + "(...)"
+                                     : "deinit runs by itself when the last reference drops — "
+                                       "never call it");
+            for (const ExprPtr& a : e->args) check_expr(a.get(), nullptr);
+            return t_poison();
+        }
         Member m = lookup_member(t, mname, e->line, e->col);
         if (m.kind == Member::Kind::method) {
             if (m.is_static) {
@@ -1993,6 +2110,356 @@ TypeId Checker::check_call(const Expr* e, TypeId expected) {
     }
     for (const ExprPtr& a : e->args) check_expr(a.get(), nullptr);
     return t_poison();
+}
+
+// constructors ----------------------------------------------------------------
+
+// super.init(...): the child's own fields are already proven assigned by
+// check_init_body's walk; here the call form, context, and args are checked,
+// and the target class key lands in Expr::resolved for interp and codegen
+TypeId Checker::check_super_init(const Expr* e) {
+    if (!in_init_body_ || !cur_class_) {
+        error_at(e->line, e->col, "super.init can only be called from init");
+        for (const ExprPtr& a : e->args) check_expr(a.get(), nullptr);
+        return t_poison();
+    }
+    const ClassInfo* p = parent_class_of(*cur_class_);
+    const ClassInfo* owner = nullptr;
+    const FnDecl* ini = p ? chain_init(*p, &owner) : nullptr;
+    if (!ini) {
+        error_at(e->line, e->col,
+                 "no parent constructor to call — " +
+                     std::string(p ? "no class above declares an init"
+                                   : "'" + cur_class_->decl->name + "' has no parent"));
+        for (const ExprPtr& a : e->args) check_expr(a.get(), nullptr);
+        return t_poison();
+    }
+    check_pub(owner->decl->qualname, ini->is_pub, e->line, e->col, "init of",
+              owner->decl->name);
+
+    const std::vector<TypeId>& params = owner->methods.at("init")->fn_params;
+    if (e->args.size() != params.size()) {
+        error_at(e->line, e->col, "super.init takes " + std::to_string(params.size()) +
+                                      " argument(s), got " + std::to_string(e->args.size()));
+        for (const ExprPtr& a : e->args) check_expr(a.get(), nullptr);
+    } else {
+        for (size_t i = 0; i < e->args.size(); i++) {
+            TypeId got = check_expr(e->args[i].get(), params[i]);
+            if (!assignable(got, params[i])) {
+                error_at(e->args[i]->line, e->args[i]->col,
+                         "super.init argument " + std::to_string(i + 1) + " is " +
+                             type_name(params[i]) + ", got " + type_name(got));
+            }
+        }
+    }
+    e->callee->resolved = owner->decl->qualname;
+    return t_unit();
+}
+
+TypeId Checker::check_ctor_call(const Expr* e, const std::string& key,
+                                const std::string& shown, TypeId expected) {
+    ClassInfo& c = classes_.at(key);
+    if (c.decl->is_interface) {
+        error_at(e->line, e->col, "'" + shown + "' is an interface — it can't be built");
+        for (const ExprPtr& a : e->args) check_expr(a.get(), nullptr);
+        return t_poison();
+    }
+    // the constructor may be inherited: nearest class up the chain with an
+    // init builds this class (legal because a class between them may not add
+    // required fields — check_hierarchy enforced that)
+    const ClassInfo* owner = nullptr;
+    const FnDecl* ini = chain_init(c, &owner);
+    if (!ini) {
+        error_at(e->line, e->col, "'" + shown + "' has no init — build it with " + shown +
+                                      " { field: value }");
+        for (const ExprPtr& a : e->args) check_expr(a.get(), nullptr);
+        return t_poison();
+    }
+    check_pub(owner->decl->qualname, ini->is_pub, e->line, e->col, "init of", shown);
+
+    // generic classes take their type arguments from the spot, like short init
+    std::vector<TypeId> targs;
+    if (!c.generic_params.empty()) {
+        if (expected && expected->k == Type::K::class_ && expected->name == key &&
+            expected->args.size() == c.generic_params.size()) {
+            targs = expected->args;
+        } else {
+            error_at(e->line, e->col, "can't tell the type arguments of '" + shown +
+                                          "' here — the spot needs a declared type");
+            for (const ExprPtr& a : e->args) check_expr(a.get(), nullptr);
+            return t_poison();
+        }
+    }
+    std::map<std::string, TypeId> env;
+    for (size_t i = 0; i < targs.size(); i++) env[c.generic_params[i]] = targs[i];
+
+    // owner's signature: an inherited constructor can't mention this class's
+    // type params (supers take no type arguments), so subst only matters when
+    // owner == the class itself
+    TypeId ft = owner->methods.at("init");
+    std::vector<TypeId> params;
+    for (TypeId p : ft->fn_params) params.push_back(subst(p, env));
+
+    if (e->args.size() != params.size()) {
+        error_at(e->line, e->col, "'" + shown + "' init takes " +
+                                      std::to_string(params.size()) + " argument(s), got " +
+                                      std::to_string(e->args.size()));
+        for (const ExprPtr& a : e->args) check_expr(a.get(), nullptr);
+    } else {
+        for (size_t i = 0; i < e->args.size(); i++) {
+            TypeId got = check_expr(e->args[i].get(), params[i]);
+            if (!assignable(got, params[i])) {
+                error_at(e->args[i]->line, e->args[i]->col,
+                         "'" + shown + "' init argument " + std::to_string(i + 1) + " is " +
+                             type_name(params[i]) + ", got " + type_name(got));
+            }
+        }
+    }
+    e->callee->resolved = key; // interp and codegen construct straight from this
+    return pool_.named(Type::K::class_, key, std::move(targs));
+}
+
+// The straight-line-prefix proof: walking init's top-level statements in
+// order, a statement either assigns a field (its right side may only touch
+// self through reads of fields already assigned) or doesn't touch self at
+// all, and return is forbidden — until every field is assigned. This is what
+// makes a half-built object unobservable without definite-assignment
+// dataflow: conservative, one shape, both backends trust it.
+
+bool Checker::expr_touches_self(const Expr* e, const std::set<std::string>& ok_fields) {
+    if (!e) return false;
+    if (e->kind == Expr::Kind::self_ref) return true;
+    if (e->kind == Expr::Kind::string_lit &&
+        e->text.find('{') != std::string_view::npos) {
+        // interpolation segments are re-parsed after checking, so the walk
+        // can't see inside them — assume the worst until every field is in
+        return true;
+    }
+    if (e->kind == Expr::Kind::field && e->object &&
+        e->object->kind == Expr::Kind::self_ref) {
+        return !ok_fields.count(e->name); // reading an assigned field is fine
+    }
+    if (expr_touches_self(e->lhs.get(), ok_fields) ||
+        expr_touches_self(e->rhs.get(), ok_fields) ||
+        expr_touches_self(e->callee.get(), ok_fields) ||
+        expr_touches_self(e->object.get(), ok_fields) ||
+        expr_touches_self(e->index_expr.get(), ok_fields) ||
+        expr_touches_self(e->cond.get(), ok_fields) ||
+        expr_touches_self(e->then_e.get(), ok_fields) ||
+        expr_touches_self(e->else_e.get(), ok_fields) ||
+        expr_touches_self(e->subject.get(), ok_fields)) {
+        return true;
+    }
+    for (const ExprPtr& a : e->args) {
+        if (expr_touches_self(a.get(), ok_fields)) return true;
+    }
+    for (const InitEntry& en : e->entries) {
+        if (expr_touches_self(en.key.get(), ok_fields) ||
+            expr_touches_self(en.value.get(), ok_fields)) {
+            return true;
+        }
+    }
+    for (const MatchArm& m : e->arms) {
+        if (expr_touches_self(m.value.get(), ok_fields) ||
+            stmts_touch_self(m.body, ok_fields)) {
+            return true;
+        }
+    }
+    return stmts_touch_self(e->body, ok_fields); // closure body captures count
+}
+
+bool Checker::stmt_touches_self(const Stmt* s, const std::set<std::string>& ok_fields) {
+    if (!s) return false;
+    if (expr_touches_self(s->init.get(), ok_fields) ||
+        expr_touches_self(s->target.get(), ok_fields) ||
+        expr_touches_self(s->value.get(), ok_fields) ||
+        expr_touches_self(s->expr.get(), ok_fields) ||
+        expr_touches_self(s->cond.get(), ok_fields) ||
+        expr_touches_self(s->iterable.get(), ok_fields)) {
+        return true;
+    }
+    return stmts_touch_self(s->body, ok_fields) || stmts_touch_self(s->else_body, ok_fields);
+}
+
+bool Checker::stmts_touch_self(const std::vector<StmtPtr>& body,
+                               const std::set<std::string>& ok_fields) {
+    for (const StmtPtr& s : body) {
+        if (stmt_touches_self(s.get(), ok_fields)) return true;
+    }
+    return false;
+}
+
+// is this expression the super.init(...) call form?
+static bool is_super_init(const Expr* e) {
+    return e && e->kind == Expr::Kind::call && e->callee &&
+           e->callee->kind == Expr::Kind::field && e->callee->name == "init" &&
+           e->callee->object && e->callee->object->kind == Expr::Kind::ident &&
+           e->callee->object->text == "super";
+}
+
+// find super.init call sites other than the sanctioned one, anywhere in the
+// body — a branch, a loop, a closure, after the first. Exactly-once and
+// top-level are structural rules, so the walk is structural too.
+static void scan_stray_super(const Expr* e, const Expr* ok,
+                             std::vector<const Expr*>& out);
+static void scan_stray_super(const std::vector<StmtPtr>& body, const Expr* ok,
+                             std::vector<const Expr*>& out) {
+    for (const StmtPtr& s : body) {
+        scan_stray_super(s->init.get(), ok, out);
+        scan_stray_super(s->target.get(), ok, out);
+        scan_stray_super(s->value.get(), ok, out);
+        scan_stray_super(s->expr.get(), ok, out);
+        scan_stray_super(s->cond.get(), ok, out);
+        scan_stray_super(s->iterable.get(), ok, out);
+        scan_stray_super(s->body, ok, out);
+        scan_stray_super(s->else_body, ok, out);
+    }
+}
+static void scan_stray_super(const Expr* e, const Expr* ok,
+                             std::vector<const Expr*>& out) {
+    if (!e) return;
+    if (is_super_init(e) && e != ok) out.push_back(e);
+    scan_stray_super(e->lhs.get(), ok, out);
+    scan_stray_super(e->rhs.get(), ok, out);
+    scan_stray_super(e->callee.get(), ok, out);
+    scan_stray_super(e->object.get(), ok, out);
+    scan_stray_super(e->index_expr.get(), ok, out);
+    scan_stray_super(e->cond.get(), ok, out);
+    scan_stray_super(e->then_e.get(), ok, out);
+    scan_stray_super(e->else_e.get(), ok, out);
+    scan_stray_super(e->subject.get(), ok, out);
+    for (const ExprPtr& a : e->args) scan_stray_super(a.get(), ok, out);
+    for (const InitEntry& en : e->entries) {
+        scan_stray_super(en.key.get(), ok, out);
+        scan_stray_super(en.value.get(), ok, out);
+    }
+    for (const MatchArm& m : e->arms) {
+        scan_stray_super(m.value.get(), ok, out);
+        scan_stray_super(m.body, ok, out);
+    }
+    scan_stray_super(e->body, ok, out);
+}
+
+void Checker::check_init_body(const FnDecl& f, ClassInfo& cls) {
+    std::set<std::string> assigned, own_all, all;
+    for (const auto& [fname, fdecl] : cls.field_decls) {
+        own_all.insert(fname);
+        all.insert(fname);
+        if (fdecl->def) assigned.insert(fname); // defaults are already there
+    }
+
+    // inherited fields: with an ancestor init they arrive through
+    // super.init; without one, this init owns them like the raw form would
+    const ClassInfo* parent = parent_class_of(cls);
+    const FnDecl* anc_init = parent ? chain_init(*parent, nullptr) : nullptr;
+    std::vector<std::string> inherited;
+    for (const ClassInfo* k = parent; k; k = parent_class_of(*k)) {
+        for (const auto& [fname, fdecl] : k->field_decls) {
+            if (all.count(fname)) continue;
+            all.insert(fname);
+            inherited.push_back(fname);
+            if (anc_init) continue; // super.init assigns these, defaults included
+            size_t dot = k->decl->qualname.find('.');
+            std::string owner_pkg =
+                dot == std::string::npos ? "" : k->decl->qualname.substr(0, dot);
+            if (fdecl->def) {
+                assigned.insert(fname);
+            } else if (owner_pkg != cur_pkg_ && !fdecl->is_pub) {
+                error_at(f.line, f.col, "can't declare init here — inherited field '" +
+                                            fname + "' isn't pub and has no default");
+                assigned.insert(fname); // stop cascading
+            }
+        }
+    }
+
+    const Expr* sanctioned = nullptr; // the one top-level super.init
+    for (const StmtPtr& sp : f.body) {
+        // completion needs every field AND the parent's constructor run —
+        // its body may do post-prefix work the parent's invariants rely on
+        if (assigned.size() == all.size() && (!anc_init || sanctioned)) break;
+        const Stmt* s = sp.get();
+
+        if (anc_init && s->kind == Stmt::Kind::expr && is_super_init(s->expr.get())) {
+            if (sanctioned) {
+                error_at(s->line, s->col, "super.init runs once");
+                continue;
+            }
+            for (const std::string& fname : own_all) {
+                if (!assigned.count(fname)) {
+                    error_at(s->line, s->col, "assign this class's own fields before "
+                                              "super.init ('" +
+                                                  fname + "' isn't assigned yet)");
+                    break;
+                }
+            }
+            for (const ExprPtr& a : s->expr->args) {
+                if (expr_touches_self(a.get(), assigned)) {
+                    error_at(a->line, a->col, "super.init arguments can only read "
+                                              "fields already assigned");
+                }
+            }
+            sanctioned = s->expr.get();
+            for (const std::string& fname : inherited) assigned.insert(fname);
+            continue;
+        }
+
+        if (s->kind == Stmt::Kind::assign && s->target &&
+            s->target->kind == Expr::Kind::field && s->target->object &&
+            s->target->object->kind == Expr::Kind::self_ref) {
+            const std::string& fname = s->target->name;
+            if (anc_init && !own_all.count(fname) && all.count(fname)) {
+                error_at(s->line, s->col, "'" + fname + "' belongs to the parent — "
+                                          "super.init assigns it");
+                continue;
+            }
+            if (s->op != TokenKind::assign && !assigned.count(fname)) {
+                error_at(s->line, s->col,
+                         "init reads '" + fname + "' before assigning it");
+            }
+            if (expr_touches_self(s->value.get(), assigned)) {
+                error_at(s->line, s->col, "init can only read fields it has already "
+                                          "assigned — assign every field first");
+            }
+            if (all.count(fname)) assigned.insert(fname);
+            continue;
+        }
+        if (s->kind == Stmt::Kind::ret) {
+            error_at(s->line, s->col,
+                     anc_init && !sanctioned
+                         ? "init can't return before super.init"
+                         : "init can't return before every field is assigned");
+            continue;
+        }
+        if (stmt_touches_self(s, assigned)) {
+            std::string missing;
+            for (const std::string& fname : all) {
+                if (!assigned.count(fname)) { missing = fname; break; }
+            }
+            error_at(s->line, s->col, "init must assign every field before using self ('" +
+                                          missing + "' isn't assigned yet)");
+        }
+    }
+
+    if (anc_init) {
+        if (!sanctioned) {
+            error_at(f.line, f.col, "init must call super.init(...) — the parent's "
+                                    "constructor sets up its part");
+        }
+        std::vector<const Expr*> stray;
+        scan_stray_super(f.body, sanctioned, stray);
+        for (const Expr* s : stray) {
+            error_at(s->line, s->col, "super.init runs once, as a top-level statement "
+                                      "of init");
+        }
+    }
+
+    if (assigned.size() != all.size()) {
+        for (const std::string& fname : all) {
+            if (!assigned.count(fname)) {
+                error_at(f.line, f.col, "init never assigns field '" + fname + "'");
+            }
+        }
+    }
 }
 
 // initializers ----------------------------------------------------------------
@@ -2062,6 +2529,14 @@ TypeId Checker::check_init(const Expr* e, TypeId expected) {
     ClassInfo& c = cit->second;
     if (c.decl->is_interface) {
         error_at(e->line, e->col, "'" + cname + "' is an interface — it can't be built directly");
+        return t_poison();
+    }
+    if (chain_init(c, nullptr)) {
+        // one way in: the raw form would sidestep every invariant the chain's
+        // init holds, whether it is this class's own or an ancestor's
+        error_at(e->line, e->col,
+                 "'" + cname + "' has an init — build it with " + cname + "(...)");
+        for (const InitEntry& en : e->entries) check_expr(en.value.get(), nullptr);
         return t_poison();
     }
     if (targs.empty() && !c.generic_params.empty() && expected &&

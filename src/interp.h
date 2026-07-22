@@ -19,6 +19,12 @@ struct BeansPanic {
     uint32_t line = 0, col = 0;
 };
 
+// set at every BeansPanic throw site. A native panic exits the process on the
+// spot — no unwinding, no releases — so while a panic unwinds the interpreter,
+// deinit must stay silent or the two backends' output diverges. Workers that
+// catch-and-store a panic clear it.
+inline thread_local bool g_beans_panicking = false;
+
 // live worker-thread count (parallel to the native runtime's cc_threads). A
 // File/MMap closed while any worker runs defers its real fd/munmap release
 // until the handle's last ref drops, so the fd number is never reused for a
@@ -81,6 +87,19 @@ private:
                                         const Value& recv, const std::string& name);
     static Hint hint_of_bt(BT p);
     static Hint map_key_hint(const MapVal& m);
+
+    // ---- init / deinit ----
+    // ClassName(args): fresh object (defaults in, the rest unassigned), then init
+    Value construct(const ClassDecl* cls, const Expr* e, std::shared_ptr<Env>& env);
+    const ClassDecl* parent_of(const ClassDecl* c) const;
+    bool needs_deinit(const ClassDecl* c) const;
+
+public:
+    // called from the instance deleter the moment the last reference drops,
+    // before the fields are torn down — self is passed as a non-owning alias
+    void run_deinit(InstanceVal* inst);
+
+private:
     static std::string display_scalar(const Value& v);
     Value eval_string(const Expr* e, std::shared_ptr<Env>& env);
 

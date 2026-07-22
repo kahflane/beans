@@ -99,6 +99,24 @@ private:
     bool stmt_returns(const Stmt* s);
     bool has_break(const std::vector<StmtPtr>& body);
 
+    // ---- init / deinit ----
+    // the class's own init, or null
+    static const FnDecl* class_init(const ClassInfo& c);
+    // nearest class in the parent chain (this one included) that declares an
+    // init — the constructor Child(args) runs, and the super.init target when
+    // starting above the class itself
+    const FnDecl* chain_init(const ClassInfo& c, const ClassInfo** owner);
+    const ClassInfo* parent_class_of(const ClassInfo& c);
+    TypeId check_ctor_call(const Expr* e, const std::string& key,
+                           const std::string& shown, TypeId expected);
+    TypeId check_super_init(const Expr* e);
+    // proves init's straight-line prefix assigns every field before self is used
+    void check_init_body(const FnDecl& f, ClassInfo& cls);
+    bool expr_touches_self(const Expr* e, const std::set<std::string>& ok_fields);
+    bool stmt_touches_self(const Stmt* s, const std::set<std::string>& ok_fields);
+    bool stmts_touch_self(const std::vector<StmtPtr>& body,
+                          const std::set<std::string>& ok_fields);
+
     // ---- expressions ----
     TypeId check_expr(const Expr* e, TypeId expected);
     TypeId check_call(const Expr* e, TypeId expected);
@@ -155,6 +173,7 @@ private:
     EnumInfo* cur_enum_ = nullptr;
     TypeId cur_ret_ = nullptr;
     bool cur_has_self_ = false;
+    bool in_init_body_ = false; // super.init(...) is only meaningful here
     std::set<std::string> cur_type_params_;
     // block nesting inside the current fn body (1 = top level) — defer is a
     // function-exit hook and is only legal at depth 1

@@ -37,6 +37,7 @@ namespace {
 std::vector<std::string> g_args;
 
 [[noreturn]] void bpanic(uint32_t line, uint32_t col, std::string msg) {
+    g_beans_panicking = true; // deinit stays silent while this unwinds
     throw BeansPanic{std::move(msg), line, col};
 }
 

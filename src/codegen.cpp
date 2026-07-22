@@ -1286,6 +1286,10 @@ struct FnEmit {
     const TypeRef* ret_ref;
     const std::vector<StmtPtr>& body_ref;
     uint32_t dline, dcol;
+    std::string fn_name; // declared method/fn name; "" for closures
+    // a deinit whose class chain has an ancestor deinit calls it on every
+    // return path, after cleanup, right before ret — subclass first, then up
+    std::string deinit_chain;
     // closures: captured variables arrive as heap cells behind an env ptr
     const std::vector<std::pair<std::string, Ty*>>* captured = nullptr;
 
@@ -1298,7 +1302,10 @@ struct FnEmit {
         Ty* ty;
         bool boxed = false;
         bool owned = false; // frame holds a ref (lets); params/bindings borrow
+        int seq = 0;        // declaration order — deinit made release order
+                            // observable, and the interpreter dies newest-first
     };
+    int next_seq = 0;
     std::vector<std::map<std::string, Var>> scopes;
     struct LoopCtx { std::string brk, cont; size_t scope_depth; };
     std::vector<LoopCtx> loop_stack;
@@ -1318,7 +1325,8 @@ struct FnEmit {
            const ClassDecl* ifc, const EnumDecl* en, const std::map<std::string, Ty*>& e)
         : cg(cg), symbol(std::move(sym)), is_main(main), has_self(d.has_self),
           self_impl(si), self_iface(ifc), self_enum(en), env(e), params_ref(d.params),
-          ret_ref(d.ret.get()), body_ref(d.body), dline(d.line), dcol(d.col) {}
+          ret_ref(d.ret.get()), body_ref(d.body), dline(d.line), dcol(d.col),
+          fn_name(d.name) {}
 
     // closure form
     FnEmit(CG2& cg, const Expr* clo, std::string sym,
@@ -1395,7 +1403,7 @@ struct FnEmit {
             if (entry) entry_inits += code;
             else body += code;
         }
-        scopes.back()[name] = {slot, t, boxed};
+        scopes.back()[name] = {slot, t, boxed, false, next_seq++};
         return slot;
     }
     std::string fresh_slot(const char* tag, Ty* t) {
@@ -1439,16 +1447,23 @@ struct FnEmit {
     // release the frame-owned locals of scopes [from_depth, end)
     void release_scopes(size_t from_depth) {
         for (size_t si = scopes.size(); si-- > from_depth;) {
-            for (auto& [name, v] : scopes[si]) {
-                if (v.boxed) {
-                    if (v.owned) {
+            // newest declaration first — the scope map is alphabetical, but
+            // deinit made release order observable and the interpreter's
+            // frames die newest-first
+            std::vector<const Var*> ordered;
+            for (auto& [name, v] : scopes[si]) ordered.push_back(&v);
+            std::sort(ordered.begin(), ordered.end(),
+                      [](const Var* a, const Var* b) { return a->seq > b->seq; });
+            for (const Var* v : ordered) {
+                if (v->boxed) {
+                    if (v->owned) {
                         std::string cell = reg();
-                        line(cell + " = load ptr, ptr " + v.slot);
+                        line(cell + " = load ptr, ptr " + v->slot);
                         emit_release(cell);
                     }
-                } else if (v.owned && is_rc(v.ty)) {
+                } else if (v->owned && is_rc(v->ty)) {
                     std::string val = reg();
-                    line(val + " = load ptr, ptr " + v.slot);
+                    line(val + " = load ptr, ptr " + v->slot);
                     emit_release(val);
                 }
             }
@@ -2198,6 +2213,12 @@ struct FnEmit {
             label(skipb);
         }
         release_scopes(0);
+        if (!deinit_chain.empty()) {
+            // parent's deinit after this one is fully done (defers included),
+            // while self is still alive — the caller walks the children next
+            Var* sv = find_var("self");
+            if (sv) line("call void " + deinit_chain + "(ptr " + var_read(sv) + ")");
+        }
         line(ret_instr);
     }
     bool in_temps(const std::string& v) const {
@@ -2348,6 +2369,81 @@ struct FnEmit {
         return {v.first, to};
     }
 
+    static bool impl_chain_has_deinit(CImpl* im) {
+        for (CImpl* p = im; p; p = p->parent) {
+            for (const FnDecl& m : p->decl->methods) {
+                if (m.has_self && m.name == "deinit" && m.has_body) return true;
+            }
+        }
+        return false;
+    }
+
+    // flag the rc word of a freshly built object whose chain has a deinit —
+    // every construction path must do this (ctor call and raw initializer),
+    // or the object dies silently
+    void emit_fin_flag(const std::string& o, CImpl* im) {
+        if (!impl_chain_has_deinit(im)) return;
+        std::string rcp = reg(), rcv = reg(), rcn = reg();
+        line(rcp + " = getelementptr i8, ptr " + o + ", i64 -16");
+        line(rcv + " = load i64, ptr " + rcp);
+        line(rcn + " = or i64 " + rcv + ", " + std::to_string(1LL << 61));
+        line("store i64 " + rcn + ", ptr " + rcp);
+    }
+
+    // ClassName(args): fresh object — defaults in, the rest zero, which the
+    // checker proved init assigns before anything reads — then the init call.
+    // Args are evaluated before the allocation, matching the interpreter.
+    EV eval_ctor(const Expr* e, const ClassDecl* cd, Ty* hint) {
+        CImpl* im = nullptr;
+        if (cd->generics.empty()) {
+            im = cg.request_impl(cd, {}, e->line, e->col);
+        } else if (hint && hint->k == Ty::obj_) {
+            auto it = cg.impl_by_name.find(hint->name);
+            if (it != cg.impl_by_name.end()) im = it->second;
+        }
+        // the constructor may be inherited — nearest impl up the chain that
+        // declares an init builds this class
+        const FnDecl* ini = nullptr;
+        CImpl* owner = nullptr;
+        for (CImpl* p = im; p && !ini; p = p->parent) {
+            for (const FnDecl& m : p->decl->methods) {
+                if (m.has_self && m.name == "init") { ini = &m; owner = p; }
+            }
+        }
+        if (!im || !ini) {
+            err(e, "building this");
+            return {"null", cg.t_bad()};
+        }
+
+        std::vector<EV> args = eval_args(e, ini->params, owner->env);
+
+        int size = 16 + 8 * static_cast<int>(im->fields.size());
+        long long mask = 0;
+        for (const CImpl::FieldInfo& f : im->fields) {
+            if (is_rc(f.ty)) mask |= 1LL << (f.offset / 8);
+        }
+        std::string o = alloc_bytes(size, fixed_meta(mask));
+        line("store ptr @vt_" + im->mangled + ", ptr " + o);
+        store_at(o, 8, std::to_string(im->id), cg.t_i64());
+        for (const CImpl::FieldInfo& f : im->fields) {
+            if (f.decl->def) {
+                EV v = eval(f.decl->def.get(), f.ty);
+                transfer_in(v);
+                store_at(o, f.offset, v.first, f.ty);
+            } else if (f.ty->k == Ty::f64_) {
+                store_at(o, f.offset, fmt_double(0), f.ty);
+            } else if (f.ty->k == Ty::i64_ || f.ty->k == Ty::i1_) {
+                store_at(o, f.offset, "0", f.ty);
+            } else {
+                store_at(o, f.offset, "null", f.ty);
+            }
+        }
+        emit_fin_flag(o, im);
+        emit_call("@m_" + owner->mangled + "_init", cg.t_unit(), args_text(args, o));
+        own(o, cg.t_obj(im->mangled));
+        return {o, cg.t_obj(im->mangled)};
+    }
+
     EV eval_init(const Expr* e, Ty* hint) {
         // map literal / short map init
         bool is_map_hint = hint && hint->k == Ty::map_;
@@ -2427,6 +2523,7 @@ struct FnEmit {
                 store_at(o, f.offset, "null", f.ty);
             }
         }
+        emit_fin_flag(o, im);
         own(o, cg.t_obj(im->mangled));
         return {o, cg.t_obj(im->mangled)};
     }
@@ -2542,6 +2639,22 @@ struct FnEmit {
             if (fit != cg.fn_decls.end()) {
                 return call_top_fn(e, fit->second);
             }
+            // a class name called like a function: construction through init.
+            // Same resolution ladder as eval_init — checker key, plain name,
+            // current package (re-parsed interpolation segments).
+            {
+                const ClassDecl* cd = nullptr;
+                if (!callee->resolved.empty()) {
+                    auto cit = cg.class_decls.find(callee->resolved);
+                    if (cit != cg.class_decls.end()) cd = cit->second;
+                } else {
+                    auto cit = cg.class_decls.find(name);
+                    if (cit == cg.class_decls.end())
+                        cit = cg.class_decls.find(cg.qual(name));
+                    if (cit != cg.class_decls.end()) cd = cit->second;
+                }
+                if (cd) return eval_ctor(e, cd, hint);
+            }
             err(e, "calling '" + name + "'");
             return {"0", cg.t_i64()};
         }
@@ -2593,6 +2706,33 @@ struct FnEmit {
             if (r != "std.thread.spawn" && rfit != cg.fn_decls.end()) {
                 return call_top_fn(e, rfit->second);
             }
+            // super.init(...): direct call of the resolved ancestor's init on
+            // the live self — construction is not restarted
+            if (mname == "init" && obj->kind == Expr::Kind::ident &&
+                obj->text == "super" && self_impl) {
+                CImpl* anc = nullptr;
+                for (CImpl* p = self_impl->parent; p; p = p->parent) {
+                    if (p->decl->qualname == r) { anc = p; break; }
+                }
+                const FnDecl* ini = nullptr;
+                if (anc) {
+                    for (const FnDecl& m : anc->decl->methods) {
+                        if (m.has_self && m.name == "init") ini = &m;
+                    }
+                }
+                Var* sv = find_var("self");
+                if (!ini || !sv) {
+                    err(e, "super.init here");
+                    return {"", cg.t_unit()};
+                }
+                std::vector<EV> args = eval_args(e, ini->params, anc->env);
+                emit_call("@m_" + anc->mangled + "_init", cg.t_unit(),
+                          args_text(args, var_read(sv)));
+                return {"", cg.t_unit()};
+            }
+            // pkg.Class(args) — the checker pinned the class key
+            auto rcit = cg.class_decls.find(r);
+            if (rcit != cg.class_decls.end()) return eval_ctor(e, rcit->second, hint);
         }
 
         if (obj->kind == Expr::Kind::ident && !find_var(std::string(obj->text))) {
@@ -3814,6 +3954,10 @@ struct FnEmit {
             size_t mark = temps.size();
             exec(s.get());
             if (!terminated) flush_temps(mark);
+            // a terminating statement (return/break) released every temp on
+            // its own path — drop its entries, or the sibling branch's next
+            // flush re-releases values it never made (LLVM's dominance error)
+            else if (temps.size() > mark) temps.resize(mark);
         }
         if (!terminated) release_scopes(scopes.size() - 1);
         scopes.pop_back();
@@ -4111,6 +4255,15 @@ struct FnEmit {
             else if (self_iface) self_ty = cg.t_obj(self_iface->qualname, self_iface);
             else if (self_enum) self_ty = cg.t_enum(self_enum->qualname, {});
         }
+        if (fn_name == "deinit" && self_impl) {
+            for (CImpl* p = self_impl->parent; p; p = p->parent) {
+                bool has = false;
+                for (const FnDecl& m : p->decl->methods) {
+                    if (m.has_self && m.name == "deinit" && m.has_body) has = true;
+                }
+                if (has) { deinit_chain = "@m_" + p->mangled + "_deinit"; break; }
+            }
+        }
 
         std::string header = "define ";
         header += is_main ? "i32" : ll(ret_ty);
@@ -4172,6 +4325,7 @@ struct FnEmit {
             size_t mark = temps.size();
             exec(s.get());
             if (!terminated) flush_temps(mark);
+            else if (temps.size() > mark) temps.resize(mark); // see exec_block
         }
         if (!terminated) {
             if (is_main) emit_ret("ret i32 0");
@@ -4286,6 +4440,16 @@ std::string CodeGen::generate() {
 
     if (!errors_.empty()) return "";
 
+    // deinit dispatches from the C runtime through the vtable, so its slot
+    // must exist even though beans code can never call it by name
+    bool any_deinit = false;
+    for (const auto& up : cg.impls) {
+        for (const FnDecl& m : up->decl->methods) {
+            if (m.has_self && m.name == "deinit" && m.has_body) any_deinit = true;
+        }
+    }
+    if (any_deinit) cg.selector("deinit");
+
     // vtables: every impl gets a table over the global selector set
     int nsel = static_cast<int>(cg.selectors.size());
     std::string tables;
@@ -4305,6 +4469,9 @@ std::string CodeGen::generate() {
         }
         tables += "]\n";
     }
+    // vtable slot the C runtime dispatches deinit through; -1 = program has none
+    tables += "@beans_deinit_sel = global i64 " +
+              std::to_string(any_deinit ? cg.selectors["deinit"] : -1) + "\n";
     // class parent table for as?
     tables += "@beans_class_parents = global [" +
               std::to_string(cg.impls.empty() ? 1 : cg.impls.size()) + " x i64] [";
@@ -4504,6 +4671,10 @@ const char* CodeGen::runtime_c() {
 #define RC_CLS_SHIFT 48
 #define RC_CLS_MAX 4095LL
 #define RC_COUNT(v) ((v) & ((1LL << RC_CLS_SHIFT) - 1))
+// rc bit 61: this object's class chain has a deinit — user code runs when the
+// count hits zero. Lives in the rc word (not meta) so pointer-mask walkers and
+// shell frees never see it; retain/release arithmetic can't carry into it.
+#define RC_FIN (1LL << 61)
 
 // meta layout
 #define CC_SHAPE ((1LL << 61) - 1)
@@ -4534,6 +4705,37 @@ static _Atomic int cc_pending;
 static int cc_collecting;
 static void cc_collect(int force);
 
+// vtable slot of deinit, emitted by codegen (-1 when no class has one).
+// Deinit runs inside a release cascade, where allocation used to be
+// impossible — beans_in_deinit keeps the collector out of that window,
+// because a mid-destroy object must never be walked.
+extern long long beans_deinit_sel;
+// NOT thread-local: a TLS read compiles to a _tlv_get_addr call. A shared
+// flag is exactly as correct — the collector only runs with zero worker
+// threads, so "any thread is mid-deinit" is the right gate anyway. Plain
+// int + __atomic builtins (an _Atomic type rejects __atomic_add_fetch).
+static int beans_in_deinit;
+
+// deinit, before the children go — outlined and cold: the indirect call must
+// stay out of beans_release's hot loop or the optimizer treats every
+// iteration as clobbered (that cost 50% on the churn bench). Count up to 1
+// and FIN off first: user code in there may retain and release self without
+// re-entering death, and death can't run twice (husk and collector paths see
+// FIN already gone). Count back to 0 after: the husk filter frees a parked
+// shell only when RC_COUNT is 0, so the bump must not outlive the call (it
+// leaked a buffered object's shell once).
+__attribute__((noinline, cold, preserve_most)) static void beans_do_deinit(
+    void* p, BHead* h, long long nrc) {
+    if (cc_mt) __atomic_store_n(&h->rc, (nrc + 1) & ~RC_FIN, __ATOMIC_RELAXED);
+    else h->rc = (nrc + 1) & ~RC_FIN;
+    void (**vt)(void*) = *(void (***)(void*))p;
+    __atomic_add_fetch(&beans_in_deinit, 1, __ATOMIC_RELAXED);
+    vt[beans_deinit_sel](p);
+    __atomic_sub_fetch(&beans_in_deinit, 1, __ATOMIC_RELAXED);
+    if (cc_mt) __atomic_store_n(&h->rc, nrc & ~RC_FIN, __ATOMIC_RELAXED);
+    else h->rc = nrc & ~RC_FIN;
+}
+
 // segregated per-thread freelists over 64KB slabs: one calloc per slab,
 // then carve; a free pushes the block on the freeing thread's list. Slabs
 // are registered globally so the leaks tool sees every allocation as
@@ -4557,7 +4759,9 @@ __attribute__((constructor)) static void pool_setup(void) {
 void beans_panic(const char* msg, long long line, long long col);
 void* beans_alloc(long long size, long long meta) {
     // allocation is the one safe point: never inside a release cascade,
-    // and every stored reference is already counted
+    // and every stored reference is already counted (a deinit body is the
+    // exception — cc_collect itself bails while one runs, so this exact
+    // condition stays byte-identical to keep clang's fast-path layout)
     if (cc_pending && !cc_collecting && cc_threads == 0) cc_collect(0);
     size_t total = (16 + (size_t)size + 15) & ~(size_t)15;
     long long cls = (long long)(total >> 4);
@@ -4776,6 +4980,11 @@ void beans_release(void* p) {
                                   : (h->rc -= 1);
             if (RC_COUNT(nrc) == 0) {
                 long long meta = h->meta;
+                // FIN is only ever set on class objects, so it alone decides
+                if (__builtin_expect(nrc & RC_FIN, 0)) {
+                    beans_do_deinit(cur, h, nrc);
+                    meta = h->meta; // colors can move while user code runs
+                }
                 cc_walk(cur, meta, cc_visit_push, &st);
                 if (meta & CC_BUF) {
                     // parked — the buffer still points here, so the collector
@@ -4871,6 +5080,10 @@ static long long cc_walk_min = 256; // adaptive gate for trial deletion
 
 static void cc_collect(int force) {
     if (cc_collecting) return;
+    // a deinit body is user code running mid-cascade: its allocations must
+    // not start a collection — a mid-destroy object must never be walked.
+    // cc_pending stays set, so the next allocation after the cascade retries.
+    if (__atomic_load_n(&beans_in_deinit, __ATOMIC_RELAXED)) return;
     cc_collecting = 1;
     if (cc_mt) pthread_mutex_lock(&cc_mu);
 
@@ -5424,8 +5637,10 @@ void beans_list_reverse(BList* l) {
     }
 }
 void beans_list_clear(BList* l) {
+    // last element first — deinit made death order observable, and the
+    // interpreter's vector teardown destroys back to front
     if ((head_of(l)->meta & CC_SHAPE) >> 3 & 1) {
-        for (long long i = 0; i < l->len; i++) {
+        for (long long i = l->len; i-- > 0;) {
             if (l->data[i]) beans_release((void*)l->data[i]);
         }
     }
@@ -5661,9 +5876,11 @@ BList* beans_map_values(BMap* m) {
 }
 void beans_map_clear(BMap* m) {
     long long flags = (head_of(m)->meta & CC_SHAPE) >> 3;
-    for (long long i = 0; i < m->used; i++) { // holes are zeroed: null-skip
-        if ((flags & 1) && m->data[i * 2]) beans_release((void*)m->data[i * 2]);
+    // reverse, value before key: the interpreter's pair teardown runs members
+    // last-first, entries back to front — observable once a deinit prints
+    for (long long i = m->used; i-- > 0;) { // holes are zeroed: null-skip
         if ((flags & 2) && m->data[i * 2 + 1]) beans_release((void*)m->data[i * 2 + 1]);
+        if ((flags & 1) && m->data[i * 2]) beans_release((void*)m->data[i * 2]);
     }
     m->len = 0;
     m->used = 0;
