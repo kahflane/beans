@@ -196,6 +196,7 @@ private:
         if (method == "textDocument/didOpen") { on_did_open(p); return; }
         if (method == "textDocument/didChange") { on_did_change(p); return; }
         if (method == "textDocument/didClose") { on_did_close(p); return; }
+        if (method == "textDocument/hover") { on_hover(id, p); return; }
 
         // unknown request -> method-not-found; unknown notification -> ignore
         if (id) reply_error(*id, -32601, "method not found: " + method);
@@ -204,6 +205,7 @@ private:
     void on_initialize(const Json* id, const Json&) {
         Json caps = Json::object();
         caps.set("textDocumentSync", Json::number(1)); // 1 = full document sync
+        caps.set("hoverProvider", Json::boolean(true));
 
         Json result = Json::object();
         result.set("capabilities", std::move(caps));
@@ -284,6 +286,45 @@ private:
         m.set("method", Json::string("textDocument/publishDiagnostics"));
         m.set("params", std::move(params));
         write_message(m);
+    }
+
+    // overlay of every open buffer, keyed by filesystem path
+    std::map<std::string, std::string> overlay_map() const {
+        std::map<std::string, std::string> m;
+        for (const auto& kv : docs_) m[uri_to_path(kv.first)] = kv.second.text;
+        return m;
+    }
+
+    // ---- hover ------------------------------------------------------------
+    void on_hover(const Json* id, const Json& p) {
+        if (!id) return;
+        const Json* td = p.find("textDocument");
+        const Json* pos = p.find("position");
+        auto it = td ? docs_.find(td->get_str("uri")) : docs_.end();
+        if (!td || !pos || it == docs_.end()) { reply(*id, Json::null()); return; }
+
+        const std::string& text = it->second.text;
+        uint32_t line = 0, col = 0;
+        from_lsp(text,
+                 {static_cast<uint32_t>(pos->get_num("line")),
+                  static_cast<uint32_t>(pos->get_num("character"))},
+                 line, col);
+        std::string path = uri_to_path(td->get_str("uri"));
+
+        std::map<std::string, std::string> overlay = overlay_map();
+        set_loader_overlay(&overlay);
+        Loader loader;
+        std::string md;
+        if (loader.load(path)) md = hover_at(loader.program(), path, line, col);
+        set_loader_overlay(nullptr);
+
+        if (md.empty()) { reply(*id, Json::null()); return; }
+        Json contents = Json::object();
+        contents.set("kind", Json::string("markdown"));
+        contents.set("value", Json::string(md));
+        Json result = Json::object();
+        result.set("contents", std::move(contents));
+        reply(*id, std::move(result));
     }
 
     struct DocState {

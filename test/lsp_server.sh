@@ -33,6 +33,9 @@ rc, objs = run([
            "params":{"textDocument":{"uri":uri,"text":bad}}}),
     frame({"jsonrpc":"2.0","method":"textDocument/didChange",
            "params":{"textDocument":{"uri":uri},"contentChanges":[{"text":good}]}}),
+    # hover the `main` name on the (now valid) buffer: line 0, char 3
+    frame({"jsonrpc":"2.0","id":3,"method":"textDocument/hover",
+           "params":{"textDocument":{"uri":uri},"position":{"line":0,"character":3}}}),
     frame({"jsonrpc":"2.0","id":2,"method":"shutdown"}),
     frame({"jsonrpc":"2.0","method":"exit"}),
 ])
@@ -57,9 +60,14 @@ if "nope" not in pubs[0]["params"]["diagnostics"][0]["message"]:
 if len(pubs[-1]["params"]["diagnostics"]) != 0:
     fail("diagnostics should clear after the fix")
 
+hov = next((o for o in objs if o.get("id") == 3), None)
+val = hov and hov.get("result") and hov["result"].get("contents", {}).get("value", "")
+if not val or "fn main" not in val:
+    fail(f"hover on `main` should render its signature, got: {val!r}")
+
 sh = next((o for o in objs if o.get("id") == 2), None)
 if not sh or "result" not in sh:
     fail("shutdown did not reply")
 
-print("ok lsp server: initialize, overlay check, diagnostics raised and cleared")
+print("ok lsp server: initialize, overlay check, diagnostics, hover")
 PY
