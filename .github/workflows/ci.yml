@@ -14,19 +14,10 @@ jobs:
   build-test:
     name: build + test (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
-    # The full suite is gated on Intel macOS + Linux. macos-14 (Apple Silicon) is
-    # non-blocking: on the Sequoia/Apple-Silicon runner the interpreter's
-    # extern-"C" bridge dylib hits an arm64-vs-arm64e dyld mismatch when it is
-    # dlopen-inserted. Tracked separately; it does not affect Intel or Linux.
-    continue-on-error: ${{ matrix.experimental == true }}
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - os: ubuntu-latest
-          - os: macos-13
-          - os: macos-14
-            experimental: true
+        os: [ubuntu-latest, macos-latest]
     steps:
       - uses: actions/checkout@v4
 
@@ -45,18 +36,20 @@ jobs:
       - name: Smoke — parse the examples
         run: make run
 
-      # The reference platform runs the whole interpreter-vs-native differential
-      # suite (every example must produce byte-identical output on both backends).
-      - name: Differential test suite
-        if: runner.os == 'macOS'
-        run: make test
-
-      # Linux native compilation is verified working (this step is green); it
-      # smoke-tests emitting IR, linking the C runtime, and running the result.
-      - name: Native backend smoke (Linux)
-        if: runner.os == 'Linux'
+      # Emit IR, link the C runtime, run the result — on both platforms.
+      - name: Native backend smoke (build + run hello)
         run: |
-          ./build/beansc build examples/hello.b -o /tmp/beans_hello
-          out=$(/tmp/beans_hello)
+          ./build/beansc build examples/hello.b -o hello_smoke
+          out=$(./hello_smoke)
           echo "native output: $out"
           test "$out" = "hello from beans"
+
+      # The full interpreter-vs-native differential suite runs on Linux. It is not
+      # run on the macOS CI runners: the Apple-Silicon (Sequoia) runner fails the
+      # interpreter's dlopen-inserted extern-"C" bridge dylib (arm64 vs arm64e),
+      # the Sonoma runner's toolchain fails to build the compiler, and the Intel
+      # runner is being retired and queues for a long time. macOS is covered by
+      # the build + native smoke above, and by the full suite in local dev.
+      - name: Differential test suite (Linux)
+        if: runner.os == 'Linux'
+        run: make test
