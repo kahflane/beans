@@ -47,6 +47,13 @@ expect "$fixture:36:5"  'Paid in cash'
 # a use site resolves to the definition and reports where it lives
 expect "$fixture:43:18" 'fn add(a: int, b: int) -> int'
 expect "$fixture:43:18" 'doc_hover.b:9'
+# span-based precision: a parameter and a local resolve to their declared types
+expect "$fixture:10:12" 'a: int'
+expect "$fixture:10:12" 'parameter'
+expect "$fixture:42:9"  'let p: Point'
+expect "$fixture:42:9"  'local'
+# a type annotation resolves as a type, not a same-named value
+expect "$fixture:42:12" 'class Point'
 # builtin method: signature comes from the registry, not a hardcoded list
 expect "examples/tour.b:87:21" 'fn string.to_int() -> Result<int>'
 # stdlib symbol: signature comes from the real beans source in lib/std
