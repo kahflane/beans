@@ -42,6 +42,12 @@ Token Lexer::make(TokenKind kind) {
     t.text = src_.substr(start_, pos_ - start_);
     t.line = start_line_;
     t.col = start_col_;
+    // A doc block binds to the token on the line immediately below it.
+    if (pending_doc_valid_ && start_line_ == pending_doc_end_line_ + 1) {
+        t.doc = src_.substr(pending_doc_start_off_,
+                            pending_doc_end_off_ - pending_doc_start_off_);
+    }
+    pending_doc_valid_ = false; // any real token clears the pending doc
     last_ = kind;
     any_token_yet_ = true;
     return t;
@@ -245,8 +251,25 @@ std::vector<Token> Lexer::scan_all() {
                 }
                 case '/':
                     if (peek2() == '/') {
-                        advance(); advance();
-                        skip_line_comment();
+                        size_t doc_line_start = pos_;   // at the first '/'
+                        uint32_t doc_line = line_;
+                        advance(); advance();           // consume "//"
+                        // "///text" (but not a "////" divider) is a doc comment:
+                        // its text is kept and bound to the next real token.
+                        bool is_doc = (peek() == '/' && peek2() != '/');
+                        if (is_doc) advance();          // consume the third '/'
+                        skip_line_comment();            // to end of line
+                        if (is_doc) {
+                            if (pending_doc_valid_ &&
+                                doc_line == pending_doc_end_line_ + 1) {
+                                pending_doc_end_off_ = pos_;      // extend the block
+                            } else {
+                                pending_doc_start_off_ = doc_line_start; // new block
+                                pending_doc_end_off_ = pos_;
+                                pending_doc_valid_ = true;
+                            }
+                            pending_doc_end_line_ = doc_line;
+                        }
                     } else if (peek2() == '*') {
                         start_ = pos_; start_line_ = line_; start_col_ = col_;
                         advance(); advance();
@@ -347,9 +370,9 @@ std::vector<Token> Lexer::scan_all() {
 
     // close the last statement if the file doesn't end with a newline
     if (any_token_yet_ && ends_statement(last_)) {
-        out.push_back({TokenKind::newline, {}, line_, col_});
+        out.push_back({TokenKind::newline, {}, {}, line_, col_});
     }
-    out.push_back({TokenKind::eof, {}, line_, col_});
+    out.push_back({TokenKind::eof, {}, {}, line_, col_});
     return out;
 }
 

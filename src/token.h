@@ -43,6 +43,7 @@ enum class TokenKind : uint8_t {
 struct Token {
     TokenKind kind;
     std::string_view text;   // slice into the source buffer
+    std::string_view doc;    // `///` doc block bound to this token, else empty
     uint32_t line;           // 1-based
     uint32_t col;            // 1-based, bytes
 };

@@ -76,6 +76,13 @@ private:
     TokenKind last_ = TokenKind::newline;
     bool any_token_yet_ = false;
 
+    // pending `///` doc block; make() binds it to the token on the line just
+    // below it, so a declaration's doc comment reaches the parser as trivia.
+    size_t pending_doc_start_off_ = 0;
+    size_t pending_doc_end_off_ = 0;
+    uint32_t pending_doc_end_line_ = 0;
+    bool pending_doc_valid_ = false;
+
     std::vector<LexError> errors_;
 };
 

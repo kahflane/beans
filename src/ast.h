@@ -200,6 +200,7 @@ struct Stmt {
 // ---- declarations ---------------------------------------------------------
 
 struct FnDecl {
+    std::string doc; // leading `///` doc block, empty if none
     bool is_pub = false;
     bool is_override = false;
     bool is_static = false;
@@ -218,6 +219,7 @@ struct FnDecl {
 };
 
 struct FieldDecl {
+    std::string doc; // leading `///` doc block, empty if none
     bool is_pub = false;
     std::string name;
     TypePtr type;
@@ -226,6 +228,7 @@ struct FieldDecl {
 };
 
 struct ClassDecl { // also interfaces (is_interface)
+    std::string doc; // leading `///` doc block, empty if none
     bool is_pub = false;
     bool is_interface = false;
     bool is_struct = false;   // inline value, never an ARC object
@@ -245,11 +248,13 @@ struct ClassDecl { // also interfaces (is_interface)
 };
 
 struct EnumVariant {
+    std::string doc; // leading `///` doc block, empty if none
     std::string name;
     std::vector<Param> payload;
 };
 
 struct EnumDecl {
+    std::string doc; // leading `///` doc block, empty if none
     bool is_pub = false;
     std::string name;
     std::string qualname;

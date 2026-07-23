@@ -41,7 +41,7 @@ bool is_assign_op(TokenKind k) {
 
 Parser::Parser(std::vector<Token> tokens) : tokens_(std::move(tokens)) {
     if (tokens_.empty()) {
-        tokens_.push_back({TokenKind::eof, {}, 1, 1});
+        tokens_.push_back({TokenKind::eof, {}, {}, 1, 1});
     }
 }
 
@@ -194,6 +194,7 @@ ImportDecl Parser::parse_import() {
 }
 
 void Parser::parse_decl(Module& m) {
+    std::string doc(cur().doc); // doc block bound to this decl's first token
     bool is_pub = accept(TokenKind::kw_pub);
     if (accept(TokenKind::at)) {
         std::string name = check(TokenKind::ident) ? std::string(cur().text) : "";
@@ -223,35 +224,41 @@ void Parser::parse_decl(Module& m) {
         case TokenKind::kw_class:
             if (is_c_layout) error_at(cur(), "extern \"C\" applies to structs, unions, and functions, not classes");
             m.classes.push_back(parse_class(is_pub, false, is_move_only));
+            m.classes.back().doc = doc;
             m.order.push_back({Module::DeclKind::class_, m.classes.size() - 1});
             break;
         case TokenKind::kw_struct:
             if (is_move_only) error_at(cur(), "unique applies to classes, not structs");
             m.classes.push_back(parse_class(is_pub, false, is_move_only, true, is_c_layout));
+            m.classes.back().doc = doc;
             m.order.push_back({Module::DeclKind::class_, m.classes.size() - 1});
             break;
         case TokenKind::kw_union:
             if (is_move_only) error_at(cur(), "unique applies to classes, not unions");
             if (!is_c_layout) error_at(cur(), "union requires extern \"C\"");
             m.classes.push_back(parse_class(is_pub, false, is_move_only, false, true, true));
+            m.classes.back().doc = doc;
             m.order.push_back({Module::DeclKind::class_, m.classes.size() - 1});
             break;
         case TokenKind::kw_interface:
             if (is_move_only) error_at(cur(), "unique applies to classes, not interfaces");
             if (is_c_layout) error_at(cur(), "extern \"C\" does not apply to interfaces");
             m.classes.push_back(parse_class(is_pub, true, false));
+            m.classes.back().doc = doc;
             m.order.push_back({Module::DeclKind::class_, m.classes.size() - 1});
             break;
         case TokenKind::kw_enum:
             if (is_move_only) error_at(cur(), "unique applies to classes, not enums");
             if (is_c_layout) error_at(cur(), "extern \"C\" does not apply to enums");
             m.enums.push_back(parse_enum(is_pub));
+            m.enums.back().doc = doc;
             m.order.push_back({Module::DeclKind::enum_, m.enums.size() - 1});
             break;
         case TokenKind::kw_fn:
             if (is_move_only) error_at(cur(), "unique applies to classes, not functions");
             {
                 FnDecl f = parse_fn(is_pub, false, is_c_layout);
+                f.doc = doc;
                 if (is_c_layout) {
                     f.is_extern_c = true;
                     f.extern_name = f.name;
@@ -342,6 +349,7 @@ ClassDecl Parser::parse_class(bool is_pub, bool is_interface, bool is_move_only,
     expect(TokenKind::lbrace, "'{'");
     skip_newlines();
     while (!check(TokenKind::rbrace) && !at_eof()) {
+        std::string mdoc(cur().doc); // doc block bound to this member's first token
         bool member_pub = accept(TokenKind::kw_pub);
         bool member_override = accept(TokenKind::kw_override);
         bool member_static = accept(TokenKind::kw_static);
@@ -350,8 +358,10 @@ ClassDecl Parser::parse_class(bool is_pub, bool is_interface, bool is_move_only,
                 error_at(cur(), "static interface methods are not supported");
             c.methods.push_back(parse_fn(member_pub, member_override, is_interface,
                                          true, member_static));
+            c.methods.back().doc = mdoc;
         } else if (check(TokenKind::ident) && !member_override && !member_static) {
             FieldDecl f;
+            f.doc = mdoc;
             f.is_pub = member_pub;
             f.line = cur().line;
             f.col = cur().col;
@@ -391,11 +401,14 @@ EnumDecl Parser::parse_enum(bool is_pub) {
     expect(TokenKind::lbrace, "'{'");
     skip_newlines();
     while (!check(TokenKind::rbrace) && !at_eof()) {
+        std::string mdoc(cur().doc); // doc block bound to this member's first token
         if (check(TokenKind::kw_fn) || check(TokenKind::kw_pub)) {
             bool method_pub = accept(TokenKind::kw_pub);
             e.methods.push_back(parse_fn(method_pub, false, false, true, false));
+            e.methods.back().doc = mdoc;
         } else if (check(TokenKind::ident)) {
             EnumVariant v;
+            v.doc = mdoc;
             v.name = std::string(cur().text);
             advance();
             if (accept(TokenKind::lparen)) {
