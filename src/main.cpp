@@ -333,13 +333,18 @@ int cmd_lsp_probe(const char* arg) {
 
 int main(int argc, char** argv) {
     compiler_executable = argc > 0 ? argv[0] : "beansc";
+    // the language server takes no file arguments — it speaks JSON-RPC on stdio
+    if (argc >= 2 && std::strcmp(argv[1], "lsp") == 0) {
+        return beans::run_lsp_server();
+    }
     if (argc < 3) {
         std::fprintf(stderr,
                      "usage: %s <lex|parse|check|run> <file.b>...\n"
                      "       %s build [--release] [--lto] [--cpu generic|native] "
                      "<file.b> [-o out]\n"
-                     "       %s lsp-probe <file.b>:<line>:<col>\n",
-                     argv[0], argv[0], argv[0]);
+                     "       %s lsp-probe <file.b>:<line>:<col>\n"
+                     "       %s lsp   (language server on stdio)\n",
+                     argv[0], argv[0], argv[0], argv[0]);
         return 2;
     }
     const char* cmd = argv[1];

@@ -21,6 +21,10 @@ namespace beans {
 std::string hover_at(const Program& prog, const std::string& file,
                      uint32_t line, uint32_t col);
 
+// Run the language server: JSON-RPC over stdin/stdout until `exit`. Returns the
+// process exit code.
+int run_lsp_server();
+
 // ---- semantic query facade (for hover, completion, goto) -----------------
 // Built from the checked Program's AST. beans requires written types on lets,
 // params, fields, and returns, so these resolve from declared types rather than

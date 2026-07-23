@@ -1,0 +1,191 @@
+// The beans language server: JSON-RPC 2.0 over stdin/stdout.
+//
+// This file owns the transport (Content-Length framing), the lifecycle
+// (initialize / shutdown / exit), and the open-document store. Feature handlers
+// (diagnostics, hover, completion, ...) are added on top and reuse the compiler
+// in-process via the document overlay in the loader.
+
+#include "lsp.h"
+
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <map>
+#include <string>
+
+#include "json.h"
+
+namespace beans {
+
+namespace {
+
+// file:///a/b%20c.b -> /a/b c.b  (strip scheme, percent-decode)
+[[maybe_unused]] std::string uri_to_path(const std::string& uri) {
+    std::string p = uri;
+    const std::string scheme = "file://";
+    if (p.rfind(scheme, 0) == 0) p = p.substr(scheme.size());
+    std::string out;
+    for (size_t i = 0; i < p.size(); i++) {
+        if (p[i] == '%' && i + 2 < p.size()) {
+            auto hx = [](char c) -> int {
+                if (c >= '0' && c <= '9') return c - '0';
+                if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+                if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+                return -1;
+            };
+            int hi = hx(p[i + 1]), lo = hx(p[i + 2]);
+            if (hi >= 0 && lo >= 0) {
+                out += static_cast<char>((hi << 4) | lo);
+                i += 2;
+                continue;
+            }
+        }
+        out += p[i];
+    }
+    return out;
+}
+
+class LspServer {
+public:
+    int run() {
+        std::string body;
+        while (read_message(body)) {
+            bool ok = false;
+            Json msg = json_parse(body, &ok);
+            if (!ok || !msg.is_object()) continue;
+            dispatch(msg);
+            if (exit_now_) return exit_code_;
+        }
+        // stream closed without `exit`
+        return shutdown_requested_ ? 0 : 1;
+    }
+
+private:
+    // ---- transport --------------------------------------------------------
+    bool read_message(std::string& body) {
+        size_t content_length = 0;
+        std::string line;
+        bool saw_header = false;
+        while (true) {
+            int c = std::getchar();
+            if (c == EOF) return false;
+            if (c == '\n') {
+                if (line.empty()) { // blank line ends the header block
+                    if (!saw_header) continue; // tolerate stray newlines
+                    break;
+                }
+                if (line.rfind("Content-Length:", 0) == 0)
+                    content_length = std::strtoul(line.c_str() + 15, nullptr, 10);
+                saw_header = true;
+                line.clear();
+            } else if (c != '\r') {
+                line += static_cast<char>(c);
+            }
+        }
+        body.resize(content_length);
+        size_t got = content_length
+                         ? std::fread(&body[0], 1, content_length, stdin)
+                         : 0;
+        return got == content_length;
+    }
+
+    void write_message(const Json& msg) {
+        std::string s = msg.dump();
+        std::printf("Content-Length: %zu\r\n\r\n", s.size());
+        std::fwrite(s.data(), 1, s.size(), stdout);
+        std::fflush(stdout);
+    }
+
+    void reply(const Json& id, Json result) {
+        Json m = Json::object();
+        m.set("jsonrpc", Json::string("2.0"));
+        m.set("id", id);
+        m.set("result", std::move(result));
+        write_message(m);
+    }
+
+    void reply_error(const Json& id, int code, const std::string& message) {
+        Json err = Json::object();
+        err.set("code", Json::number(code));
+        err.set("message", Json::string(message));
+        Json m = Json::object();
+        m.set("jsonrpc", Json::string("2.0"));
+        m.set("id", id);
+        m.set("error", std::move(err));
+        write_message(m);
+    }
+
+    // ---- dispatch ---------------------------------------------------------
+    void dispatch(const Json& msg) {
+        std::string method = msg.get_str("method");
+        const Json* id = msg.find("id");
+        const Json* params = msg.find("params");
+        Json empty = Json::object();
+        const Json& p = params ? *params : empty;
+
+        if (method == "initialize") { on_initialize(id, p); return; }
+        if (method == "initialized") return; // notification, nothing to do
+        if (method == "shutdown") {
+            shutdown_requested_ = true;
+            if (id) reply(*id, Json::null());
+            return;
+        }
+        if (method == "exit") {
+            exit_now_ = true;
+            exit_code_ = shutdown_requested_ ? 0 : 1;
+            return;
+        }
+        if (method == "textDocument/didOpen") { on_did_open(p); return; }
+        if (method == "textDocument/didChange") { on_did_change(p); return; }
+        if (method == "textDocument/didClose") { on_did_close(p); return; }
+
+        // unknown request -> method-not-found; unknown notification -> ignore
+        if (id) reply_error(*id, -32601, "method not found: " + method);
+    }
+
+    void on_initialize(const Json* id, const Json&) {
+        Json caps = Json::object();
+        caps.set("textDocumentSync", Json::number(1)); // 1 = full document sync
+
+        Json result = Json::object();
+        result.set("capabilities", std::move(caps));
+        Json info = Json::object();
+        info.set("name", Json::string("beansc"));
+        info.set("version", Json::string("0.1.0"));
+        result.set("serverInfo", std::move(info));
+        if (id) reply(*id, std::move(result));
+    }
+
+    // ---- document store ---------------------------------------------------
+    void on_did_open(const Json& p) {
+        const Json* doc = p.find("textDocument");
+        if (!doc) return;
+        std::string uri = doc->get_str("uri");
+        docs_[uri] = doc->get_str("text");
+    }
+
+    void on_did_change(const Json& p) {
+        const Json* doc = p.find("textDocument");
+        const Json* changes = p.find("contentChanges");
+        if (!doc || !changes || !changes->is_array() || changes->arr.empty()) return;
+        // full sync: the last change carries the whole document text
+        std::string uri = doc->get_str("uri");
+        docs_[uri] = changes->arr.back().get_str("text");
+    }
+
+    void on_did_close(const Json& p) {
+        const Json* doc = p.find("textDocument");
+        if (doc) docs_.erase(doc->get_str("uri"));
+    }
+
+    std::map<std::string, std::string> docs_; // uri -> current text (overlay)
+    bool shutdown_requested_ = false;
+    bool exit_now_ = false;
+    int exit_code_ = 0;
+};
+
+} // namespace
+
+int run_lsp_server() { return LspServer().run(); }
+
+} // namespace beans
