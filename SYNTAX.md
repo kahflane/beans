@@ -1,4 +1,4 @@
-# beans syntax — draft 0.4
+# beans syntax — draft 0.5
 
 Language: **beans** · extension: **.b** · status: draft for discussion
 Toolchain status: **lexer + parser + loader + checker + interpreter + native backend implemented** — including multi-file modules and git imports
@@ -96,7 +96,9 @@ import gitlab.com/tools/csv as csvlib
 `lines() -> List<string>` (a trailing newline makes no empty final line),
 `to_int`/`to_float`/`to_decimal -> Result<...>`,
 `chars() -> List<string>` (UTF-8 characters; malformed bytes come through one at a time),
-`count_chars(from, to)` for a checked, allocation-free byte range scan.
+`count_chars(from, to)` for a checked, allocation-free byte range scan,
+`find_byte(byte, from) -> int` (`-1` when absent), `range_equals(from, to, other)`,
+and `parse_int_range_or(from, to, fallback)` for allocation-free byte-range work.
 
 ## Bytes (v0.5, implemented)
 
@@ -105,7 +107,8 @@ self, so page-building chains work: `Bytes.new(4096).put_u32(0, root).put_u64(8,
 
 - `Bytes.new(n)` (zeroed, panics on negative), `Bytes.from(s)` (copies the text bytes)
 - `len()`, `reserve(n)`, `resize(n)` (regrown range reads zero), `fill(v)`
-- `get(i)` / `set(i, v)` — one byte, panics out of range
+- `get(i)` / `set(i, v)` — one byte, panics out of range; `push(v)` appends one
+  byte. These are low-level storage operations used by Beans-written formats.
 - `get_u8/u16/u32/u64/i64(pos)` / `put_...(pos, v)` — fixed width, little-endian, panics out of range
 - `slice(from, to)`, `copy_from(src, at)`, `append(other)`, `append_str(s)`,
   `append_i64(v)` (little-endian), `append_range(src, from, to)` (no slice allocation)
@@ -156,11 +159,15 @@ Class-first, like everything builtin. Errors are `Result<T>`; `Error.kind` carri
 
 High-level compiler-shipped packages are normal Beans source under `lib/std`.
 `std.collections` provides `count_int`, `sum_int`, `frequencies`, `unique`, and
-the generic `count`, `filter`, `transform`, and `unique_of` functions.
+the generic `count`, `filter`, `transform`, and `unique_of` functions. Its
+`increment`, `get_or_insert`, `merge_with`, `remove_if`, and `map_values`
+functions mutate a caller Map through `inout`; these are ordinary generic Beans
+functions, including for structural wide keys.
 `std.option` provides generic `map`, `and_then`, and `filter`; `std.result`
 provides generic `map`, `and_then`, and `recover`; `std.math`
 provides `clamp_int` and `gcd`; `std.bytes` provides Beans-written `crc32`,
-`varint_size`, `encode_varint`, and checked `decode_varint`; `std.path` is fully
+`varint_size`, `encode_varint`, `append_varint`, `decode_varint`, and
+`decode_varint_at_or`; `std.path` is fully
 Beans-written; `std.fmt` implements `hex`, `bin`, and `group` in Beans; and
 `std.fs` implements the high-level whole-file byte/write/copy helpers in Beans;
 `std.reader` implements buffered line reading in Beans.
@@ -299,13 +306,17 @@ arena.clear()                             // drops all values in one pass
 
 `Box.new(value)` owns one heap slot. `get()` returns the value and `set(value)`
 replaces it. The native runtime uses the common iterative ownership walker, so
-boxed chains do not recurse during teardown.
+boxed chains do not recurse during teardown. Structs, fixed arrays, SIMD,
+slices, inline Option/Result values, and decimals keep their real inline layout;
+nested ARC fields are retained and dropped recursively.
 
 `Arena.new(capacity)` needs a declared `Arena<T>` type. `put(value)` appends and
 returns a stable integer handle; `len`, `at`, `get`, and `clear` operate on the
 current region. `clear` keeps capacity but invalidates every old handle. This
-first arena stores typed 64-bit runtime slots. Inline structs and borrowed
-arena references still wait for the value-layout and lifetime work.
+arena stores typed-width values in one contiguous region. Wide values and
+16-byte decimals stay inline, and `clear` drops every nested ARC field before
+reusing the buffer. References returned by `get` and `at` are owned copies;
+there is no borrowed arena-reference type yet.
 
 `Shared<T>` is the explicit thread-safe shared-ownership handle. `Weak<T>`
 observes the same control block without keeping the value alive:
@@ -317,13 +328,14 @@ let live: Option<Shared<string>> = weak.upgrade()
 let gone: bool = weak.expired()
 ```
 
-`get()` returns a copy of the value. The control block owns one value reference
+`get()` returns a copy of the value. Wide values and decimals stay inline in a
+typed payload box, and nested ARC fields use normal copy ownership. The control block owns one value reference
 until its last strong handle dies; upgrade uses an atomic compare/exchange, so
 it cannot revive a dead value. A cycle made through `Shared` must be broken with
 `Weak`, like C++ `shared_ptr`/`weak_ptr`; the local-class cycle collector does
-not trace through explicit Shared control blocks. `Send`/`Sync` trait checks are
-not enforced yet, so this is the runtime ownership foundation, not the final
-compile-time race model.
+not trace through explicit Shared control blocks. `Shared<T>` and `Weak<T>` are
+`Send` and `Sync` only when `T` is both. `Mutex<T>` is the explicit lock-based
+synchronization boundary, including for local ARC class values.
 
 ### Short init
 
@@ -351,8 +363,9 @@ Primitives (all unboxed in codegen):
 - Use it for every money value. Using `float` for money should feel wrong in beans.
 - 128-bit value type (C#-style, ~28 significant digits) — fast, stack-allocated, no heap.
 - Native locals, fields, parameters, returns, and arithmetic use one inline LLVM `i128`.
-  The current one-slot generic runtime uses a small adapter box only when a decimal is
-  stored in List, Map, Option/Result, Box, Arena, Mutex, Channel, or a thread result.
+  Typed generic storage keeps decimal inline in List, Map values, Box, Arena,
+  Shared, Mutex, Channel, and thread results. A narrow Option/Result keeps its
+  existing representation.
 
 ### Number rules
 
@@ -365,10 +378,16 @@ Primitives (all unboxed in codegen):
 - `f32` rounds after every literal, cast, and arithmetic operation. It is a real 32-bit LLVM value in locals, calls, and fields, not an alias for `f64`.
 
 The native backend uses exact LLVM integer, float, and decimal types for locals,
-parameters, returns, arithmetic, and packed class fields. List, Map, channel,
-mutex, and enum payload slots still use one 64-bit runtime slot and are converted
-on entry/exit; this keeps the current generic runtime ABI while the move-only
-buffer layout is being built.
+parameters, returns, arithmetic, and packed class fields. List keeps its old
+data/len/cap prefix for hot scalar code, but wide structs, fixed arrays, SIMD,
+slices, and inline Option/Result values use their real stride plus an ARC pointer
+mask, including inline 16-byte decimals. Map keeps its existing one-slot key and
+narrow-value path, while wide values use a parallel typed-width buffer with the
+same ARC mask. Box, Arena, Shared, Mutex, and Channel also use typed-width
+storage, as do thread results. User enums use aligned inline layout for wide
+payloads inside their ARC object. A stored wide Map key gets one immutable ARC
+box; lookup keys stay on the stack and generated equality/hash functions walk
+their fields rather than padding bytes.
 
 ### Collections
 
@@ -399,6 +418,12 @@ updating a key keeps its place, while removing and reinserting it moves it to th
 end. Lookup is hash-indexed (O(1)) in both backends, and `remove` is amortized
 O(1). Plain Map swap-removes entries, so deletion may change enumeration order;
 OrderedMap keeps stable entry slots and compacts holes as needed.
+Map values may be wide structs, fixed arrays, SIMD vectors, slices, inline
+Option/Result values, or decimals. Their nested ARC fields are retained, dropped,
+cloned, returned by `get`, and copied into `values()` recursively. Struct,
+fixed-array, and inline Option/Result keys work when their contents satisfy
+`Eq` and `Hash`; `keys()` returns their real value layout. Stored keys own nested
+ARC fields, while `get`, `contains`, and `remove` use allocation-free stack keys.
 
 List, Map, and OrderedMap are move-only unique-buffer values. Binding,
 assignment, storage, and return use `take`; function parameters and loop reads
@@ -672,8 +697,10 @@ small scalar payloads keep the boxed enum ABI. A `Result` with either wide
 payload uses `{is_error, ok_payload, error_payload}`; its inactive payload is
 zero. The compiler retains and drops references nested inside these aggregates.
 Wide Options and Results pass and return by value and do not allocate their own
-enum box. User enums and runtime-slot containers still cannot hold wide inline
-values yet.
+enum box. List and Map values can store them inline, including nested ARC fields.
+Box, Arena, Shared, Mutex, Channel, and thread results can store them inline too.
+User enums remain ARC values, but wide payloads use their real aligned layout
+inside the enum object and participate in matching, equality, hashing, and ARC.
 
 ## Control flow
 
@@ -835,15 +862,18 @@ hits.add(1)
   lane-wise; `lane(i)` and `sum()` read it; `load(RawPtr<f32>)` and
   `store(RawPtr<f32>)` move 16 bytes without requiring aligned memory. Native
   code uses LLVM vector operations. SIMD values can be carried by inline
-  `Option` and `Result`, but cannot yet be placed directly in List, Map, or the
-  other eight-byte-slot runtime containers.
+  `Option` and `Result` and stored directly in List, Map values, Box, Arena,
+  Shared, Mutex, Channel, and thread results. SIMD does not implement `Hash`,
+  so it cannot be a Map key.
 - `[T; N]` is a fixed-size inline array. It accepts inline scalar, `RawPtr`,
   nested fixed-array, and struct elements with `1 <= N <= 4096`. A list-shaped
   literal gets fixed-array meaning from its declared spot:
   `var lanes: [f32; 4] = [1, 2, 3, 4]`. Arrays copy by value, pass and return
   inline, support checked integer indexing, element assignment on `var`
-  locals, `len()`, equality, and `for` iteration. Direct storage in the old
-  eight-byte runtime containers waits for inline generic storage.
+  locals, `len()`, equality, and `for` iteration. List, Box, and Arena store
+  arrays inline; Map stores them inline as values and as structural keys when
+  their element type implements `Hash`. Shared, Mutex, Channel, and thread
+  results use the same typed-width layout.
 - `Slice<T>` is a non-owning inline `{pointer, length}` view for the raw-memory
   element set above. `Slice.from_raw(ptr, len)`,
   `get`, `set`, indexing, `subslice`,
@@ -865,13 +895,18 @@ hits.add(1)
 
   `@c_layout` fixes declaration order and the target C size/alignment rules, so
   `RawPtr<Packet>` and `Slice<Packet>` can access matching native memory.
-  Fields are private unless marked `pub`, as with classes. Fields can contain
-  inline scalars, `RawPtr`, fixed arrays, and nested structs; every nested value
-  inside a `@c_layout` record must also have C layout. A direct or array-wrapped
+  Fields are private unless marked `pub`, as with classes. Ordinary structs can
+  own strings, classes, collections, Options/Results, and other ARC values; the
+  compiler retains and drops those fields recursively through copies, arrays,
+  class fields, and typed List, Map-value, Box, and Arena storage. `@c_layout` structs stay restricted to
+  inline scalars, `RawPtr`, fixed arrays, and nested C-layout structs so their C
+  ABI has no hidden ownership policy. A direct or array-wrapped
   recursive value edge is rejected because it has no finite size; use `RawPtr`
   or `Box` for that edge. Generic structs, inheritance, methods, ARC reference
-  fields, and old runtime-slot container storage remain open. A field can be
-  changed only through a `var` local.
+  fields in C-layout records remain open. Ordinary structs that satisfy `Eq`
+  and `Hash` can be Map keys; stored keys use an immutable compiler-owned box
+  and lookups use a stack copy. A field can be changed only through a `var`
+  local.
 
 - `@c_layout union` declares overlapping inline scalar, `RawPtr`, fixed-array,
   or nested C-layout storage. It must be

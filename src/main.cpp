@@ -8,6 +8,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <fstream>
 #include <sstream>
 #include <string>
@@ -21,6 +22,9 @@
 #include "parser.h"
 
 namespace {
+
+namespace fs = std::filesystem;
+std::string compiler_executable;
 
 bool read_file(const char* path, std::string& out) {
     std::ifstream in(path, std::ios::binary);
@@ -172,6 +176,40 @@ unsigned long long content_hash(const std::string& contents) {
     return hash;
 }
 
+std::string find_runtime_source() {
+    std::vector<fs::path> candidates;
+    if (const char* override_path = std::getenv("BEANS_RUNTIME"))
+        candidates.emplace_back(override_path);
+
+    fs::path executable(compiler_executable);
+    if (executable.has_parent_path()) {
+        std::error_code error;
+        fs::path absolute = fs::absolute(executable, error);
+        if (!error) candidates.push_back(absolute.parent_path() / "beans_rt.c");
+    } else if (const char* path_env = std::getenv("PATH")) {
+        std::string paths(path_env);
+        std::size_t start = 0;
+        while (start <= paths.size()) {
+            std::size_t end = paths.find(':', start);
+            fs::path directory = paths.substr(start, end - start);
+            if (directory.empty()) directory = ".";
+            if (fs::exists(directory / executable))
+                candidates.push_back(directory / "beans_rt.c");
+            if (end == std::string::npos) break;
+            start = end + 1;
+        }
+    }
+    // Source-tree fallbacks keep direct developer builds convenient.
+    candidates.emplace_back("runtime/beans_rt.c");
+    candidates.emplace_back("build/beans_rt.c");
+    for (const fs::path& candidate : candidates) {
+        std::error_code error;
+        if (fs::is_regular_file(candidate, error) && !error)
+            return candidate.string();
+    }
+    return "";
+}
+
 int run_build_command(const std::string& command, const char* what) {
     int rc = std::system(command.c_str());
     if (rc != 0) std::fprintf(stderr, "error: %s failed\n", what);
@@ -203,7 +241,6 @@ int cmd_build(const char* path, const char* out_path, const BuildOptions& option
 
     std::system("mkdir -p build");
     std::string ll_path = "build/" + stem + ".ll";
-    std::string rt_path = "build/beans_rt.c";
     std::string ffi_path = "build/" + stem + "_ffi.c";
     std::string bin = out_path ? out_path : "build/" + stem;
 
@@ -211,8 +248,13 @@ int cmd_build(const char* path, const char* out_path, const BuildOptions& option
         std::ofstream f(ll_path, std::ios::binary);
         f << ir;
     }
-    const std::string runtime_source = beans::CodeGen::runtime_c();
-    write_if_changed(rt_path, runtime_source);
+    const std::string rt_path = find_runtime_source();
+    std::string runtime_source;
+    if (rt_path.empty() || !read_file(rt_path.c_str(), runtime_source)) {
+        std::fprintf(stderr,
+                     "error: can't find beans_rt.c beside beansc; set BEANS_RUNTIME\n");
+        return 1;
+    }
     if (!cg.ffi_c().empty()) write_if_changed(ffi_path, cg.ffi_c());
     const std::string optimize = options.release ? "-O3 -DNDEBUG" : "-O2";
     const std::string cpu = options.cpu == "native" ? " -march=native" : "";
@@ -250,6 +292,7 @@ int cmd_build(const char* path, const char* out_path, const BuildOptions& option
 } // namespace
 
 int main(int argc, char** argv) {
+    compiler_executable = argc > 0 ? argv[0] : "beansc";
     if (argc < 3) {
         std::fprintf(stderr,
                      "usage: %s <lex|parse|check|run> <file.b>...\n"

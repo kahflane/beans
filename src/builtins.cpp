@@ -190,6 +190,59 @@ Value str_byte_at(uint32_t line, uint32_t col, Value& recv, std::vector<Value>& 
     return Value::of_int(static_cast<uint8_t>(s[static_cast<size_t>(i)]));
 }
 
+Value str_find_byte(uint32_t line, uint32_t col, Value& recv,
+                    std::vector<Value>& args) {
+    const std::string& s = *recv.s;
+    int64_t byte = args[0].i, from = args[1].i;
+    if (byte < 0 || byte > 255)
+        bpanic(line, col, "byte " + std::to_string(byte) + " out of range");
+    if (from < 0 || static_cast<size_t>(from) > s.size())
+        bpanic(line, col, "find start " + std::to_string(from) +
+                              " out of range (len " + std::to_string(s.size()) + ")");
+    size_t found = s.find(static_cast<char>(byte), static_cast<size_t>(from));
+    return Value::of_int(found == std::string::npos ? -1
+                                                     : static_cast<int64_t>(found));
+}
+
+Value str_range_equals(uint32_t line, uint32_t col, Value& recv,
+                       std::vector<Value>& args) {
+    const std::string& s = *recv.s;
+    int64_t from = args[0].i, to = args[1].i;
+    if (from < 0 || to < from || static_cast<size_t>(to) > s.size())
+        bpanic(line, col, "range " + std::to_string(from) + ".." +
+                              std::to_string(to) + " out of range (len " +
+                              std::to_string(s.size()) + ")");
+    const std::string& other = *args[2].s;
+    size_t length = static_cast<size_t>(to - from);
+    return Value::of_bool(length == other.size() &&
+                          memcmp(s.data() + from, other.data(), length) == 0);
+}
+
+Value str_parse_int_range_or(uint32_t line, uint32_t col, Value& recv,
+                             std::vector<Value>& args) {
+    const std::string& s = *recv.s;
+    int64_t from = args[0].i, to = args[1].i, fallback = args[2].i;
+    if (from < 0 || to < from || static_cast<size_t>(to) > s.size())
+        bpanic(line, col, "range " + std::to_string(from) + ".." +
+                              std::to_string(to) + " out of range (len " +
+                              std::to_string(s.size()) + ")");
+    size_t at = static_cast<size_t>(from), end = static_cast<size_t>(to);
+    bool negative = false;
+    if (at < end && (s[at] == '+' || s[at] == '-')) {
+        negative = s[at] == '-';
+        at += 1;
+    }
+    if (at == end) return Value::of_int(fallback);
+    uint64_t value = 0;
+    for (; at < end; ++at) {
+        unsigned char c = static_cast<unsigned char>(s[at]);
+        if (c < '0' || c > '9') return Value::of_int(fallback);
+        value = value * 10 + static_cast<uint64_t>(c - '0');
+    }
+    if (negative) value = 0 - value;
+    return Value::of_int(static_cast<int64_t>(value));
+}
+
 Value str_trim(uint32_t, uint32_t, Value& recv, std::vector<Value>&) {
     const std::string& s = *recv.s;
     size_t b = 0, e = s.size();
@@ -456,6 +509,11 @@ Value bytes_set(uint32_t line, uint32_t col, Value& recv, std::vector<Value>& ar
     int64_t i = args[0].i;
     if (i < 0 || static_cast<size_t>(i) >= d.size()) byte_oob(line, col, i, d.size());
     d[static_cast<size_t>(i)] = static_cast<uint8_t>(args[1].i & 255);
+    return recv;
+}
+
+Value bytes_push(uint32_t, uint32_t, Value& recv, std::vector<Value>& args) {
+    recv.bytes->data.push_back(static_cast<uint8_t>(args[0].i & 255));
     return recv;
 }
 
@@ -1403,6 +1461,9 @@ const std::vector<BuiltinMethod>& builtin_methods() {
         {BT::str, "rfind", {BT::str}, BT::opt_i64, "beans_str_rfind", false, str_rfind},
         {BT::str, "slice", {BT::i64, BT::i64}, BT::str, "beans_str_slice", true, str_slice},
         {BT::str, "byte_at", {BT::i64}, BT::i64, "beans_str_byte_at", true, str_byte_at},
+        {BT::str, "find_byte", {BT::i64, BT::i64}, BT::i64, "beans_str_find_byte", true, str_find_byte},
+        {BT::str, "range_equals", {BT::i64, BT::i64, BT::str}, BT::boolean, "beans_str_range_equals", true, str_range_equals},
+        {BT::str, "parse_int_range_or", {BT::i64, BT::i64, BT::i64}, BT::i64, "beans_str_parse_int_range_or", true, str_parse_int_range_or},
         {BT::str, "trim", {}, BT::str, "beans_str_trim", false, str_trim},
         {BT::str, "trim_start", {}, BT::str, "beans_str_trim_start", false, str_trim_start},
         {BT::str, "trim_end", {}, BT::str, "beans_str_trim_end", false, str_trim_end},
@@ -1424,6 +1485,7 @@ const std::vector<BuiltinMethod>& builtin_methods() {
         {BT::bytes, "fill", {BT::i64}, BT::self_recv, "beans_bytes_fill", false, bytes_fill},
         {BT::bytes, "get", {BT::i64}, BT::i64, "beans_bytes_get", true, bytes_get},
         {BT::bytes, "set", {BT::i64, BT::i64}, BT::self_recv, "beans_bytes_set", true, bytes_set},
+        {BT::bytes, "push", {BT::i64}, BT::self_recv, "beans_bytes_push", false, bytes_push},
         {BT::bytes, "get_u8", {BT::i64}, BT::i64, "beans_bytes_get_u8", true, bytes_get_u8},
         {BT::bytes, "get_u16", {BT::i64}, BT::i64, "beans_bytes_get_u16", true, bytes_get_u16},
         {BT::bytes, "get_u32", {BT::i64}, BT::i64, "beans_bytes_get_u32", true, bytes_get_u32},

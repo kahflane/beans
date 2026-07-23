@@ -76,7 +76,8 @@ private:
     struct Hint {
         const TypeRef* tref;
         NumHint num;
-        Hint() : tref(nullptr), num(NumHint::none) {}
+        bool fixed_array;
+        Hint() : tref(nullptr), num(NumHint::none), fixed_array(false) {}
         static Hint of(const TypeRef* t);
         static Hint decimal() { Hint h; h.num = NumHint::dec; return h; }
         static Hint floating() { Hint h; h.num = NumHint::flt; return h; }

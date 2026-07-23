@@ -21,6 +21,10 @@ fn main() {
     xs.sort()
     io.println(xs)
 
+    var signed: List<int> = [70000, -100000, -1, 65536, 0, -99999]
+    signed.sort()
+    io.println(signed)
+
     // sort_by takes any less-than predicate; captures work
     let desc: bool = true
     xs.sort_by(fn(a: int, b: int) -> bool {
@@ -62,6 +66,14 @@ fn main() {
     m["two"] = 2
     m["three"] = 3
     io.println("{m.remove("two")} {m.remove("nope")} {m.len()}")
+    match m.get("one") {
+        some(value) => { io.println("map match {value}") },
+        none => { io.println("map match missing") },
+    }
+    match m.get("gone") {
+        some(value) => { io.println("bad map match {value}") },
+        none => { io.println("map match none") },
+    }
     io.println(m.keys())
     io.println(m.values())
     m.clear()

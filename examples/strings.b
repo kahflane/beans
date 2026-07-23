@@ -92,6 +92,11 @@ fn main() {
     io.println("{"héllo→🌍".count_chars(0, "héllo→🌍".len())} chars without a list")
     io.println("{"héllo→🌍".count_chars(0, 3)} chars in three bytes")
 
+    let row: string = "user7,error,-42"
+    let comma: int = row.find_byte(44, 0)
+    let comma2: int = row.find_byte(44, comma + 1)
+    io.println("range={comma},{comma2},{row.range_equals(comma + 1, comma2, "error")},{row.parse_int_range_or(comma2 + 1, row.len(), 0)}")
+
     // out of range slices panic with the range in the message
     io.println(t.slice(5, 99))
 }

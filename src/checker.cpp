@@ -394,13 +394,15 @@ void Checker::resolve_class_members(ClassInfo& c) {
         TypeId field_type = resolve_type(f.type.get());
         c.fields[f.name] = field_type;
         c.field_decls[f.name] = &f;
-        if (c.decl->is_struct || c.decl->is_union) {
+        if (c.decl->is_union || c.decl->is_c_layout) {
             bool inline_value = is_inline_storage_type(field_type, c.decl->is_c_layout);
             if (!inline_value && field_type->k != Type::K::poison) {
                 error_at(f.line, f.col,
                          "struct/union fields need inline scalar, RawPtr, fixed-array, or nested struct storage, got " +
                              type_name(field_type));
             }
+        } else if (c.decl->is_struct && field_type->k == Type::K::unit) {
+            error_at(f.line, f.col, "struct fields cannot have unit type");
         }
     }
     for (const FnDecl& m : c.decl->methods) {
@@ -473,10 +475,6 @@ void Checker::resolve_enum_members(EnumInfo& e) {
         std::vector<TypeId> payload;
         for (const Param& p : v.payload) {
             TypeId type = resolve_type(p.type.get());
-            if (is_wide_inline_value(type)) {
-                error_at(p.line, p.col,
-                         "wide inline enum payloads need inline enum storage, not available yet");
-            }
             payload.push_back(type);
         }
         e.variants[v.name] = std::move(payload);
@@ -829,7 +827,11 @@ TypeId Checker::resolve_type(const TypeRef* t) {
         size_t want = (n == "Map" || n == "OrderedMap") ? 2 : 1;
         if (!want_args(want)) return t_poison();
         std::vector<TypeId> args = resolved_args();
-        if (n != "RawPtr" && n != "Slice") {
+        if ((n != "Map" && n != "OrderedMap") &&
+                   n != "RawPtr" && n != "Slice" && n != "List" &&
+                   n != "Box" && n != "Arena" && n != "Shared" &&
+                   n != "Weak" && n != "Mutex" && n != "Channel" &&
+                   n != "Thread") {
             for (TypeId arg : args) {
                 if (is_wide_inline_value(arg)) {
                     error_at(t->line, t->col,
@@ -874,12 +876,6 @@ TypeId Checker::resolve_type(const TypeRef* t) {
         if (!want_args(eit->second.generic_params.size())) return t_poison();
         t->resolved = ekey;
         std::vector<TypeId> args = resolved_args();
-        for (TypeId arg : args) {
-            if (is_wide_inline_value(arg)) {
-                error_at(t->line, t->col,
-                         "wide inline enum payloads need inline enum storage, not available yet");
-            }
-        }
         std::map<std::string, TypeId> env;
         for (size_t i = 0; i < eit->second.decl->generics.size() && i < args.size(); i++)
             env[eit->second.decl->generics[i].name] = args[i];
@@ -1089,8 +1085,8 @@ bool Checker::trait_satisfied_rec(TypeId t, const std::string& raw_trait,
     }
 
     if (t->k == Type::K::fixed_array) {
-        return (trait == "Clone" || trait == "Eq" || trait == "Send" ||
-                trait == "Sync") &&
+        return (trait == "Clone" || trait == "Eq" || trait == "Hash" ||
+                trait == "Send" || trait == "Sync") &&
                trait_satisfied_rec(t->args[0], trait, seen);
     }
 
@@ -1102,7 +1098,8 @@ bool Checker::trait_satisfied_rec(TypeId t, const std::string& raw_trait,
             (!it->second.decl->is_struct && !it->second.decl->is_union))
             return false;
         if (it->second.decl->is_union) return trait == "Clone";
-        if (trait != "Clone" && trait != "Eq" && trait != "Send" && trait != "Sync")
+        if (trait != "Clone" && trait != "Eq" && trait != "Hash" &&
+            trait != "Send" && trait != "Sync")
             return false;
         for (const auto& [name, field] : it->second.fields) {
             (void)name;
@@ -1156,7 +1153,8 @@ bool Checker::trait_satisfied_rec(TypeId t, const std::string& raw_trait,
         return false;
     }
     if (name == "Mutex") {
-        // The only way to touch T is through the lock-held closure.
+        // Mutex is the synchronization boundary for local ARC values. This is
+        // needed until inout lets value structs be mutated under the lock.
         return trait == "Clone" || trait == "Send" || trait == "Sync";
     }
     if (name == "Channel") {
@@ -1216,6 +1214,8 @@ void Checker::check_generic_bounds(const std::vector<GenericParam>& params,
 
 bool Checker::is_move_only(TypeId t) const {
     if (!t) return false;
+    if (t->k == Type::K::fixed_array && !t->args.empty())
+        return is_move_only(t->args[0]);
     if (t->k == Type::K::class_ &&
         (t->name == "Box" || t->name == "Arena" || t->name == "List" ||
          t->name == "Map" || t->name == "OrderedMap"))
@@ -2645,6 +2645,7 @@ Checker::Member Checker::builtin_member(TypeId recv, const std::string& name) {
         }
         if (recv->name == "List" && recv->args.size() == 1) {
             TypeId T = recv->args[0];
+            bool wide = is_wide_inline_value(T);
             bool ordered = trait_satisfied(T, "Order");
             bool equatable = trait_satisfied(T, "Eq");
             if (name == "push") return method({T}, t_unit());
@@ -2656,18 +2657,21 @@ Checker::Member Checker::builtin_member(TypeId recv, const std::string& name) {
             if ((name == "first" || name == "last") && !is_move_only(T))
                 return method({}, t_option(T));
             if (name == "len") return method({}, t_int());
-            if (name == "max" || name == "min")
+            if (!wide && (name == "max" || name == "min"))
                 return ordered ? method({}, t_option(T)) : none;
-            if (name == "contains" && equatable) return method({T}, t_bool());
-            if (name == "index_of" && equatable) return method({T}, t_option(t_int()));
+            if (!wide && name == "contains" && equatable) return method({T}, t_bool());
+            if (!wide && name == "index_of" && equatable)
+                return method({T}, t_option(t_int()));
             if (name == "insert") return method({t_int(), T}, t_unit());
             if (name == "remove") return method({t_int()}, T);
             if (name == "reverse" || name == "clear") return method({}, t_unit());
             if (name == "slice") return method({t_int(), t_int()}, recv);
-            if (name == "sort") return ordered ? method({}, t_unit()) : none;
-            if (name == "sort_by") return method({pool_.fn({T, T}, t_bool())}, t_unit());
-            if (name == "sort_by_key") return method({pool_.fn({T}, t_int())}, t_unit());
-            if (name == "join") return method({t_str()}, t_str());
+            if (!wide && name == "sort") return ordered ? method({}, t_unit()) : none;
+            if (!wide && name == "sort_by")
+                return method({pool_.fn({T, T}, t_bool())}, t_unit());
+            if (!wide && name == "sort_by_key")
+                return method({pool_.fn({T}, t_int())}, t_unit());
+            if (!wide && name == "join") return method({t_str()}, t_str());
             return none;
         }
         if ((recv->name == "Map" || recv->name == "OrderedMap") &&
@@ -2907,36 +2911,6 @@ TypeId Checker::check_call(const Expr* e, TypeId expected) {
         for (TypeId param : fn_t->fn_params) concrete_params.push_back(subst(param, env));
         check_passing(decl->params, concrete_params, what);
         TypeId concrete_ret = subst(fn_t->fn_ret, env);
-        std::set<TypeId> seen_storage;
-        std::function<bool(TypeId)> unsupported_storage = [&](TypeId type) {
-            if (!type || !seen_storage.insert(type).second) return false;
-            if (type->k == Type::K::class_) {
-                static const std::set<std::string> slot_types = {
-                    "List", "Map", "OrderedMap", "Box", "Arena", "Shared",
-                    "Weak", "Mutex", "Channel", "Thread",
-                };
-                if (slot_types.count(type->name)) {
-                    for (TypeId arg : type->args)
-                        if (is_wide_inline_value(arg)) return true;
-                }
-            }
-            if (type->k == Type::K::enum_ && type->name != "Option" &&
-                type->name != "Result") {
-                for (TypeId arg : type->args)
-                    if (is_wide_inline_value(arg)) return true;
-            }
-            for (TypeId arg : type->args)
-                if (unsupported_storage(arg)) return true;
-            for (TypeId param : type->fn_params)
-                if (unsupported_storage(param)) return true;
-            return unsupported_storage(type->fn_ret);
-        };
-        bool unsupported = unsupported_storage(concrete_ret);
-        for (TypeId param : concrete_params) unsupported |= unsupported_storage(param);
-        if (unsupported) {
-            error_at(e->line, e->col,
-                     what + " instantiates old runtime-slot storage with a wide inline value");
-        }
         return concrete_ret;
     };
 
@@ -3095,10 +3069,6 @@ TypeId Checker::check_call(const Expr* e, TypeId expected) {
                                  "thread.spawn closure returns non-Send type " +
                                      type_name(f->fn_ret));
                     }
-                    if (is_wide_inline_value(f->fn_ret)) {
-                        error_at(e->line, e->col,
-                                 "Thread result storage does not support wide inline values yet");
-                    }
                     return pool_.named(Type::K::class_, "Thread", {f->fn_ret});
                 }
                 // a real package: pub fn call across the package line
@@ -3143,9 +3113,20 @@ TypeId Checker::check_call(const Expr* e, TypeId expected) {
                     return t_poison();
                 }
                 if (!eit->second.generic_params.empty()) {
-                    error_at(e->line, e->col,
-                             "constructing generic enum '" + n + "' this way isn't supported yet");
-                    return t_poison();
+                    if (!expected || expected->k != Type::K::enum_ ||
+                        expected->name != n ||
+                        expected->args.size() != eit->second.generic_params.size()) {
+                        error_at(e->line, e->col,
+                                 "can't infer generic enum '" + n +
+                                     "' — declare the result type");
+                        return t_poison();
+                    }
+                    std::map<std::string, TypeId> env;
+                    for (size_t i = 0; i < eit->second.generic_params.size(); i++)
+                        env[eit->second.generic_params[i]] = expected->args[i];
+                    std::vector<TypeId> payload;
+                    for (TypeId type : vit->second) payload.push_back(subst(type, env));
+                    return check_args_against(payload, expected, n + "." + mname);
                 }
                 return check_args_against(vit->second,
                                           pool_.named(Type::K::enum_, n),
@@ -3256,6 +3237,12 @@ TypeId Checker::check_call(const Expr* e, TypeId expected) {
                 if (expected && expected->k == Type::K::class_ && expected->name == "Mutex")
                     inner = expected->args[0];
                 TypeId got = check_expr(e->args[0].get(), inner);
+                require_move_source(e->args[0].get(), got, "Mutex.new");
+                if (inner && !assignable(got, inner)) {
+                    error_at(e->args[0]->line, e->args[0]->col,
+                             "Mutex.new here needs " + type_name(inner) +
+                                 ", got " + type_name(got));
+                }
                 return pool_.named(Type::K::class_, "Mutex", {inner ? inner : got});
             }
             if (n == "Channel" && mname == "new") {

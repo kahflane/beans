@@ -25,9 +25,6 @@ public:
     const std::vector<CGError>& errors() const { return errors_; }
     const std::string& ffi_c() const { return ffi_c_; }
 
-    // the C runtime that every beans binary links against
-    static const char* runtime_c();
-
 private:
     const HirProgram& hir_;
     const Program& prog_;

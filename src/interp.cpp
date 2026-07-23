@@ -1741,7 +1741,8 @@ Value Interp::eval(const Expr* e, std::shared_ptr<Env>& env, Hint hint) {
         case Expr::Kind::list_lit: {
             Value v;
             TypeId checked = hir_.type_of(e);
-            if ((hint.tref && hint.tref->kind == TypeRef::Kind::fixed_array) ||
+            if (hint.fixed_array ||
+                (hint.tref && hint.tref->kind == TypeRef::Kind::fixed_array) ||
                 (checked && checked->k == Type::K::fixed_array)) {
                 v.k = Value::K::fixed_array;
                 Hint elem = Hint::of(hint.arg(0));
@@ -2519,6 +2520,11 @@ std::vector<Value> Interp::eval_method_args(const Expr* e, std::shared_ptr<Env>&
     auto sample = [](const Value& v) {
         if (v.k == Value::K::decimal_) return Hint::decimal();
         if (v.k == Value::K::float_) return Hint::floating();
+        if (v.k == Value::K::fixed_array) {
+            Hint hint;
+            hint.fixed_array = true;
+            return hint;
+        }
         return Hint();
     };
     auto row_hints = [&](BT want) {
@@ -3424,6 +3430,18 @@ uint64_t Interp::value_hash(const Value& v) {
             return mix64(reinterpret_cast<uintptr_t>(v.raw.address));
         case Value::K::bytes:
             return fnv_hash(v.bytes->data.data(), v.bytes->data.size());
+        case Value::K::fixed_array: {
+            uint64_t h = mix64(v.array.size());
+            for (const Value& element : v.array)
+                h = h * 1099511628211ull ^ value_hash(element);
+            return h;
+        }
+        case Value::K::struct_v: {
+            uint64_t h = mix64(v.struct_fields.size());
+            for (const Value& field : v.struct_fields)
+                h = h * 1099511628211ull ^ value_hash(field);
+            return h;
+        }
         default: return 0; // value_eq's never-equal arm: any hash is consistent
     }
 }
@@ -3521,6 +3539,11 @@ Interp::Hint Interp::map_key_hint(const MapVal& m) {
         if (m.is_dead(i)) continue;
         if (m.entries[i].first.k == Value::K::decimal_) return Hint::decimal();
         if (m.entries[i].first.k == Value::K::float_) return Hint::floating();
+        if (m.entries[i].first.k == Value::K::fixed_array) {
+            Hint hint;
+            hint.fixed_array = true;
+            return hint;
+        }
         break;
     }
     return {};

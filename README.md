@@ -10,7 +10,7 @@ A small OOP language: Java-style objects, Go-sized grammar, with C++-class perfo
 
 | piece | state |
 |---|---|
-| syntax draft | v0.4 |
+| syntax draft | v0.5 |
 | lexer | done |
 | parser | done |
 | module loader | done (v6) — modules, git imports, compiler-shipped `.b` std packages |
@@ -62,16 +62,19 @@ paths. Extern parameters can also take borrowed synchronous C callbacks made
 from Beans closures or stored top-level functions. Callback values may cross
 the ABI only for the duration of that call and on the same thread.
 
-The native backend emits textual LLVM IR and hands it to clang — no LLVM library dependency. It covers the whole language: classes (descriptor/vtable dispatch, inheritance, interface defaults, `override`, `as?`), monomorphized generics on classes *and* functions, enums + `match` (block-bodied arms included), Option/Result + `?`, exact-width integers and `f32`, exact `decimal`, lists and maps, closures (lambda-lifted, captured variables live in shared heap cells — mutation works, escaping works), real pthreads for `thread.spawn`/`Mutex`/`Channel`/`AtomicInt`, `defer`, string interpolation, and multi-package programs (symbols are package-qualified; cross-package calls, inheritance, generics, and interface dispatch all compile into one flat module). Every test file produces byte-identical output under `beansc build` and `beansc run` — panics included, same message, same exit code.
+The native backend emits textual LLVM IR and hands it to clang — no LLVM library dependency. The C runtime lives in `runtime/beans_rt.c`, not inside the compiler binary. Development builds link a cached runtime object; `--release --lto` links cached runtime bitcode so LLVM can optimize across the boundary. `BEANS_RUNTIME` can point at another runtime source. The backend covers the whole language: classes (descriptor/vtable dispatch, inheritance, interface defaults, `override`, `as?`), monomorphized generics on classes *and* functions, enums + `match` (block-bodied arms included), Option/Result + `?`, exact-width integers and `f32`, exact `decimal`, lists and maps, closures (lambda-lifted, captured variables live in shared heap cells — mutation works, escaping works), real pthreads for `thread.spawn`/`Mutex`/`Channel`/`AtomicInt`, `defer`, string interpolation, and multi-package programs (symbols are package-qualified; cross-package calls, inheritance, generics, and interface dispatch all compile into one flat module). Every test file produces byte-identical output under `beansc build` and `beansc run` — panics included, same message, same exit code.
 
 High-level standard-library code can now be written in Beans. The loader ships
 packages from `lib/std/`; `std.collections`, `std.option`, `std.result`,
 `std.math`, `std.bytes`, `std.path`, `std.fmt`, `std.fs`, and `std.reader` are the first ones. Generic collection
-`filter`/`transform`, Option and Result combinators, `frequencies`, `unique`,
-`gcd`, `clamp_int`, CRC32, unsigned varint encoding/decoding, path handling,
+`filter`/`transform`, inout Map increment/insert/merge/remove/map policies,
+Option and Result combinators, `frequencies`, `unique`, `gcd`, `clamp_int`,
+CRC32, unsigned varint append/encoding/decoding, path handling,
 integer hex/binary/group formatting, high-level whole-file text/byte/write/copy
 helpers, and buffered line reading are normal `.b` functions. Only their current
-low-level storage operations remain native. Set `BEANS_STDLIB` to use a
+low-level storage operations remain native. The scored bytes workload calls the
+Beans-written varint and CRC32 code, not the older native compatibility methods.
+Set `BEANS_STDLIB` to use a
 different shipped library root.
 
 ## Memory
@@ -82,38 +85,35 @@ Reference cycles (`a.next = some(b); b.next = some(a)`) are caught by trial dele
 
 Verified with Apple's `leaks` tool: **0 leaked bytes** on every test program — including [examples/cycles.b](examples/cycles.b), which drops 400k cycle pairs, a self-cycle, a 300k ring, and a closure that captures its own cell. **2M dropped cycle pairs run in 1.4MB flat**, same as the acyclic stress test, and live rings survive collections untouched.
 
-The design keeps RC off hot paths: function arguments, loop variables, and reads borrow instead of retaining. `take local` moves an owned value with compile-time use-after-move checks, and `return take local` transfers its last reference instead of retaining it. List, Map, OrderedMap, `Box<T>`, and the typed append-only `Arena<T>` are move-only outer handles; collections copy only through explicit `clone()`, and Arena values drop in bulk on `clear` or scope exit. `Shared<T>`/`Weak<T>` add an explicit atomic control block for cross-thread ownership without making local classes pay that cost. `Send`/`Sync` trait bounds are enforced, and `thread.spawn` rejects non-`Send` captures and returns. Pointer-valued `Option` uses a null niche in native code, while structs, fixed arrays, SIMD vectors, slices, and nested wide Options use an inline `{has_value, payload}` aggregate. A Result with a wide branch is also inline; the compiler tracks ARC references inside it through copies, calls, captures, assignments, matches, and `?`. These forms do not allocate their own enum box. The benchmark numbers below are measured *with* ARC and the collector enabled. Known limits: collection is deferred while worker threads run (a program that churns cycles forever while never letting its threads drain will grow until they do), wide user-enum and runtime-slot container storage, nested move-only collection clones, consuming Map reads, and a `?` early-return that can hold mid-statement temporaries a little longer.
+The design keeps RC off hot paths: function arguments, loop variables, and reads borrow instead of retaining. `take local` moves an owned value with compile-time use-after-move checks, and `return take local` transfers its last reference instead of retaining it. List, Map, OrderedMap, `Box<T>`, and the typed append-only `Arena<T>` are move-only outer handles; collections copy only through explicit `clone()`, and Arena values drop in bulk on `clear` or scope exit. `Shared<T>`/`Weak<T>` add an explicit atomic control block for cross-thread ownership without making local classes pay that cost. `Send`/`Sync` trait bounds are enforced, and `thread.spawn` rejects non-`Send` captures and returns. Pointer-valued `Option` uses a null niche in native code, while structs, fixed arrays, SIMD vectors, slices, and nested wide Options use an inline `{has_value, payload}` aggregate. A Result with a wide branch is also inline. Ordinary structs can own ARC fields. Typed-width List, Map-value, Box, Arena, Shared, Mutex, Channel, Thread-result, and user-enum payload storage keeps wide values and 16-byte decimals inline with ARC pointer masks. Map keeps its existing narrow fast path and uses a parallel buffer only for wide values. Wide value keys are boxed once when stored; lookup uses a stack copy and generated field-wise equality and hashing, so queries do not allocate. The compiler tracks nested references through copies, calls, captures, assignments, class nesting, collection operations, matches, and `?`. Inline Option/Result forms do not allocate their own aggregate box; user enums remain ARC values but keep wide payloads inline inside that allocation. The benchmark numbers below are measured *with* ARC and the collector enabled. Known limits: collection is deferred while worker threads run (a program that churns cycles forever while never letting its threads drain will grow until they do), nested move-only collection clones, consuming Map reads, and a `?` early-return that can hold mid-statement temporaries a little longer.
 
 ## Benchmarks
 
 The benchmark harness compares safe Beans with both tuned C++ and C++ using
 Beans-like ownership. It uses runtime inputs, fixed checksums, randomized run
-order, cold-start separation, peak RSS, and raw JSON samples.
+order, cold-start separation, process CPU/RSS data, and raw JSON samples. Full
+mode uses ten timing batches and at least ten measured seconds per target.
+Rows above 3% variation are retried with longer batches; discarded attempts
+remain in the JSON.
 
-The latest eight-group quick run on an Apple M1 scored **109.2% of tuned C++**
-and **120.0% of matched C++**. The runtime-sized mixed interface workload is
-about 99% of tuned C++; seven required target rows were above the 3% noise
-limit, so this is still useful direction, not a performance claim. Quick mode
-is never claim-eligible.
+The stable 39-workload full run on an Apple M1 (2026-07-23) scored **103.4% of
+tuned C++** and **128.9% of matched C++**. Peak memory was **1.17x tuned C++**
+and **0.97x matched C++**. Every group cleared the 70% floor, so both the safe
+80% target and tuned 90% target passed. This is a result for the recorded suite,
+machine, compiler, flags, and working tree—not a general claim that every Beans
+program is within 10% of C++.
 
-The last broad timing pass rejected itself on noise: desktop scheduling caused
-large wall-time outliers in 62 of 108 required target rows. Its medians are
-kept only as a bottleneck audit: about **56% of tuned C++**, **81% of matched
-C++**, and 1.38x tuned-C++ peak memory before the Box/Arena rows were added.
-Since that rejected pass, Decimal locals/fields/calls became inline 16-byte
-values and List slicing became one exact allocation plus one copy. Decimal
-arithmetic now has no per-operation allocation; a direct diagnostic improved
-from roughly 1% to roughly 40% of tuned C++, but it is not a scored result.
-The clearest remaining gaps are Decimal arithmetic, UTF-8 character lists,
-object sorting, deep ARC chains, and allocation-heavy application code. A full
-stable run has not passed, so there is no 90% claim.
+The weakest tuned-C++ rows are still clear: exact Decimal arithmetic 48.6%,
+the mixed allocation application 55.0%, Option-heavy chains 68.4%, UTF-8
+walking 70.3%, and slices 72.2%. Those are the next compiler/runtime targets.
+Beans wins the sequence, OrderedMap, deep teardown, churn, and tree rows. The
+generated `bench/report.md` contains every median, CV, group score, memory
+result, compile time, and binary size.
 
-The manifest now contains all 39 full-contract workloads, including a real
-inline-SIMD kernel. `make bench-verify`
-builds every target and enforces fixed checksum and byte-output parity. Run it
-for one correctness pass over all 39 workloads,
-or `make bench-quick` for timed quick results. Timed runs write
-`bench/report.md` and `build/bench/results-<mode>.json`.
+`make bench-verify` builds every target and enforces fixed checksum and
+byte-output parity. `make bench-quick` is useful during development but is
+never claim-eligible. Timed runs write `bench/report.md` and
+`build/bench/results-<mode>.json`.
 
 `kv_store` measures the append/restart/compact algorithm in memory so storage
 hardware does not enter the compiler score. File and mmap tests belong in the

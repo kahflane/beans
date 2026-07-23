@@ -181,6 +181,9 @@ struct Ty {
     uint32_t array_len = 0;
     uint32_t layout_size = 0;
     uint32_t layout_align = 1;
+    std::vector<Ty*> field_types;       // inline struct fields, declaration order
+    std::vector<uint32_t> field_offsets; // byte offsets used by ARC pointer masks
+    bool is_union = false;
     std::string name;          // obj: impl/iface name, enum_: enum name
     std::vector<Ty*> args;     // enum_ args; list_ elem in args[0]
     const ClassDecl* iface = nullptr; // obj typed as an interface
@@ -207,6 +210,21 @@ bool is_wide_inline_value(const Ty* t) {
             return false;
     }
 }
+
+// The legacy generic ABI stores one widened i64 per element. Aggregates keep
+// their real LLVM layout in List storage instead of being boxed into that slot.
+bool is_typed_list_element(const Ty* t) {
+    return t && (t->k == Ty::dec_ || is_wide_inline_value(t));
+}
+
+// Wide map values keep their real layout in a parallel value buffer. Wide
+// keys cross the runtime's slot ABI as pointers to immutable typed storage.
+bool is_typed_map_value(const Ty* t) { return is_typed_list_element(t); }
+
+// Wide value keys are immutable map keys. They are stored in one ARC box per
+// distinct key, while lookup keys stay in stack storage and use generated
+// pointer-based structural equality/hash thunks.
+bool is_typed_map_key(const Ty* t) { return is_wide_inline_value(t); }
 
 bool is_inline_option(const Ty* t) {
     return t && t->k == Ty::enum_ && t->name == "Option" && t->args.size() == 1 &&
@@ -279,6 +297,12 @@ bool has_owned_refs(const Ty* t) {
     if (is_inline_option(t)) return has_owned_refs(t->args[0]);
     if (is_inline_result(t))
         return has_owned_refs(t->args[0]) || has_owned_refs(t->args[1]);
+    if (t->k == Ty::fixed_array_)
+        return !t->args.empty() && has_owned_refs(t->args[0]);
+    if (t->k == Ty::struct_) {
+        for (Ty* field : t->field_types)
+            if (has_owned_refs(field)) return true;
+    }
     return false;
 }
 // Generic runtime containers still use one i64 slot. Wider inline values are
@@ -438,13 +462,31 @@ struct CG2 {
         Ty t; t.k = Ty::obj_; t.name = std::move(n); t.iface = iface;
         return intern(std::move(t));
     }
-    Ty* t_struct(std::string n, uint32_t size, uint32_t align) {
+    Ty* t_struct(CImpl* im) {
         Ty t;
         t.k = Ty::struct_;
-        t.name = std::move(n);
-        t.layout_size = size;
-        t.layout_align = align;
-        return intern(std::move(t));
+        t.name = im->mangled;
+        t.layout_size = static_cast<uint32_t>(im->size);
+        t.layout_align = static_cast<uint32_t>(im->align);
+        t.is_union = im->decl->is_union;
+        for (const CImpl::FieldInfo& field : im->fields) {
+            t.field_types.push_back(field.ty);
+            t.field_offsets.push_back(static_cast<uint32_t>(field.offset));
+        }
+        Ty* result = intern(std::move(t));
+        // A struct reached through a recursive class can be interned while its
+        // CImpl is still being laid out. The identity is already right; refresh
+        // the completed layout instead of keeping the temporary zero-size view.
+        result->layout_size = static_cast<uint32_t>(im->size);
+        result->layout_align = static_cast<uint32_t>(im->align);
+        result->is_union = im->decl->is_union;
+        result->field_types.clear();
+        result->field_offsets.clear();
+        for (const CImpl::FieldInfo& field : im->fields) {
+            result->field_types.push_back(field.ty);
+            result->field_offsets.push_back(static_cast<uint32_t>(field.offset));
+        }
+        return result;
     }
     Ty* t_kind1(Ty::K k, Ty* a) { Ty t; t.k = k; t.args = {a}; return intern(std::move(t)); }
     Ty* t_map(Ty* k, Ty* v, bool ordered = false) {
@@ -744,17 +786,15 @@ struct CG2 {
                 targs.push_back(resolve(a.get(), env, line, col));
             CImpl* im = request_impl(cit->second, std::move(targs), line, col);
             return (cit->second->is_struct || cit->second->is_union)
-                       ? t_struct(im->mangled, static_cast<uint32_t>(im->size),
-                                  static_cast<uint32_t>(im->align))
+                       ? t_struct(im)
                        : t_obj(im->mangled);
         }
         auto enit = enum_decls.find(key);
         if (enit != enum_decls.end()) {
-            if (!t->args.empty()) {
-                err(line, col, "generic enums");
-                return t_bad();
-            }
-            return t_enum(key, {});
+            std::vector<Ty*> arguments;
+            for (const TypePtr& argument : t->args)
+                arguments.push_back(resolve(argument.get(), env, line, col));
+            return t_enum(key, std::move(arguments));
         }
         err(line, col, "type '" + n + "'");
         return t_bad();
@@ -1073,7 +1113,9 @@ struct CG2 {
         std::string sym = "@bsortcmp" + std::to_string(sort_thunks.size());
         sort_thunks[elem] = sym;
         std::string lt = ll(elem);
-        std::string t = "define internal i64 " + sym + "(ptr %box, i64 %a, i64 %b) {\n";
+        std::string arg_type = elem->k == Ty::dec_ ? "i128" : "i64";
+        std::string t = "define internal i64 " + sym + "(ptr %box, " + arg_type +
+                        " %a, " + arg_type + " %b) {\n";
         std::string ta = "%a", tb = "%b";
         if (elem->k == Ty::f64_) {
             if (elem->bits == 32) {
@@ -1088,13 +1130,7 @@ struct CG2 {
         } else if (elem->k == Ty::i1_) {
             t += "  %ta = trunc i64 %a to i1\n  %tb = trunc i64 %b to i1\n";
             ta = "%ta", tb = "%tb";
-        } else if (elem->k == Ty::dec_) {
-            t += "  %ap = inttoptr i64 %a to ptr\n"
-                 "  %bp = inttoptr i64 %b to ptr\n"
-                 "  %ta = call i128 @beans_decv_unbox(ptr %ap)\n"
-                 "  %tb = call i128 @beans_decv_unbox(ptr %bp)\n";
-            ta = "%ta", tb = "%tb";
-        } else if (elem->k != Ty::i64_) {
+        } else if (elem->k != Ty::i64_ && elem->k != Ty::dec_) {
             t += "  %ta = inttoptr i64 %a to ptr\n  %tb = inttoptr i64 %b to ptr\n";
             ta = "%ta", tb = "%tb";
         }
@@ -1113,7 +1149,9 @@ struct CG2 {
         std::string sym = "@bsortkey" + std::to_string(sort_key_thunks.size());
         sort_key_thunks[elem] = sym;
         std::string lt = ll(elem);
-        std::string t = "define internal i64 " + sym + "(ptr %box, i64 %a) {\n";
+        std::string arg_type = elem->k == Ty::dec_ ? "i128" : "i64";
+        std::string t = "define internal i64 " + sym + "(ptr %box, " + arg_type +
+                        " %a) {\n";
         std::string value = "%a";
         if (elem->k == Ty::f64_) {
             if (elem->bits == 32) {
@@ -1126,11 +1164,7 @@ struct CG2 {
         } else if (elem->k == Ty::i1_) {
             t += "  %ta = trunc i64 %a to i1\n";
             value = "%ta";
-        } else if (elem->k == Ty::dec_) {
-            t += "  %ap = inttoptr i64 %a to ptr\n"
-                 "  %ta = call i128 @beans_decv_unbox(ptr %ap)\n";
-            value = "%ta";
-        } else if (elem->k != Ty::i64_) {
+        } else if (elem->k != Ty::i64_ && elem->k != Ty::dec_) {
             t += "  %ta = inttoptr i64 %a to ptr\n";
             value = "%ta";
         }
@@ -1182,10 +1216,16 @@ struct CG2 {
                      "  call void @beans_retain(ptr %p)\n  ret ptr %p\n";
                 break;
             case Ty::list_: {
-                std::string es = request_show(t->args[0]);
-                b += "  %p = inttoptr i64 %v to ptr\n"
-                     "  %r = call ptr @beans_show_list(ptr %p, ptr " + es + ")\n"
-                     "  ret ptr %r\n";
+                if (t->args[0]->k == Ty::dec_) {
+                    b += "  %p = inttoptr i64 %v to ptr\n"
+                         "  %r = call ptr @beans_show_list_decv(ptr %p)\n"
+                         "  ret ptr %r\n";
+                } else {
+                    std::string es = request_show(t->args[0]);
+                    b += "  %p = inttoptr i64 %v to ptr\n"
+                         "  %r = call ptr @beans_show_list(ptr %p, ptr " + es + ")\n"
+                         "  ret ptr %r\n";
+                }
                 break;
             }
             case Ty::enum_: {
@@ -1198,6 +1238,139 @@ struct CG2 {
             }
             default:
                 b += "  ret ptr " + intern_string("?") + "\n";
+                break;
+        }
+        b += "}\n";
+        lifted += b;
+        return sym;
+    }
+
+    static bool boxed_enum_typed_payload(Ty* type) {
+        return is_typed_list_element(type);
+    }
+    static int boxed_enum_payload_size(Ty* type) {
+        return boxed_enum_typed_payload(type) ? value_size(type) : 8;
+    }
+    static int boxed_enum_payload_align(Ty* type) {
+        return boxed_enum_typed_payload(type) ? value_align(type) : 8;
+    }
+    static std::vector<int> boxed_enum_payload_offsets(
+        const std::vector<Ty*>& payloads) {
+        std::vector<int> offsets;
+        int next = 8;
+        for (Ty* payload : payloads) {
+            next = align_up(next, boxed_enum_payload_align(payload));
+            offsets.push_back(next);
+            next += boxed_enum_payload_size(payload);
+        }
+        return offsets;
+    }
+
+    // Wide enum payloads are passed to the iterative display driver by
+    // address. That keeps arrays and nested inline Option/Result values inline
+    // and avoids rebuilding a temporary box merely to print them.
+    std::map<Ty*, std::string> wide_step_fns;
+    std::string request_wide_step(Ty* t) {
+        auto found = wide_step_fns.find(t);
+        if (found != wide_step_fns.end()) return found->second;
+        std::string sym = "@bwstep" + std::to_string(wide_step_fns.size());
+        wide_step_fns[t] = sym;
+        std::string b = "define internal void " + sym +
+                        "(ptr %c, i64 %raw) {\n"
+                        "  %p = inttoptr i64 %raw to ptr\n";
+        int r = 0;
+        auto tmp = [&] { return "%w" + std::to_string(r++); };
+        auto push_at = [&](Ty* value_type, int offset) {
+            std::string pointer = tmp();
+            b += "  " + pointer + " = getelementptr i8, ptr %p, i64 " +
+                 std::to_string(offset) + "\n";
+            if (boxed_enum_typed_payload(value_type)) {
+                std::string raw = tmp();
+                b += "  " + raw + " = ptrtoint ptr " + pointer + " to i64\n";
+                b += "  call void @beans_show_push_val(ptr %c, ptr " +
+                     request_wide_step(value_type) + ", i64 " + raw + ")\n";
+            } else {
+                std::string slot = wide_load_slot(value_type, pointer, b, r);
+                b += "  call void @beans_show_push_val(ptr %c, ptr " +
+                     request_step(value_type) + ", i64 " + slot + ")\n";
+            }
+        };
+        switch (t->k) {
+            case Ty::dec_:
+                b += "  %d = load i128, ptr %p\n"
+                     "  %s = call ptr @beans_decv_str(i128 %d)\n"
+                     "  call void @beans_show_append(ptr %c, ptr %s)\n"
+                     "  call void @beans_release(ptr %s)\n  ret void\n";
+                break;
+            case Ty::struct_:
+                b += "  call void @beans_show_append(ptr %c, ptr " +
+                     intern_string(t->name.empty() ? "{struct}" : t->name) +
+                     ")\n  ret void\n";
+                break;
+            case Ty::simd4f32_:
+                b += "  call void @beans_show_append(ptr %c, ptr " +
+                     intern_string("{simd4f32}") + ")\n  ret void\n";
+                break;
+            case Ty::slice_:
+                b += "  call void @beans_show_append(ptr %c, ptr " +
+                     intern_string("{slice}") + ")\n  ret void\n";
+                break;
+            case Ty::fixed_array_: {
+                b += "  call void @beans_show_append(ptr %c, ptr " +
+                     intern_string("[") + ")\n"
+                     "  call void @beans_show_push_lit(ptr %c, ptr " +
+                     intern_string("]") + ")\n";
+                int stride = value_size(t->args[0]);
+                for (uint32_t i = t->array_len; i-- > 1;) {
+                    push_at(t->args[0], static_cast<int>(i) * stride);
+                    b += "  call void @beans_show_push_lit(ptr %c, ptr " +
+                         intern_string(", ") + ")\n";
+                }
+                if (t->array_len) push_at(t->args[0], 0);
+                b += "  ret void\n";
+                break;
+            }
+            case Ty::enum_: {
+                if (is_inline_option(t)) {
+                    int offset = align_up(1, value_align(t->args[0]));
+                    b += "  %tag = load i1, ptr %p\n"
+                         "  br i1 %tag, label %some, label %none\n"
+                         "none:\n  call void @beans_show_append(ptr %c, ptr " +
+                         intern_string("none") + ")\n  ret void\n"
+                         "some:\n  call void @beans_show_append(ptr %c, ptr " +
+                         intern_string("some(") + ")\n"
+                         "  call void @beans_show_push_lit(ptr %c, ptr " +
+                         intern_string(")") + ")\n";
+                    push_at(t->args[0], offset);
+                    b += "  ret void\n";
+                } else if (is_inline_result(t)) {
+                    int ok_offset = align_up(1, value_align(t->args[0]));
+                    int error_offset =
+                        align_up(ok_offset + value_size(t->args[0]),
+                                 value_align(t->args[1]));
+                    b += "  %tag = load i1, ptr %p\n"
+                         "  br i1 %tag, label %error, label %ok\n"
+                         "ok:\n  call void @beans_show_append(ptr %c, ptr " +
+                         intern_string("ok(") + ")\n"
+                         "  call void @beans_show_push_lit(ptr %c, ptr " +
+                         intern_string(")") + ")\n";
+                    push_at(t->args[0], ok_offset);
+                    b += "  ret void\n"
+                         "error:\n  call void @beans_show_append(ptr %c, ptr " +
+                         intern_string("err(") + ")\n"
+                         "  call void @beans_show_push_lit(ptr %c, ptr " +
+                         intern_string(")") + ")\n";
+                    push_at(t->args[1], error_offset);
+                    b += "  ret void\n";
+                } else {
+                    b += "  call void @beans_show_append(ptr %c, ptr " +
+                         intern_string("?") + ")\n  ret void\n";
+                }
+                break;
+            }
+            default:
+                b += "  call void @beans_show_append(ptr %c, ptr " +
+                     intern_string("?") + ")\n  ret void\n";
                 break;
         }
         b += "}\n";
@@ -1256,10 +1429,17 @@ struct CG2 {
                      "  call void @beans_show_append(ptr %c, ptr %p)\n  ret void\n";
                 break;
             case Ty::list_: {
-                std::string es = request_step(t->args[0]);
-                b += "  %p = inttoptr i64 %v to ptr\n"
-                     "  call void @beans_show_list_iter(ptr %c, ptr %p, ptr " + es +
-                     ")\n  ret void\n";
+                if (t->args[0]->k == Ty::dec_) {
+                    b += "  %p = inttoptr i64 %v to ptr\n"
+                         "  %s = call ptr @beans_show_list_decv(ptr %p)\n"
+                         "  call void @beans_show_append(ptr %c, ptr %s)\n"
+                         "  call void @beans_release(ptr %s)\n  ret void\n";
+                } else {
+                    std::string es = request_step(t->args[0]);
+                    b += "  %p = inttoptr i64 %v to ptr\n"
+                         "  call void @beans_show_list_iter(ptr %c, ptr %p, ptr " + es +
+                         ")\n  ret void\n";
+                }
                 break;
             }
             case Ty::enum_: {
@@ -1324,25 +1504,33 @@ struct CG2 {
                          intern_string(vi.name + "(") + ")\n";
                     b += "  call void @beans_show_push_lit(ptr %c, ptr " +
                          intern_string(")") + ")\n";
+                    std::vector<int> offsets = boxed_enum_payload_offsets(vi.pays);
+                    auto push_payload = [&](size_t pi) {
+                        std::string pointer = "%r" + std::to_string(r++);
+                        b += "  " + pointer + " = getelementptr i8, ptr %e, i64 " +
+                             std::to_string(offsets[pi]) + "\n";
+                        if (boxed_enum_typed_payload(vi.pays[pi])) {
+                            std::string raw = "%r" + std::to_string(r++);
+                            b += "  " + raw + " = ptrtoint ptr " + pointer +
+                                 " to i64\n";
+                            b += "  call void @beans_show_push_val(ptr %c, ptr " +
+                                 request_wide_step(vi.pays[pi]) + ", i64 " + raw +
+                                 ")\n";
+                        } else {
+                            std::string slot =
+                                wide_load_slot(vi.pays[pi], pointer, b, r);
+                            b += "  call void @beans_show_push_val(ptr %c, ptr " +
+                                 request_step(vi.pays[pi]) + ", i64 " + slot +
+                                 ")\n";
+                        }
+                    };
                     for (size_t pi = vi.pays.size(); pi-- > 1;) {
-                        std::string ps = request_step(vi.pays[pi]);
-                        std::string pl = "%r" + std::to_string(r++);
-                        std::string ld = "%r" + std::to_string(r++);
-                        b += "  " + pl + " = getelementptr i8, ptr %e, i64 " +
-                             std::to_string(8 + 8 * pi) + "\n";
-                        b += "  " + ld + " = load i64, ptr " + pl + "\n";
-                        b += "  call void @beans_show_push_val(ptr %c, ptr " + ps +
-                             ", i64 " + ld + ")\n";
+                        push_payload(pi);
                         b += "  call void @beans_show_push_lit(ptr %c, ptr " +
                              intern_string(", ") + ")\n";
                     }
-                    std::string ps0 = request_step(vi.pays[0]);
-                    std::string pl0 = "%r" + std::to_string(r++);
-                    std::string ld0 = "%r" + std::to_string(r++);
-                    b += "  " + pl0 + " = getelementptr i8, ptr %e, i64 8\n";
-                    b += "  " + ld0 + " = load i64, ptr " + pl0 + "\n";
-                    b += "  call void @beans_show_push_val(ptr %c, ptr " + ps0 +
-                         ", i64 " + ld0 + ")\n  ret void\n";
+                    push_payload(0);
+                    b += "  ret void\n";
                 }
                 b += "vend:\n  call void @beans_show_append(ptr %c, ptr " +
                      intern_string("?") + ")\n  ret void\n";
@@ -1461,21 +1649,31 @@ struct CG2 {
                 for (size_t i = 0; i < pays.size(); i++) {
                     if (pays[i].empty()) continue;
                     b += "v" + std::to_string(i) + ":\n";
+                    std::vector<int> offsets = boxed_enum_payload_offsets(pays[i]);
                     for (size_t pi = 0; pi < pays[i].size(); pi++) {
-                        std::string ps = request_eq(pays[i][pi]);
                         std::string pa = "%r" + std::to_string(r++);
-                        std::string la = "%r" + std::to_string(r++);
                         std::string pb = "%r" + std::to_string(r++);
-                        std::string lb = "%r" + std::to_string(r++);
                         std::string c = "%r" + std::to_string(r++);
                         std::string cc = "%r" + std::to_string(r++);
-                        std::string off = std::to_string(8 + 8 * pi);
+                        std::string off = std::to_string(offsets[pi]);
                         b += "  " + pa + " = getelementptr i8, ptr %ea, i64 " + off + "\n";
-                        b += "  " + la + " = load i64, ptr " + pa + "\n";
                         b += "  " + pb + " = getelementptr i8, ptr %eb, i64 " + off + "\n";
-                        b += "  " + lb + " = load i64, ptr " + pb + "\n";
-                        b += "  " + c + " = call i64 " + ps + "(i64 " + la + ", i64 " +
-                             lb + ")\n";
+                        if (boxed_enum_typed_payload(pays[i][pi])) {
+                            std::string ai = "%r" + std::to_string(r++);
+                            std::string bi = "%r" + std::to_string(r++);
+                            b += "  " + ai + " = ptrtoint ptr " + pa + " to i64\n";
+                            b += "  " + bi + " = ptrtoint ptr " + pb + " to i64\n";
+                            b += "  " + c + " = call i64 " +
+                                 request_wide_eq(pays[i][pi]) + "(i64 " + ai +
+                                 ", i64 " + bi + ")\n";
+                        } else {
+                            std::string la = "%r" + std::to_string(r++);
+                            std::string lb = "%r" + std::to_string(r++);
+                            b += "  " + la + " = load i64, ptr " + pa + "\n";
+                            b += "  " + lb + " = load i64, ptr " + pb + "\n";
+                            b += "  " + c + " = call i64 " + request_eq(pays[i][pi]) +
+                                 "(i64 " + la + ", i64 " + lb + ")\n";
+                        }
                         b += "  " + cc + " = icmp ne i64 " + c + ", 0\n";
                         bool last = pi + 1 == pays[i].size();
                         std::string next = last ? "yes"
@@ -1579,17 +1777,25 @@ struct CG2 {
                     if (pays[i].empty()) continue;
                     b += "v" + std::to_string(i) + ":\n";
                     std::string acc = "%h0";
+                    std::vector<int> offsets = boxed_enum_payload_offsets(pays[i]);
                     for (size_t pi = 0; pi < pays[i].size(); pi++) {
-                        std::string ps = request_hash(pays[i][pi]);
                         std::string pa = "%r" + std::to_string(r++);
-                        std::string la = "%r" + std::to_string(r++);
                         std::string fh = "%r" + std::to_string(r++);
                         std::string mu = "%r" + std::to_string(r++);
                         std::string nx = "%r" + std::to_string(r++);
-                        std::string off = std::to_string(8 + 8 * pi);
+                        std::string off = std::to_string(offsets[pi]);
                         b += "  " + pa + " = getelementptr i8, ptr %ea, i64 " + off + "\n";
-                        b += "  " + la + " = load i64, ptr " + pa + "\n";
-                        b += "  " + fh + " = call i64 " + ps + "(i64 " + la + ")\n";
+                        if (boxed_enum_typed_payload(pays[i][pi])) {
+                            std::string raw = "%r" + std::to_string(r++);
+                            b += "  " + raw + " = ptrtoint ptr " + pa + " to i64\n";
+                            b += "  " + fh + " = call i64 " +
+                                 request_wide_hash(pays[i][pi]) + "(i64 " + raw + ")\n";
+                        } else {
+                            std::string la = "%r" + std::to_string(r++);
+                            b += "  " + la + " = load i64, ptr " + pa + "\n";
+                            b += "  " + fh + " = call i64 " +
+                                 request_hash(pays[i][pi]) + "(i64 " + la + ")\n";
+                        }
                         b += "  " + mu + " = mul i64 " + acc + ", 1099511628211\n";
                         b += "  " + nx + " = xor i64 " + mu + ", " + fh + "\n";
                         acc = nx;
@@ -1606,6 +1812,231 @@ struct CG2 {
         b += "}\n";
         lifted += b;
         return sym;
+    }
+
+    // Wide map keys use pointers to their inline storage. Stored keys point
+    // into an immutable ARC box; lookup keys point at a stack spill. These
+    // thunks compare/hash fields, never padding bytes.
+    std::map<Ty*, std::string> wide_eq_fns;
+    std::map<Ty*, std::string> wide_hash_fns;
+
+    std::string wide_load_slot(Ty* type, const std::string& pointer,
+                               std::string& text, int& next) {
+        auto tmp = [&] { return "%r" + std::to_string(next++); };
+        std::string loaded = tmp();
+        text += "  " + loaded + " = load " + ll(type) + ", ptr " + pointer + "\n";
+        if (type->k == Ty::i64_) {
+            if (type->bits == 64 || type->bits == 0) return loaded;
+            std::string widened = tmp();
+            text += "  " + widened + " = " +
+                    std::string(type->is_unsigned ? "zext " : "sext ") + ll(type) +
+                    " " + loaded + " to i64\n";
+            return widened;
+        }
+        if (type->k == Ty::i1_) {
+            std::string widened = tmp();
+            text += "  " + widened + " = zext i1 " + loaded + " to i64\n";
+            return widened;
+        }
+        if (type->k == Ty::f64_) {
+            if (type->bits == 32) {
+                std::string bits = tmp(), widened = tmp();
+                text += "  " + bits + " = bitcast float " + loaded + " to i32\n";
+                text += "  " + widened + " = zext i32 " + bits + " to i64\n";
+                return widened;
+            }
+            std::string bits = tmp();
+            text += "  " + bits + " = bitcast double " + loaded + " to i64\n";
+            return bits;
+        }
+        std::string bits = tmp();
+        text += "  " + bits + " = ptrtoint ptr " + loaded + " to i64\n";
+        return bits;
+    }
+
+    std::string request_wide_eq(Ty* type) {
+        auto found = wide_eq_fns.find(type);
+        if (found != wide_eq_fns.end()) return found->second;
+        std::string symbol = "@bweq" + std::to_string(wide_eq_fns.size());
+        wide_eq_fns[type] = symbol;
+        std::string text = "define internal i64 " + symbol +
+                           "(i64 %araw, i64 %braw) {\n"
+                           "  %a = inttoptr i64 %araw to ptr\n"
+                           "  %b = inttoptr i64 %braw to ptr\n";
+        int next = 0;
+        auto tmp = [&] { return "%r" + std::to_string(next++); };
+        auto compare_at = [&](Ty* field, int offset, const std::string& yes_label) {
+            std::string ap = tmp(), bp = tmp();
+            text += "  " + ap + " = getelementptr i8, ptr %a, i64 " +
+                    std::to_string(offset) + "\n";
+            text += "  " + bp + " = getelementptr i8, ptr %b, i64 " +
+                    std::to_string(offset) + "\n";
+            std::string equal = tmp();
+            if (field->k == Ty::dec_ || is_wide_inline_value(field)) {
+                std::string ai = tmp(), bi = tmp();
+                text += "  " + ai + " = ptrtoint ptr " + ap + " to i64\n";
+                text += "  " + bi + " = ptrtoint ptr " + bp + " to i64\n";
+                text += "  " + equal + " = call i64 " + request_wide_eq(field) +
+                        "(i64 " + ai + ", i64 " + bi + ")\n";
+            } else {
+                std::string av = wide_load_slot(field, ap, text, next);
+                std::string bv = wide_load_slot(field, bp, text, next);
+                text += "  " + equal + " = call i64 " + request_eq(field) +
+                        "(i64 " + av + ", i64 " + bv + ")\n";
+            }
+            std::string condition = tmp();
+            text += "  " + condition + " = icmp ne i64 " + equal + ", 0\n";
+            text += "  br i1 " + condition + ", label %" + yes_label +
+                    ", label %no\n";
+        };
+
+        if (type->k == Ty::dec_) {
+            text += "  %av = load i128, ptr %a\n"
+                    "  %bv = load i128, ptr %b\n"
+                    "  %cmp = call i32 @beans_decv_cmp(i128 %av, i128 %bv)\n"
+                    "  %same = icmp eq i32 %cmp, 0\n"
+                    "  %result = zext i1 %same to i64\n"
+                    "  ret i64 %result\n";
+        } else if (type->k == Ty::struct_ && !type->is_union) {
+            if (type->field_types.empty()) {
+                text += "  ret i64 1\n";
+            } else {
+                for (size_t i = 0; i < type->field_types.size(); i++) {
+                    std::string next_label = i + 1 == type->field_types.size()
+                                                 ? "yes"
+                                                 : "f" + std::to_string(i + 1);
+                    compare_at(type->field_types[i],
+                               static_cast<int>(type->field_offsets[i]), next_label);
+                    if (i + 1 < type->field_types.size()) text += next_label + ":\n";
+                }
+                text += "no:\n  ret i64 0\nyes:\n  ret i64 1\n";
+            }
+        } else if (type->k == Ty::fixed_array_) {
+            if (type->array_len == 0) {
+                text += "  ret i64 1\n";
+            } else {
+                int stride = value_size(type->args[0]);
+                for (uint32_t i = 0; i < type->array_len; i++) {
+                    std::string next_label = i + 1 == type->array_len
+                                                 ? "yes"
+                                                 : "f" + std::to_string(i + 1);
+                    compare_at(type->args[0], static_cast<int>(i) * stride,
+                               next_label);
+                    if (i + 1 < type->array_len) text += next_label + ":\n";
+                }
+                text += "no:\n  ret i64 0\nyes:\n  ret i64 1\n";
+            }
+        } else if (is_inline_option(type)) {
+            int offset = align_up(1, value_align(type->args[0]));
+            text += "  %at = load i1, ptr %a\n  %bt = load i1, ptr %b\n"
+                    "  %tags = icmp eq i1 %at, %bt\n"
+                    "  br i1 %tags, label %same_tag, label %no\n"
+                    "same_tag:\n  br i1 %at, label %payload, label %yes\n"
+                    "payload:\n";
+            compare_at(type->args[0], offset, "yes");
+            text += "no:\n  ret i64 0\nyes:\n  ret i64 1\n";
+        } else if (is_inline_result(type)) {
+            int ok_offset = align_up(1, value_align(type->args[0]));
+            int error_offset = align_up(ok_offset + value_size(type->args[0]),
+                                        value_align(type->args[1]));
+            text += "  %at = load i1, ptr %a\n  %bt = load i1, ptr %b\n"
+                    "  %tags = icmp eq i1 %at, %bt\n"
+                    "  br i1 %tags, label %same_tag, label %no\n"
+                    "same_tag:\n  br i1 %at, label %error, label %ok\n"
+                    "ok:\n";
+            compare_at(type->args[0], ok_offset, "yes");
+            text += "error:\n";
+            compare_at(type->args[1], error_offset, "yes");
+            text += "no:\n  ret i64 0\nyes:\n  ret i64 1\n";
+        } else {
+            text += "  ret i64 0\n";
+        }
+        text += "}\n";
+        lifted += text;
+        return symbol;
+    }
+
+    std::string request_wide_hash(Ty* type) {
+        auto found = wide_hash_fns.find(type);
+        if (found != wide_hash_fns.end()) return found->second;
+        std::string symbol = "@bwhash" + std::to_string(wide_hash_fns.size());
+        wide_hash_fns[type] = symbol;
+        std::string text = "define internal i64 " + symbol +
+                           "(i64 %raw) {\n  %value = inttoptr i64 %raw to ptr\n";
+        int next = 0;
+        auto tmp = [&] { return "%r" + std::to_string(next++); };
+        auto field_hash = [&](Ty* field, int offset, const std::string& base) {
+            std::string pointer = tmp();
+            text += "  " + pointer + " = getelementptr i8, ptr %value, i64 " +
+                    std::to_string(offset) + "\n";
+            std::string hash = tmp();
+            if (field->k == Ty::dec_ || is_wide_inline_value(field)) {
+                std::string raw = tmp();
+                text += "  " + raw + " = ptrtoint ptr " + pointer + " to i64\n";
+                text += "  " + hash + " = call i64 " + request_wide_hash(field) +
+                        "(i64 " + raw + ")\n";
+            } else {
+                std::string slot = wide_load_slot(field, pointer, text, next);
+                text += "  " + hash + " = call i64 " + request_hash(field) +
+                        "(i64 " + slot + ")\n";
+            }
+            std::string multiplied = tmp(), combined = tmp();
+            text += "  " + multiplied + " = mul i64 " + base +
+                    ", 1099511628211\n";
+            text += "  " + combined + " = xor i64 " + multiplied + ", " + hash +
+                    "\n";
+            return combined;
+        };
+
+        if (type->k == Ty::dec_) {
+            text += "  %v = load i128, ptr %value\n"
+                    "  %h = call i64 @beans_decv_hash(i128 %v)\n"
+                    "  ret i64 %h\n";
+        } else if (type->k == Ty::struct_ && !type->is_union) {
+            text += "  %seed = call i64 @beans_slot_mix(i64 " +
+                    std::to_string(type->field_types.size()) + ")\n";
+            std::string hash = "%seed";
+            for (size_t i = 0; i < type->field_types.size(); i++)
+                hash = field_hash(type->field_types[i],
+                                  static_cast<int>(type->field_offsets[i]), hash);
+            text += "  ret i64 " + hash + "\n";
+        } else if (type->k == Ty::fixed_array_) {
+            text += "  %seed = call i64 @beans_slot_mix(i64 " +
+                    std::to_string(type->array_len) + ")\n";
+            std::string hash = "%seed";
+            int stride = value_size(type->args[0]);
+            for (uint32_t i = 0; i < type->array_len; i++)
+                hash = field_hash(type->args[0], static_cast<int>(i) * stride, hash);
+            text += "  ret i64 " + hash + "\n";
+        } else if (is_inline_option(type)) {
+            int offset = align_up(1, value_align(type->args[0]));
+            text += "  %tag = load i1, ptr %value\n"
+                    "  %tag64 = zext i1 %tag to i64\n"
+                    "  %seed = call i64 @beans_slot_mix(i64 %tag64)\n"
+                    "  br i1 %tag, label %some, label %none\n"
+                    "some:\n";
+            std::string hash = field_hash(type->args[0], offset, "%seed");
+            text += "  ret i64 " + hash + "\nnone:\n  ret i64 %seed\n";
+        } else if (is_inline_result(type)) {
+            int ok_offset = align_up(1, value_align(type->args[0]));
+            int error_offset = align_up(ok_offset + value_size(type->args[0]),
+                                        value_align(type->args[1]));
+            text += "  %tag = load i1, ptr %value\n"
+                    "  %tag64 = zext i1 %tag to i64\n"
+                    "  %seed = call i64 @beans_slot_mix(i64 %tag64)\n"
+                    "  br i1 %tag, label %error, label %ok\n"
+                    "ok:\n";
+            std::string ok_hash = field_hash(type->args[0], ok_offset, "%seed");
+            text += "  ret i64 " + ok_hash + "\nerror:\n";
+            std::string error_hash =
+                field_hash(type->args[1], error_offset, "%seed");
+            text += "  ret i64 " + error_hash + "\n";
+        } else {
+            text += "  ret i64 0\n";
+        }
+        text += "}\n";
+        lifted += text;
+        return symbol;
     }
     struct FnInst {
         const FnDecl* decl;
@@ -1684,6 +2115,7 @@ struct CG2 {
 struct FreeVars {
     std::set<std::string> bound;
     std::set<std::string> free;
+    std::set<std::string> assigned_free;
     std::vector<std::unique_ptr<std::string>> srcs;
 
     void use(std::string_view name) {
@@ -1710,6 +2142,10 @@ struct FreeVars {
                 bound.insert(s->name);
                 break;
             case Stmt::Kind::assign:
+                if (s->target && s->target->kind == Expr::Kind::ident) {
+                    std::string name(s->target->text);
+                    if (!bound.count(name)) assigned_free.insert(std::move(name));
+                }
                 expr(s->target.get());
                 expr(s->value.get());
                 break;
@@ -1828,9 +2264,19 @@ static std::set<std::string> closure_free_names(const Expr* clo) {
     return fv.free;
 }
 
+// A free name written by the closure (including a nested closure) needs one
+// shared cell. Read-only scalar captures can live in the environment itself.
+static std::set<std::string> closure_assigned_free_names(const Expr* clo) {
+    FreeVars fv;
+    for (const Param& p : clo->params) fv.bound.insert(p.name);
+    fv.block(clo->body);
+    return fv.assigned_free;
+}
+
 // every name captured by any closure anywhere in this body
 struct ClosureScan {
     std::set<std::string> captured;
+    std::set<std::string> assigned_captures;
     std::set<std::string> taken;
     void block(const std::vector<StmtPtr>& b) {
         for (const StmtPtr& s : b) stmt(s.get());
@@ -1855,6 +2301,8 @@ struct ClosureScan {
         if (e->kind == Expr::Kind::closure) {
             std::set<std::string> f = closure_free_names(e);
             captured.insert(f.begin(), f.end());
+            std::set<std::string> a = closure_assigned_free_names(e);
+            assigned_captures.insert(a.begin(), a.end());
             // and keep scanning inside for doubly nested closures
         }
         if (e->kind == Expr::Kind::string_lit) {
@@ -1952,6 +2400,116 @@ struct ReadScan {
     }
 };
 
+// Name totals above deliberately disable shadowed names. Keep a second,
+// lexical scan for the common local-with-one-read case: two unrelated `node`
+// bindings must not force a retain. Loop-depth checks in FnEmit still prevent
+// moving an outer value on the first iteration of an inner loop.
+struct SingleReadScan {
+    struct Binding { std::vector<const Expr*> reads; };
+    std::vector<std::map<std::string, size_t>> scopes{{}};
+    std::vector<Binding> bindings;
+    std::set<const Expr*> single_reads;
+
+    void bind(const std::string& name) {
+        scopes.back()[name] = bindings.size();
+        bindings.push_back({});
+    }
+    void use(const Expr* e) {
+        std::string name(e->text);
+        for (auto scope = scopes.rbegin(); scope != scopes.rend(); ++scope) {
+            auto found = scope->find(name);
+            if (found != scope->end()) {
+                bindings[found->second].reads.push_back(e);
+                return;
+            }
+        }
+    }
+    void pattern(const Pattern* p) {
+        if (!p) return;
+        for (const Param& binding : p->bindings) bind(binding.name);
+        for (const PatPtr& alt : p->alts) pattern(alt.get());
+    }
+    void block(const std::vector<StmtPtr>& body, bool nested = true) {
+        if (nested) scopes.emplace_back();
+        for (const StmtPtr& statement : body) stmt(statement.get());
+        if (nested) scopes.pop_back();
+    }
+    void stmt(const Stmt* s) {
+        if (!s) return;
+        switch (s->kind) {
+            case Stmt::Kind::let_:
+                expr(s->init.get());
+                bind(s->name);
+                return;
+            case Stmt::Kind::assign:
+                if (s->target && s->target->kind != Expr::Kind::ident)
+                    expr(s->target.get());
+                expr(s->value.get());
+                return;
+            case Stmt::Kind::expr:
+            case Stmt::Kind::ret:
+            case Stmt::Kind::defer_:
+                expr(s->expr.get());
+                return;
+            case Stmt::Kind::if_:
+                expr(s->cond.get());
+                block(s->body);
+                block(s->else_body);
+                return;
+            case Stmt::Kind::for_ever:
+                block(s->body);
+                return;
+            case Stmt::Kind::for_while:
+                expr(s->cond.get());
+                block(s->body);
+                return;
+            case Stmt::Kind::for_in:
+                expr(s->iterable.get());
+                scopes.emplace_back();
+                bind(s->loop_var);
+                block(s->body, false);
+                scopes.pop_back();
+                return;
+            case Stmt::Kind::unsafe_:
+                block(s->body);
+                return;
+            default:
+                return;
+        }
+    }
+    void expr(const Expr* e) {
+        if (!e) return;
+        if (e->kind == Expr::Kind::ident) { use(e); return; }
+        if (e->kind == Expr::Kind::string_lit) return;
+        if (e->kind == Expr::Kind::closure) {
+            scopes.emplace_back();
+            for (const Param& param : e->params) bind(param.name);
+            block(e->body, false);
+            scopes.pop_back();
+            return;
+        }
+        expr(e->lhs.get()); expr(e->rhs.get()); expr(e->callee.get());
+        for (const ExprPtr& arg : e->args) expr(arg.get());
+        expr(e->object.get()); expr(e->index_expr.get());
+        for (const InitEntry& entry : e->entries) {
+            expr(entry.key.get()); expr(entry.value.get());
+        }
+        expr(e->cond.get()); expr(e->then_e.get()); expr(e->else_e.get());
+        expr(e->subject.get());
+        for (const MatchArm& arm : e->arms) {
+            scopes.emplace_back();
+            pattern(arm.pat.get());
+            expr(arm.value.get());
+            block(arm.body, false);
+            scopes.pop_back();
+        }
+    }
+    void finish() {
+        for (const Binding& binding : bindings)
+            if (binding.reads.size() == 1) single_reads.insert(binding.reads[0]);
+    }
+};
+
 // ---- per-function emitter ----------------------------------------------------
 
 struct FnEmit {
@@ -1972,8 +2530,14 @@ struct FnEmit {
     // a deinit whose class chain has an ancestor deinit calls it on every
     // return path, after cleanup, right before ret — subclass first, then up
     std::string deinit_chain;
-    // closures: captured variables arrive as heap cells behind an env ptr
-    const std::vector<std::pair<std::string, Ty*>>* captured = nullptr;
+    struct Capture {
+        std::string name;
+        Ty* ty;
+        bool by_value = false;
+    };
+    // Mutable/reference captures arrive as shared cells. Immutable scalars are
+    // stored directly in their eight-byte environment slot.
+    const std::vector<Capture>* captured = nullptr;
 
     std::string allocas, body, entry_inits;
     std::string pkg; // package prefix this function's source lives in
@@ -1991,6 +2555,10 @@ struct FnEmit {
                             // observable, and the interpreter dies newest-first
         size_t loop_depth = 0;
         int decimal_scale = -1; // exact only while every path preserves it
+        // A known-scale decimal local keeps its signed coefficient unpacked.
+        // Literal +=/-= loops then avoid rebuilding the 16-byte wire layout
+        // on every iteration; var_read packs it only at an escape/read site.
+        std::string decimal_coeff_slot;
     };
     int next_seq = 0;
     std::vector<std::map<std::string, Var>> scopes;
@@ -2001,10 +2569,12 @@ struct FnEmit {
     // owned temporaries created while emitting the current statement
     std::vector<EV> temps;
     Ty* ret_ty = nullptr;
-    std::set<std::string> boxed_names; // captured by closures
+    std::set<std::string> boxed_names; // names captured by closures
+    std::set<std::string> assigned_capture_names;
     std::set<std::string> taken_names;
     std::map<std::string, size_t> remaining_reads;
     std::map<std::string, size_t> declaration_counts;
+    std::set<const Expr*> single_read_moves;
     std::map<std::string, Var*> transfer_candidates;
     std::map<const Expr*, std::string> closure_symbols;
     struct DeferRec {
@@ -2023,7 +2593,7 @@ struct FnEmit {
 
     // closure form
     FnEmit(CG2& cg, const Expr* clo, std::string sym,
-           const std::vector<std::pair<std::string, Ty*>>* caps,
+           const std::vector<Capture>* caps,
            const std::map<std::string, Ty*>& e)
         : cg(cg), symbol(std::move(sym)), is_main(false), has_self(false),
           self_impl(nullptr), self_iface(nullptr), self_enum(nullptr), env(e),
@@ -2057,13 +2627,16 @@ struct FnEmit {
     // borrow can't dangle. Closure-captured (boxed) names keep the retain —
     // their cell owns its value and closures can swap it.
     std::set<std::string> assigned_names_;
+    std::map<std::string, std::vector<const Stmt*>> assignment_sites_;
     bool assigned_scanned_ = false;
     void scan_assigned(const std::vector<StmtPtr>& stmts) {
         for (const StmtPtr& sp : stmts) {
             const Stmt* s = sp.get();
             if (s->kind == Stmt::Kind::assign && s->target &&
                 s->target->kind == Expr::Kind::ident) {
-                assigned_names_.insert(std::string(s->target->text));
+                std::string name(s->target->text);
+                assigned_names_.insert(name);
+                assignment_sites_[name].push_back(s);
             }
             if (s->kind == Stmt::Kind::expr && s->expr &&
                 s->expr->kind == Expr::Kind::match_expr) {
@@ -2080,8 +2653,32 @@ struct FnEmit {
         }
         return assigned_names_.count(name) > 0;
     }
+    bool can_shadow_decimal(const std::string& name, int scale) {
+        (void)ever_assigned(name); // populate assignment_sites_
+        auto found = assignment_sites_.find(name);
+        if (found == assignment_sites_.end()) return true;
+        for (const Stmt* assignment : found->second) {
+            if (assignment->op != TokenKind::plus_eq &&
+                assignment->op != TokenKind::minus_eq)
+                return false;
+            Decimal literal;
+            if (!decimal_literal_value(assignment->value.get(), literal) ||
+                literal.scale != scale)
+                return false;
+        }
+        return true;
+    }
+    static bool scalar_capture_type(const Ty* type) {
+        return type->k == Ty::i64_ || type->k == Ty::i1_ || type->k == Ty::f64_ ||
+               type->k == Ty::rawptr_;
+    }
+    bool needs_capture_cell(const std::string& name, Ty* type) {
+        if (!boxed_names.count(name)) return false;
+        return !scalar_capture_type(type) || ever_assigned(name) ||
+               assigned_capture_names.count(name);
+    }
     std::string alloc_slot(const std::string& name, Ty* t, bool entry = false) {
-        bool boxed = boxed_names.count(name) > 0;
+        bool boxed = needs_capture_cell(name, t);
         std::string slot = "%v" + std::to_string(next_reg++) + "." + name;
         allocas += "  " + slot + " = alloca " + (boxed ? "ptr" : ll(t)) + "\n";
         std::string live_flag;
@@ -2107,7 +2704,7 @@ struct FnEmit {
             else body += code;
         }
         scopes.back()[name] = {slot, live_flag, t, boxed, false, false, "", next_seq++,
-                               loop_stack.size()};
+                               loop_stack.size(), -1, ""};
         return slot;
     }
     std::string fresh_slot(const char* tag, Ty* t) {
@@ -2163,6 +2760,27 @@ struct FnEmit {
                      val + ", " + std::to_string(i + 1));
                 emit_retain_value(payload, type->args[i]);
             }
+            return;
+        }
+        if (type->k == Ty::fixed_array_) {
+            if (!has_owned_refs(type->args[0])) return;
+            for (uint32_t i = 0; i < type->array_len; i++) {
+                std::string element = reg();
+                line(element + " = extractvalue " + std::string(ll(type)) + " " + val +
+                     ", " + std::to_string(i));
+                emit_retain_value(element, type->args[0]);
+            }
+            return;
+        }
+        if (type->k == Ty::struct_ && !type->is_union) {
+            for (size_t i = 0; i < type->field_types.size(); i++) {
+                Ty* field = type->field_types[i];
+                if (!has_owned_refs(field)) continue;
+                std::string value = reg();
+                line(value + " = extractvalue " + std::string(ll(type)) + " " + val +
+                     ", " + std::to_string(i));
+                emit_retain_value(value, field);
+            }
         }
     }
     void emit_release_value(const std::string& val, Ty* type) {
@@ -2186,6 +2804,27 @@ struct FnEmit {
                      val + ", " + std::to_string(i + 1));
                 emit_release_value(payload, type->args[i]);
             }
+            return;
+        }
+        if (type->k == Ty::fixed_array_) {
+            if (!has_owned_refs(type->args[0])) return;
+            for (uint32_t i = type->array_len; i-- > 0;) {
+                std::string element = reg();
+                line(element + " = extractvalue " + std::string(ll(type)) + " " + val +
+                     ", " + std::to_string(i));
+                emit_release_value(element, type->args[0]);
+            }
+            return;
+        }
+        if (type->k == Ty::struct_ && !type->is_union) {
+            for (size_t i = type->field_types.size(); i-- > 0;) {
+                Ty* field = type->field_types[i];
+                if (!has_owned_refs(field)) continue;
+                std::string value = reg();
+                line(value + " = extractvalue " + std::string(ll(type)) + " " + val +
+                     ", " + std::to_string(i));
+                emit_release_value(value, field);
+            }
         }
     }
     void emit_retain_value_entry(const std::string& val, Ty* type) {
@@ -2208,6 +2847,27 @@ struct FnEmit {
                 entry_inits += "  " + payload + " = extractvalue " + ll(type) + " " +
                                val + ", " + std::to_string(i + 1) + "\n";
                 emit_retain_value_entry(payload, type->args[i]);
+            }
+            return;
+        }
+        if (type->k == Ty::fixed_array_) {
+            if (!has_owned_refs(type->args[0])) return;
+            for (uint32_t i = 0; i < type->array_len; i++) {
+                std::string element = reg();
+                entry_inits += "  " + element + " = extractvalue " + ll(type) + " " +
+                               val + ", " + std::to_string(i) + "\n";
+                emit_retain_value_entry(element, type->args[0]);
+            }
+            return;
+        }
+        if (type->k == Ty::struct_ && !type->is_union) {
+            for (size_t i = 0; i < type->field_types.size(); i++) {
+                Ty* field = type->field_types[i];
+                if (!has_owned_refs(field)) continue;
+                std::string value = reg();
+                entry_inits += "  " + value + " = extractvalue " + ll(type) + " " + val +
+                               ", " + std::to_string(i) + "\n";
+                emit_retain_value_entry(value, field);
             }
         }
     }
@@ -2262,6 +2922,20 @@ struct FnEmit {
 
     // read/write a Var, transparently going through its cell when boxed
     std::string var_read(Var* v) {
+        if (!v->boxed && v->ty->k == Ty::dec_ && v->decimal_scale >= 0 &&
+            !v->decimal_coeff_slot.empty()) {
+            const unsigned __int128 coeff_mask =
+                (static_cast<unsigned __int128>(1) << 112) - 1;
+            const unsigned __int128 scale =
+                static_cast<unsigned __int128>(v->decimal_scale) << 112;
+            std::string coefficient = reg();
+            line(coefficient + " = load i128, ptr " + v->decimal_coeff_slot);
+            std::string masked = reg(), packed = reg();
+            line(masked + " = and i128 " + coefficient + ", " +
+                 u128_str(coeff_mask));
+            line(packed + " = or i128 " + masked + ", " + u128_str(scale));
+            return packed;
+        }
         std::string r = reg();
         if (!v->boxed) {
             line(r + " = load " + std::string(ll(v->ty)) + ", ptr " + v->slot);
@@ -2319,9 +2993,18 @@ struct FnEmit {
             default: return 5;
         }
     }
-    std::string eq_thunk(Ty* t, int kind) { return kind == 4 ? cg.request_eq(t) : "null"; }
+    int map_key_kind(Ty* type) {
+        return is_typed_map_key(type) ? 4 : eq_kind(type);
+    }
+    std::string eq_thunk(Ty* t, int kind) {
+        if (is_typed_map_key(t)) return cg.request_wide_eq(t);
+        return kind == 4 ? cg.request_eq(t) : "null";
+    }
     // map index hash for thunk-compared keys; other kinds hash in the runtime
-    std::string hash_thunk(Ty* t, int kind) { return kind == 4 ? cg.request_hash(t) : "null"; }
+    std::string hash_thunk(Ty* t, int kind) {
+        if (is_typed_map_key(t)) return cg.request_wide_hash(t);
+        return kind == 4 ? cg.request_hash(t) : "null";
+    }
     // interp panics on integer divide/modulo by zero; a bare sdiv would give 0
     // silently on arm64 (and trap on x86) — emit the same panic on both paths
     void guard_div_zero(const std::string& rhs, Ty* type, bool is_mod,
@@ -2395,6 +3078,75 @@ struct FnEmit {
             return pointer_mask(type->args[0], base + ok_offset) |
                    pointer_mask(type->args[1], base + error_offset);
         }
+        if (type->k == Ty::fixed_array_ && !type->args.empty()) {
+            long long mask = 0;
+            int stride = CG2::value_size(type->args[0]);
+            for (uint32_t i = 0; i < type->array_len; i++)
+                mask |= pointer_mask(type->args[0], base + static_cast<int>(i) * stride);
+            return mask;
+        }
+        if (type->k == Ty::struct_ && !type->is_union) {
+            long long mask = 0;
+            for (size_t i = 0; i < type->field_types.size(); i++)
+                mask |= pointer_mask(type->field_types[i],
+                                     base + static_cast<int>(type->field_offsets[i]));
+            return mask;
+        }
+        return 0;
+    }
+    static bool cycle_capable_pointer(Ty* type) {
+        if (!type || !is_rc(type)) return false;
+        switch (type->k) {
+            case Ty::obj_:
+            case Ty::list_:
+            case Ty::map_:
+            case Ty::fn_:
+            case Ty::mutex_:
+            case Ty::chan_:
+            case Ty::box_:
+            case Ty::arena_:
+            case Ty::enum_:
+                return true;
+            default:
+                return false;
+        }
+    }
+    static long long cycle_pointer_mask(Ty* type, int base = 0) {
+        if (!type) return 0;
+        if (is_rc(type)) {
+            int slot = base / 8;
+            return cycle_capable_pointer(type) && base % 8 == 0 && slot < 58
+                       ? static_cast<long long>(1ULL << slot)
+                       : 0;
+        }
+        if (is_inline_option(type)) {
+            int offset = CG2::align_up(1, CG2::value_align(type->args[0]));
+            return cycle_pointer_mask(type->args[0], base + offset);
+        }
+        if (is_inline_result(type)) {
+            int ok_offset = CG2::align_up(1, CG2::value_align(type->args[0]));
+            int error_offset = CG2::align_up(
+                ok_offset + CG2::value_size(type->args[0]),
+                CG2::value_align(type->args[1]));
+            return cycle_pointer_mask(type->args[0], base + ok_offset) |
+                   cycle_pointer_mask(type->args[1], base + error_offset);
+        }
+        if (type->k == Ty::fixed_array_ && !type->args.empty()) {
+            long long mask = 0;
+            int stride = CG2::value_size(type->args[0]);
+            for (uint32_t i = 0; i < type->array_len; i++)
+                mask |= cycle_pointer_mask(type->args[0],
+                                           base + static_cast<int>(i) * stride);
+            return mask;
+        }
+        if (type->k == Ty::struct_ && !type->is_union) {
+            long long mask = 0;
+            for (size_t i = 0; i < type->field_types.size(); i++)
+                mask |= cycle_pointer_mask(
+                    type->field_types[i],
+                    base + static_cast<int>(type->field_offsets[i]));
+            return mask;
+        }
         return 0;
     }
     static bool pointer_mask_fits(Ty* type, int base = 0) {
@@ -2412,7 +3164,26 @@ struct FnEmit {
             return pointer_mask_fits(type->args[0], base + ok_offset) &&
                    pointer_mask_fits(type->args[1], base + error_offset);
         }
+        if (type->k == Ty::fixed_array_ && !type->args.empty()) {
+            int stride = CG2::value_size(type->args[0]);
+            for (uint32_t i = 0; i < type->array_len; i++)
+                if (!pointer_mask_fits(type->args[0],
+                                       base + static_cast<int>(i) * stride))
+                    return false;
+            return true;
+        }
+        if (type->k == Ty::struct_ && !type->is_union) {
+            for (size_t i = 0; i < type->field_types.size(); i++)
+                if (!pointer_mask_fits(
+                        type->field_types[i],
+                        base + static_cast<int>(type->field_offsets[i])))
+                    return false;
+            return true;
+        }
         return true;
+    }
+    static bool uses_typed_owned_storage(Ty* type) {
+        return is_typed_list_element(type) || cycle_pointer_mask(type) != 0;
     }
     void store_at(const std::string& base, int offset, const std::string& val, Ty* t) {
         std::string p = reg();
@@ -2428,20 +3199,203 @@ struct FnEmit {
     std::string load_slot_at(const std::string& base, int offset, Ty* type) {
         return from_slot(load_at(base, offset, cg.t_i64()), type);
     }
-    // enum boxes own their payload refs; the box itself is an owned temp
+    std::string list_element_ptr(const std::string& list, const std::string& index,
+                                 Ty* element) {
+        std::string data = load_at(list, 0, cg.t_str());
+        std::string pointer = reg();
+        if (is_typed_list_element(element)) {
+            line(pointer + " = getelementptr " + std::string(ll(element)) + ", ptr " +
+                 data + ", i64 " + index);
+        } else {
+            line(pointer + " = getelementptr i64, ptr " + data + ", i64 " + index);
+        }
+        return pointer;
+    }
+    EV load_list_element(const std::string& list, const std::string& index, Ty* element,
+                         bool moved = false) {
+        std::string pointer = list_element_ptr(list, index, element);
+        std::string value = reg();
+        if (is_typed_list_element(element)) {
+            line(value + " = load " + std::string(ll(element)) + ", ptr " + pointer);
+            return {value, element};
+        }
+        line(value + " = load i64, ptr " + pointer);
+        return {from_slot(value, element, moved), element};
+    }
+    std::string spill_list_element(const EV& value, const char* tag) {
+        std::string slot = fresh_slot(tag, value.second);
+        line("store " + std::string(ll(value.second)) + " " + value.first + ", ptr " +
+             slot);
+        return slot;
+    }
+    void emit_list_push(const std::string& list, const EV& value) {
+        if (is_typed_list_element(value.second)) {
+            std::string slot = spill_list_element(value, "list.push");
+            line("call void @beans_list_push_typed(ptr " + list + ", ptr " + slot + ")");
+        } else {
+            line("call void @beans_list_push(ptr " + list + ", i64 " +
+                 to_slot(value, true) + ")");
+        }
+    }
+    std::string emit_list_new(Ty* element) {
+        std::string list = reg();
+        if (is_typed_list_element(element)) {
+            if (has_owned_refs(element) && !pointer_mask_fits(element))
+                cg.err(dline, dcol,
+                       "list element ARC layout exceeds runtime metadata capacity");
+            line(list + " = call ptr @beans_list_new_typed(i64 " +
+                 std::to_string(CG2::value_size(element)) + ", i64 " +
+                 std::to_string(pointer_mask(element)) + ")");
+        } else {
+            line(list + " = call ptr @beans_list_new(i64 " +
+                 std::string(is_slot_rc(element) ? "1" : "0") + ")");
+        }
+        return list;
+    }
+    std::string emit_map_new(Ty* key, Ty* value, bool ordered) {
+        std::string map = reg();
+        if (is_typed_map_value(value)) {
+            if (has_owned_refs(value) && !pointer_mask_fits(value))
+                cg.err(dline, dcol,
+                       "map value ARC layout exceeds runtime metadata capacity");
+            line(map + " = call ptr @beans_map_new_typed_value(i64 " +
+                 std::string(is_slot_rc(key) || is_typed_map_key(key) ? "1" : "0") +
+                 ", i64 " +
+                 std::to_string(CG2::value_size(value)) + ", i64 " +
+                 std::to_string(pointer_mask(value)) + ", i64 " +
+                 std::to_string(cycle_pointer_mask(value)) + ", i64 " +
+                 (ordered ? "1" : "0") + ")");
+        } else {
+            line(map + " = call ptr @beans_map_new(i64 " +
+                 std::string(is_slot_rc(key) || is_typed_map_key(key) ? "1" : "0") +
+                 ", i64 " +
+                 std::string(is_slot_rc(value) ? "1" : "0") + ", i64 " +
+                 (ordered ? "1" : "0") + ")");
+        }
+        return map;
+    }
+    std::string emit_map_key_argument(const EV& key, Ty* key_type, bool storing) {
+        if (!is_typed_map_key(key_type)) return to_slot(key, storing);
+        std::string pointer;
+        if (storing) {
+            if (has_owned_refs(key_type) && !pointer_mask_fits(key_type))
+                cg.err(dline, dcol,
+                       "map key ARC layout exceeds runtime metadata capacity");
+            pointer = alloc_bytes(CG2::value_size(key_type),
+                                  fixed_meta(pointer_mask(key_type)));
+        } else {
+            pointer = fresh_slot("map.key", key_type);
+        }
+        line("store " + std::string(ll(key_type)) + " " + key.first + ", ptr " +
+             pointer);
+        std::string raw = reg();
+        line(raw + " = ptrtoint ptr " + pointer + " to i64");
+        return raw;
+    }
+    void emit_map_set(const std::string& map, const EV& key, const EV& value,
+                      Ty* key_type, Ty* value_type, int kind) {
+        std::string key_argument = emit_map_key_argument(key, key_type, true);
+        if (is_typed_map_value(value_type)) {
+            std::string slot = spill_list_element(value, "map.set");
+            if (kind == 0) {
+                line("call void @beans_map_set_typed_raw(ptr " + map + ", i64 " +
+                     key_argument + ", ptr " + slot + ")");
+            } else {
+                line("call void @beans_map_set_typed(ptr " + map + ", i64 " +
+                     key_argument + ", ptr " + slot + ", i64 " +
+                     std::to_string(kind) + ", ptr " + eq_thunk(key_type, kind) +
+                     ", ptr " + hash_thunk(key_type, kind) + ")");
+            }
+            return;
+        }
+        if (kind == 0) {
+            line("call void @beans_map_set_raw(ptr " + map + ", i64 " +
+                 key_argument + ", i64 " + to_slot(value, true) + ")");
+        } else {
+            line("call void @beans_map_set(ptr " + map + ", i64 " +
+                 key_argument + ", i64 " + to_slot(value, true) + ", i64 " +
+                 std::to_string(kind) + ", ptr " + eq_thunk(key_type, kind) +
+                 ", ptr " + hash_thunk(key_type, kind) + ")");
+        }
+    }
+    std::string emit_map_insert(const std::string& map, const EV& key,
+                                const EV& value, Ty* key_type, Ty* value_type,
+                                int kind) {
+        std::string result = reg();
+        std::string key_argument = emit_map_key_argument(key, key_type, true);
+        if (is_typed_map_value(value_type)) {
+            std::string slot = spill_list_element(value, "map.insert");
+            if (kind == 0) {
+                line(result + " = call i64 @beans_map_insert_typed_raw(ptr " + map +
+                     ", i64 " + key_argument + ", ptr " + slot + ")");
+            } else {
+                line(result + " = call i64 @beans_map_insert_typed(ptr " + map +
+                     ", i64 " + key_argument + ", ptr " + slot + ", i64 " +
+                     std::to_string(kind) + ", ptr " + eq_thunk(key_type, kind) +
+                     ", ptr " + hash_thunk(key_type, kind) + ")");
+            }
+            return result;
+        }
+        if (kind == 0) {
+            line(result + " = call i64 @beans_map_insert_raw(ptr " + map + ", i64 " +
+                 key_argument + ", i64 " + to_slot(value, true) + ")");
+        } else {
+            line(result + " = call i64 @beans_map_insert(ptr " + map + ", i64 " +
+                 key_argument + ", i64 " + to_slot(value, true) + ", i64 " +
+                 std::to_string(kind) + ", ptr " + eq_thunk(key_type, kind) +
+                 ", ptr " + hash_thunk(key_type, kind) + ")");
+        }
+        return result;
+    }
+    static bool enum_typed_payload(Ty* type) {
+        return is_typed_list_element(type);
+    }
+    static int enum_payload_size(Ty* type) {
+        return enum_typed_payload(type) ? CG2::value_size(type) : 8;
+    }
+    static int enum_payload_align(Ty* type) {
+        return enum_typed_payload(type) ? CG2::value_align(type) : 8;
+    }
+    static std::vector<int> enum_payload_offsets(const std::vector<Ty*>& types) {
+        std::vector<int> offsets;
+        int next = 8;
+        for (Ty* type : types) {
+            next = CG2::align_up(next, enum_payload_align(type));
+            offsets.push_back(next);
+            next += enum_payload_size(type);
+        }
+        return offsets;
+    }
+    // Enum boxes keep narrow payloads in their original eight-byte slots and
+    // wide payloads in their real inline layout. The box owns nested ARC refs.
     std::string box_enum(int tag, const std::vector<EV>& payload) {
         if (payload.empty()) return cg.intern_enum_tag(tag); // immortal singleton
+        std::vector<Ty*> types;
+        for (const EV& value : payload) types.push_back(value.second);
+        std::vector<int> offsets = enum_payload_offsets(types);
+        int bytes = offsets.back() + enum_payload_size(types.back());
         long long mask = 0;
         for (size_t i = 0; i < payload.size(); i++) {
-            if (is_slot_rc(payload[i].second)) mask |= 1LL << (i + 1);
+            if (has_owned_refs(payload[i].second) &&
+                !pointer_mask_fits(payload[i].second, offsets[i])) {
+                cg.err(dline, dcol,
+                       "enum payload ARC layout exceeds runtime metadata capacity");
+            }
+            if (enum_typed_payload(payload[i].second)) {
+                mask |= pointer_mask(payload[i].second, offsets[i]);
+            } else if (is_slot_rc(payload[i].second)) {
+                mask |= 1LL << (offsets[i] / 8);
+            }
         }
-        std::string b = alloc_bytes(8 + 8 * static_cast<int>(payload.size()),
-                                    fixed_meta(mask));
+        std::string b = alloc_bytes(bytes, fixed_meta(mask));
         store_at(b, 0, std::to_string(tag), cg.t_i64());
         for (size_t i = 0; i < payload.size(); i++) {
             transfer_in(payload[i]);
-            store_at(b, 8 + 8 * static_cast<int>(i), to_slot(payload[i], true),
-                     cg.t_i64());
+            if (enum_typed_payload(payload[i].second)) {
+                store_at(b, offsets[i], payload[i].first, payload[i].second);
+            } else {
+                store_at(b, offsets[i], to_slot(payload[i], true), cg.t_i64());
+            }
         }
         own(b, cg.t_enum("Option", {})); // any rc type works for bookkeeping
         return b;
@@ -2508,7 +3462,10 @@ struct FnEmit {
                  result.first + ", " + std::to_string(ok ? 1 : 2));
             return payload;
         }
-        return load_slot_at(result.first, 8, payload_type);
+        int offset = enum_payload_offsets({payload_type})[0];
+        return enum_typed_payload(payload_type)
+                   ? load_at(result.first, offset, payload_type)
+                   : load_slot_at(result.first, offset, payload_type);
     }
 
     std::string option_has(const EV& option) {
@@ -2533,7 +3490,9 @@ struct FnEmit {
             return result;
         }
         if (is_niche_option(option.second)) return option.first;
-        return load_slot_at(option.first, 8, inner);
+        int offset = enum_payload_offsets({inner})[0];
+        return enum_typed_payload(inner) ? load_at(option.first, offset, inner)
+                                         : load_slot_at(option.first, offset, inner);
     }
 
     // Convert to the generic runtime's i64 slot. Decimal is inline everywhere
@@ -2667,10 +3626,12 @@ struct FnEmit {
                     auto remaining = remaining_reads.find(name);
                     if (remaining != remaining_reads.end() && remaining->second > 0)
                         remaining->second -= 1;
-                    bool last_read = remaining != remaining_reads.end() &&
-                                     remaining->second == 0 &&
-                                     declaration_counts[name] == 1 &&
-                                     v->loop_depth == loop_stack.size();
+                    bool last_read =
+                        ((remaining != remaining_reads.end() &&
+                          remaining->second == 0 &&
+                          declaration_counts[name] == 1) ||
+                         single_read_moves.count(e)) &&
+                        v->loop_depth == loop_stack.size();
                     bool overwritten_next =
                         cg.hir.mir().can_move_before_overwrite(e);
                     if ((last_read || overwritten_next) && v->owned && !v->boxed &&
@@ -2788,19 +3749,38 @@ struct FnEmit {
                     // message byte-identical to the interpreter's
                     Ty* K = obj.second->args[0];
                     Ty* V = obj.second->args[1];
-                    int kind = eq_kind(K);
-                    std::string raw = reg();
+                    int kind = map_key_kind(K);
+                    std::string key_argument =
+                        emit_map_key_argument(idx, K, false);
+                    bool typed_value = is_typed_map_value(V);
+                    std::string raw;
+                    std::string value_slot;
                     std::string okv = reg(), c = reg();
-                    if (kind == 0) {
+                    if (typed_value) {
+                        value_slot = fresh_slot("map.index", V);
+                        if (kind == 0) {
+                            line(okv + " = call i64 @beans_map_get_typed_raw(ptr " +
+                                 obj.first + ", i64 " + key_argument + ", ptr " +
+                                 value_slot + ")");
+                        } else {
+                            line(okv + " = call i64 @beans_map_get_typed(ptr " +
+                                 obj.first + ", i64 " + key_argument + ", i64 " +
+                                 std::to_string(kind) + ", ptr " + value_slot +
+                                 ", ptr " + eq_thunk(K, kind) + ", ptr " +
+                                 hash_thunk(K, kind) + ")");
+                        }
+                    } else if (kind == 0) {
+                        raw = reg();
                         std::string pair = reg();
                         line(pair + " = call {i64, i64} @beans_map_get_raw(ptr " +
-                             obj.first + ", i64 " + to_slot(idx) + ")");
+                             obj.first + ", i64 " + key_argument + ")");
                         line(raw + " = extractvalue {i64, i64} " + pair + ", 0");
                         line(okv + " = extractvalue {i64, i64} " + pair + ", 1");
                     } else {
+                        raw = reg();
                         std::string okf = fresh_slot("mgok", cg.t_i64());
                         line(raw + " = call i64 @beans_map_get(ptr " + obj.first +
-                             ", i64 " + to_slot(idx) + ", i64 " +
+                             ", i64 " + key_argument + ", i64 " +
                              std::to_string(kind) + ", ptr " + okf + ", ptr " +
                              eq_thunk(K, kind) + ", ptr " + hash_thunk(K, kind) + ")");
                         line(okv + " = load i64, ptr " + okf);
@@ -2809,7 +3789,9 @@ struct FnEmit {
                     std::string okb = bb(), badb = bb();
                     line("br i1 " + c + ", label %" + okb + ", label %" + badb);
                     label(badb);
-                    std::string ks = to_str(idx, e->index_expr.get());
+                    std::string ks = is_typed_map_key(K)
+                                         ? cg.intern_string("<key>")
+                                         : to_str(idx, e->index_expr.get());
                     // branch-local, and the panic never returns — but to_str is
                     // identity on strings, so this can eat the key temp itself,
                     // and then the hit path must release it in its own branch
@@ -2823,6 +3805,12 @@ struct FnEmit {
                     line("unreachable");
                     label(okb);
                     if (key_eaten) emit_release(idx.first);
+                    if (typed_value) {
+                        std::string value = reg();
+                        line(value + " = load " + std::string(ll(V)) + ", ptr " +
+                             value_slot);
+                        return {value, V};
+                    }
                     return {from_slot(raw, V), V}; // borrowed from the map, like lists
                 }
                 if (obj.second->k == Ty::slice_) {
@@ -2889,11 +3877,7 @@ struct FnEmit {
                      std::to_string(e->col) + ")");
                 line("unreachable");
                 label(okb);
-                std::string data = load_at(obj.first, 0, cg.t_str()); // ptr
-                std::string ep = reg(), raw = reg();
-                line(ep + " = getelementptr i64, ptr " + data + ", i64 " + index);
-                line(raw + " = load i64, ptr " + ep);
-                return {from_slot(raw, elem), elem};
+                return load_list_element(obj.first, index, elem);
             }
             case Expr::Kind::list_lit: {
                 if (hint && hint->k == Ty::fixed_array_) {
@@ -2903,12 +3887,14 @@ struct FnEmit {
                     std::string elem_type = ll(elem);
                     for (size_t i = 0; i < e->args.size(); i++) {
                         EV value = eval(e->args[i].get(), elem);
+                        transfer_in(value);
                         std::string next = reg();
                         line(next + " = insertvalue " + array_type + " " + current +
                              ", " + elem_type + " " + value.first + ", " +
                              std::to_string(i));
                         current = next;
                     }
+                    own(current, hint);
                     return {current, hint};
                 }
                 Ty* elem = hint && hint->k == Ty::list_ ? hint->args[0] : nullptr;
@@ -2919,13 +3905,10 @@ struct FnEmit {
                     elems.push_back(std::move(v));
                 }
                 if (!elem) elem = cg.t_i64();
-                std::string l = reg();
-                line(l + " = call ptr @beans_list_new(i64 " +
-                     std::string(is_slot_rc(elem) ? "1" : "0") + ")");
+                std::string l = emit_list_new(elem);
                 for (const EV& v : elems) {
                     transfer_in(v);
-                    line("call void @beans_list_push(ptr " + l + ", i64 " +
-                         to_slot(v, true) + ")");
+                    emit_list_push(l, v);
                 }
                 own(l, cg.t_list(elem));
                 return {l, cg.t_list(elem)};
@@ -2999,11 +3982,14 @@ struct FnEmit {
     }
 
     // lambda-lift: emit the closure as a top-level fn taking its env ptr,
-    // and build a box {fnptr, cell...} at the site
+    // and build a box {fnptr, capture...} at the site
     EV eval_closure(const Expr* e) {
-        std::vector<std::pair<std::string, Ty*>> caps;
+        std::vector<Capture> caps;
         for (const std::string& name : closure_free_names(e)) {
-            if (Var* v = find_var(name)) caps.push_back({name, v->ty});
+            if (Var* v = find_var(name)) {
+                const bool by_value = !needs_capture_cell(name, v->ty);
+                caps.push_back({name, v->ty, by_value});
+            }
         }
 
         std::string sym = "@clo" + std::to_string(cg.next_clo++);
@@ -3019,14 +4005,31 @@ struct FnEmit {
         sig.push_back(e->type ? rt(e->type.get(), e->line, e->col) : cg.t_unit());
         Ty* fty = cg.t_fn(std::move(sig));
 
+        // A capture-free closure is immutable. Give it one immortal global
+        // environment instead of allocating and releasing the same 8-byte
+        // box on every loop iteration.
+        if (caps.empty()) {
+            std::string name = "@.closure" + std::to_string(cg.next_clo++);
+            cg.globals += name +
+                          " = private unnamed_addr constant {i64, i64, ptr} "
+                          "{i64 4611686018427387904, i64 1, ptr " + sym + "}\n";
+            return {"getelementptr (i8, ptr " + name + ", i64 16)", fty};
+        }
+
         long long mask = 0;
-        for (size_t i = 0; i < caps.size(); i++) mask |= 1LL << (i + 1);
+        for (size_t i = 0; i < caps.size(); i++) {
+            if (!caps[i].by_value) mask |= 1LL << (i + 1);
+        }
         std::string box = alloc_bytes(8 + 8 * static_cast<int>(caps.size()),
                                       fixed_meta(mask));
         store_at(box, 0, sym, cg.t_str());
         for (size_t i = 0; i < caps.size(); i++) {
-            Var* v = find_var(caps[i].first);
-            // v is boxed (the prepass saw this closure) — share the cell, +1
+            Var* v = find_var(caps[i].name);
+            if (caps[i].by_value) {
+                store_at(box, 8 + 8 * static_cast<int>(i), var_read(v), caps[i].ty);
+                continue;
+            }
+            // v is boxed (the prepass saw this closure) — share the cell, +1.
             std::string cell = reg();
             line(cell + " = load ptr, ptr " + v->slot);
             emit_retain(cell);
@@ -3348,9 +4351,13 @@ struct FnEmit {
                 return r;
             }
             case Ty::list_: {
-                std::string es = cg.request_show(v.second->args[0]);
-                line(r + " = call ptr @beans_show_list(ptr " + v.first + ", ptr " +
-                     es + ")");
+                if (v.second->args[0]->k == Ty::dec_) {
+                    line(r + " = call ptr @beans_show_list_decv(ptr " + v.first + ")");
+                } else {
+                    std::string es = cg.request_show(v.second->args[0]);
+                    line(r + " = call ptr @beans_show_list(ptr " + v.first + ", ptr " +
+                         es + ")");
+                }
                 own(r, cg.t_str());
                 return r;
             }
@@ -3370,6 +4377,27 @@ struct FnEmit {
 
     std::string inline_equal(const std::string& left, const std::string& right,
                              Ty* type) {
+        if (type->k == Ty::str_) {
+            std::string equal = reg(), same = reg();
+            line(equal + " = call i64 @beans_str_eq(ptr " + left + ", ptr " + right +
+                 ")");
+            line(same + " = icmp ne i64 " + equal + ", 0");
+            return same;
+        }
+        if (type->k == Ty::dec_) {
+            std::string compared = reg(), same = reg();
+            line(compared + " = call i32 @beans_decv_cmp(i128 " + left + ", i128 " +
+                 right + ")");
+            line(same + " = icmp eq i32 " + compared + ", 0");
+            return same;
+        }
+        if (type->k == Ty::bytes_) {
+            std::string equal = reg(), same = reg();
+            line(equal + " = call i64 @beans_bytes_eq(ptr " + left + ", ptr " + right +
+                 ")");
+            line(same + " = icmp ne i64 " + equal + ", 0");
+            return same;
+        }
         if (type->k == Ty::f64_) {
             std::string same = reg();
             line(same + " = fcmp oeq " + std::string(ll(type)) + " " + left + ", " +
@@ -3790,6 +4818,104 @@ struct FnEmit {
         return false;
     }
 
+    // A map update written through the safe Option API normally probes twice:
+    // once for get and once for set. Recognize the pure, integer accumulator
+    // form and lower it to one runtime probe. This is the same operation as
+    // C++ unordered_map's `m[key] += delta`, without adding a magic public API.
+    bool same_pure_expr(const Expr* a, const Expr* b) const {
+        if (!a || !b || a->kind != b->kind) return false;
+        switch (a->kind) {
+            case Expr::Kind::ident:
+                return a->text == b->text && a->resolved == b->resolved;
+            case Expr::Kind::self_ref:
+                return true;
+            case Expr::Kind::int_lit:
+            case Expr::Kind::float_lit:
+            case Expr::Kind::string_lit:
+                return a->text == b->text;
+            case Expr::Kind::bool_lit:
+                return a->bool_val == b->bool_val;
+            case Expr::Kind::field:
+                return a->name == b->name && same_pure_expr(a->object.get(),
+                                                            b->object.get());
+            case Expr::Kind::index:
+                return same_pure_expr(a->object.get(), b->object.get()) &&
+                       same_pure_expr(a->index_expr.get(), b->index_expr.get());
+            default:
+                return false;
+        }
+    }
+
+    bool is_zero_int(const Expr* e) const {
+        if (!e || e->kind != Expr::Kind::int_lit) return false;
+        for (char c : e->text)
+            if (c != '0' && c != '_') return false;
+        return true;
+    }
+
+    bool is_same_map_get_or_zero(const Expr* e, const Expr* map,
+                                 const Expr* key) const {
+        if (!e || e->kind != Expr::Kind::call || e->args.size() != 1 ||
+            !is_zero_int(e->args[0].get()) || !e->callee ||
+            e->callee->kind != Expr::Kind::field || e->callee->name != "or" ||
+            !e->callee->object)
+            return false;
+        const Expr* get = e->callee->object.get();
+        return get->kind == Expr::Kind::call && get->args.size() == 1 &&
+               get->callee && get->callee->kind == Expr::Kind::field &&
+               get->callee->name == "get" && get->callee->object &&
+               same_pure_expr(get->callee->object.get(), map) &&
+               same_pure_expr(get->args[0].get(), key);
+    }
+
+    bool is_pure_map_delta(const Expr* e) const {
+        if (!e) return false;
+        switch (e->kind) {
+            case Expr::Kind::int_lit:
+            case Expr::Kind::float_lit:
+            case Expr::Kind::bool_lit:
+            case Expr::Kind::ident:
+            case Expr::Kind::self_ref:
+                return true;
+            case Expr::Kind::field:
+                return is_pure_map_delta(e->object.get());
+            case Expr::Kind::index:
+                return same_pure_expr(e, e); // only recursively pure index shapes pass
+            case Expr::Kind::unary:
+                return is_pure_map_delta(e->rhs.get());
+            case Expr::Kind::binary:
+                return is_pure_map_delta(e->lhs.get()) &&
+                       is_pure_map_delta(e->rhs.get());
+            case Expr::Kind::cast:
+                return is_pure_map_delta(e->object.get());
+            case Expr::Kind::call: {
+                if (!e->args.empty() || !e->callee ||
+                    e->callee->kind != Expr::Kind::field ||
+                    e->callee->name != "len" || !e->callee->object)
+                    return false;
+                TypeId receiver = cg.checked_type(e->callee->object.get());
+                return receiver && receiver->k == Type::K::string_ &&
+                       is_pure_map_delta(e->callee->object.get());
+            }
+            default:
+                return false;
+        }
+    }
+
+    void collect_map_add_terms(const Expr* e, const Expr* map, const Expr* key,
+                               bool& found, std::vector<const Expr*>& terms) const {
+        if (e && e->kind == Expr::Kind::binary && e->op == TokenKind::plus) {
+            collect_map_add_terms(e->lhs.get(), map, key, found, terms);
+            collect_map_add_terms(e->rhs.get(), map, key, found, terms);
+            return;
+        }
+        if (!found && is_same_map_get_or_zero(e, map, key)) {
+            found = true;
+            return;
+        }
+        terms.push_back(e);
+    }
+
     void exec_index_assign(const Stmt* s) {
         EV obj = eval(s->target->object.get());
         if (obj.second->k == Ty::fixed_array_) {
@@ -3820,8 +4946,17 @@ struct FnEmit {
                  ", ptr " + var_ptr(owner) + ", i64 0, i64 " + index);
             EV value = eval(s->value.get(), elem);
             if (s->op == TokenKind::assign) {
-                line("store " + std::string(ll(elem)) + " " + value.first +
-                     ", ptr " + pointer);
+                if (has_owned_refs(elem)) {
+                    transfer_in(value);
+                    std::string old = reg();
+                    line(old + " = load " + std::string(ll(elem)) + ", ptr " + pointer);
+                    line("store " + std::string(ll(elem)) + " " + value.first +
+                         ", ptr " + pointer);
+                    emit_release_value(old, elem);
+                } else {
+                    line("store " + std::string(ll(elem)) + " " + value.first +
+                         ", ptr " + pointer);
+                }
                 return;
             }
             bool floating = elem->k == Ty::f64_;
@@ -3867,10 +5002,17 @@ struct FnEmit {
             label(okb);
             EV v = eval(s->value.get(), elem);
             transfer_in(v);
-            std::string data = load_at(obj.first, 0, cg.t_str());
-            std::string ep = reg();
-            line(ep + " = getelementptr i64, ptr " + data + ", i64 " + index);
-            if (is_slot_rc(elem)) {
+            std::string ep = list_element_ptr(obj.first, index, elem);
+            if (is_typed_list_element(elem)) {
+                if (has_owned_refs(elem)) {
+                    std::string old = reg();
+                    line(old + " = load " + std::string(ll(elem)) + ", ptr " + ep);
+                    line("store " + std::string(ll(elem)) + " " + v.first + ", ptr " + ep);
+                    emit_release_value(old, elem);
+                } else {
+                    line("store " + std::string(ll(elem)) + " " + v.first + ", ptr " + ep);
+                }
+            } else if (is_slot_rc(elem)) {
                 std::string oldraw = reg(), oldp = reg();
                 line(oldraw + " = load i64, ptr " + ep);
                 line(oldp + " = inttoptr i64 " + oldraw + " to ptr");
@@ -3884,21 +5026,43 @@ struct FnEmit {
         if (obj.second->k == Ty::map_) {
             Ty* K = obj.second->args[0];
             Ty* V = obj.second->args[1];
-            int kind = eq_kind(K);
+            int kind = map_key_kind(K);
             EV k = eval(s->target->index_expr.get(), K);
+            if (s->op == TokenKind::assign && !is_typed_map_key(K) &&
+                V->k == Ty::i64_ && V->bits == 64 && !V->is_unsigned) {
+                bool found = false;
+                std::vector<const Expr*> terms;
+                collect_map_add_terms(s->value.get(), s->target->object.get(),
+                                      s->target->index_expr.get(), found, terms);
+                for (const Expr* term : terms)
+                    if (!is_pure_map_delta(term)) found = false;
+                if (found && !terms.empty()) {
+                    EV delta = eval(terms[0], V);
+                    std::string sum = delta.first;
+                    for (size_t i = 1; i < terms.size(); ++i) {
+                        EV term = eval(terms[i], V);
+                        std::string next = reg();
+                        line(next + " = add i64 " + sum + ", " + term.first);
+                        sum = next;
+                    }
+                    transfer_in(k);
+                    if (kind == 0) {
+                        line("call void @beans_map_add_raw(ptr " + obj.first +
+                             ", i64 " + to_slot(k, true) + ", i64 " + sum + ")");
+                    } else {
+                        line("call void @beans_map_add(ptr " + obj.first + ", i64 " +
+                             to_slot(k, true) + ", i64 " + sum + ", i64 " +
+                             std::to_string(kind) + ", ptr " + eq_thunk(K, kind) +
+                             ", ptr " + hash_thunk(K, kind) + ")");
+                    }
+                    return;
+                }
+            }
             EV v = eval(s->value.get(), V);
             // the map owns both refs — storing borrows here corrupted the heap
             transfer_in(k);
             transfer_in(v);
-            if (kind == 0) {
-                line("call void @beans_map_set_raw(ptr " + obj.first + ", i64 " +
-                     to_slot(k, true) + ", i64 " + to_slot(v, true) + ")");
-            } else {
-                line("call void @beans_map_set(ptr " + obj.first + ", i64 " +
-                     to_slot(k, true) + ", i64 " + to_slot(v, true) + ", i64 " +
-                     std::to_string(kind) + ", ptr " + eq_thunk(K, kind) + ", ptr " +
-                     hash_thunk(K, kind) + ")");
-            }
+            emit_map_set(obj.first, k, v, K, V, kind);
             return;
         }
         cg.err(s->line, s->col, "assigning into this");
@@ -4093,7 +5257,10 @@ struct FnEmit {
 
         long long mask = 0;
         for (const CImpl::FieldInfo& f : im->fields) {
-            if (is_rc(f.ty)) mask |= 1LL << (f.offset / 8);
+            if (has_owned_refs(f.ty) && !pointer_mask_fits(f.ty, f.offset))
+                cg.err(f.decl->line, f.decl->col,
+                       "class ARC layout exceeds runtime metadata capacity");
+            mask |= pointer_mask(f.ty, f.offset);
         }
         std::string o = alloc_bytes(im->size, fixed_meta(mask));
         line("store ptr @td_" + im->mangled + ", ptr " + o);
@@ -4126,29 +5293,16 @@ struct FnEmit {
         if (e->name.empty() && (is_map_hint || has_expr_keys)) {
             Ty* K = is_map_hint ? hint->args[0] : cg.t_str();
             Ty* V = is_map_hint ? hint->args[1] : cg.t_i64();
-            int kind = eq_kind(K);
-            std::string m = reg();
+            int kind = map_key_kind(K);
             bool ordered = is_map_hint && hint->name == "OrderedMap";
-            line(m + " = call ptr @beans_map_new(i64 " +
-                 std::string(is_slot_rc(K) ? "1" : "0") + ", i64 " +
-                 std::string(is_slot_rc(V) ? "1" : "0") + ", i64 " +
-                 (ordered ? "1" : "0") + ")");
+            std::string m = emit_map_new(K, V, ordered);
             for (const InitEntry& en : e->entries) {
                 EV k = en.key ? eval(en.key.get(), K)
                               : EV{cg.intern_string(en.name), cg.t_str()};
                 EV v = eval(en.value.get(), V);
                 transfer_in(k);
                 transfer_in(v);
-                if (kind == 0) {
-                    line("call void @beans_map_set_raw(ptr " + m + ", i64 " +
-                         to_slot(k, true) + ", i64 " + to_slot(v, true) + ")");
-                } else {
-                    line("call void @beans_map_set(ptr " + m + ", i64 " +
-                         to_slot(k, true) + ", i64 " + to_slot(v, true) +
-                         ", i64 " + std::to_string(kind) +
-                         ", ptr " + eq_thunk(K, kind) + ", ptr " +
-                         hash_thunk(K, kind) + ")");
-                }
+                emit_map_set(m, k, v, K, V, kind);
             }
             Ty* map_type = cg.t_map(K, V, ordered);
             own(m, map_type);
@@ -4178,9 +5332,7 @@ struct FnEmit {
             return {"null", cg.t_bad()};
         }
         if (im->decl->is_struct || im->decl->is_union) {
-            Ty* result_ty = cg.t_struct(im->mangled,
-                                        static_cast<uint32_t>(im->size),
-                                        static_cast<uint32_t>(im->align));
+            Ty* result_ty = cg.t_struct(im);
             if (im->decl->is_union) {
                 std::string slot = fresh_slot("unioninit", result_ty);
                 line("store " + std::string(ll(result_ty)) +
@@ -4207,17 +5359,22 @@ struct FnEmit {
                 const Expr* source = given ? given->value.get() : field.decl->def.get();
                 if (!source) continue;
                 EV value = eval(source, field.ty);
+                transfer_in(value);
                 std::string next = reg();
                 line(next + " = insertvalue " + std::string(ll(result_ty)) + " " +
                      aggregate + ", " + ll(field.ty) + " " + value.first + ", " +
                      std::to_string(i));
                 aggregate = next;
             }
+            own(aggregate, result_ty);
             return {aggregate, result_ty};
         }
         long long mask = 0;
         for (const CImpl::FieldInfo& f : im->fields) {
-            if (is_rc(f.ty)) mask |= 1LL << (f.offset / 8);
+            if (has_owned_refs(f.ty) && !pointer_mask_fits(f.ty, f.offset))
+                cg.err(f.decl->line, f.decl->col,
+                       "class ARC layout exceeds runtime metadata capacity");
+            mask |= pointer_mask(f.ty, f.offset);
         }
         std::string o = alloc_bytes(im->size, fixed_meta(mask));
         line("store ptr @td_" + im->mangled + ", ptr " + o);
@@ -4532,16 +5689,24 @@ struct FnEmit {
             if (cg.enum_decls.count(en)) {
                 const EnumVariant* var = cg.variant_decl(en, mname);
                 int tag = cg.variant_tag(en, mname);
+                Ty* enum_type = hint && hint->k == Ty::enum_ && hint->name == en
+                                    ? hint
+                                    : cg.t_enum(en, {});
+                std::map<std::string, Ty*> enum_env;
+                const EnumDecl* declaration = cg.enum_decls[en];
+                for (size_t i = 0;
+                     i < declaration->generics.size() && i < enum_type->args.size(); i++)
+                    enum_env[declaration->generics[i].name] = enum_type->args[i];
                 std::vector<EV> payload;
                 for (size_t i = 0; i < e->args.size(); i++) {
                     Ty* h = var && i < var->payload.size()
-                                ? cg.resolve(var->payload[i].type.get(), CG2::empty_env(),
+                                ? cg.resolve(var->payload[i].type.get(), enum_env,
                                              e->line, e->col)
                                 : nullptr;
                     payload.push_back(eval(e->args[i].get(), h));
                 }
                 std::string b = box_enum(tag, payload);
-                return {b, cg.t_enum(en, {})};
+                return {b, enum_type};
             }
             // user class static
             auto cit = cg.class_decls.find(obj->resolved.empty() ? cg.qual(n)
@@ -4564,9 +5729,17 @@ struct FnEmit {
                 Ty* ret = clo.second->k == Ty::fn_ && clo.second->fn_ret()
                               ? clo.second->fn_ret()
                               : cg.t_unit();
-                // per-site thunk: (ptr env) -> i64, so the C runtime can call it
+                bool typed_result = is_typed_list_element(ret);
                 std::string thunk = "@spawn_thunk" + std::to_string(cg.next_clo++);
                 std::string t;
+                if (typed_result) {
+                    t += "define void " + thunk + "(ptr %env, ptr %out) {\n";
+                    t += "  %f = load ptr, ptr %env\n";
+                    t += "  %r = call " + std::string(ll(ret)) + " %f(ptr %env)\n";
+                    t += "  store " + std::string(ll(ret)) + " %r, ptr %out\n";
+                    t += "  ret void\n}\n\n";
+                } else {
+                // The narrow thunk widens scalars and pointers to one runtime slot.
                 t += "define i64 " + thunk + "(ptr %env) {\n";
                 t += "  %f = load ptr, ptr %env\n";
                 if (ret->k == Ty::unit_) {
@@ -4598,11 +5771,23 @@ struct FnEmit {
                     t += "  %r = call ptr %f(ptr %env)\n";
                     t += "  %z = ptrtoint ptr %r to i64\n  ret i64 %z\n}\n\n";
                 }
+                }
                 cg.lifted += t;
                 transfer_in(clo);
                 std::string r = reg();
-                line(r + " = call ptr @beans_thread_spawn(ptr " + thunk + ", ptr " +
-                     clo.first + ")");
+                if (typed_result) {
+                    if (has_owned_refs(ret) && !pointer_mask_fits(ret))
+                        cg.err(e->line, e->col,
+                               "thread result ARC layout exceeds runtime metadata capacity");
+                    line(r + " = call ptr @beans_thread_spawn_typed(ptr " + thunk +
+                         ", ptr " + clo.first + ", i64 " +
+                         std::to_string(CG2::value_size(ret)) + ", i64 " +
+                         std::to_string(pointer_mask(ret)) + ")");
+                } else {
+                    line(r + " = call ptr @beans_thread_spawn(ptr " + thunk + ", ptr " +
+                         clo.first + ", i64 " +
+                         std::string(is_slot_rc(ret) ? "1" : "0") + ")");
+                }
                 own(r, cg.t_kind1(Ty::thread_, ret));
                 return {r, cg.t_kind1(Ty::thread_, ret)};
             }
@@ -4711,9 +5896,22 @@ struct FnEmit {
                 EV cap = eval(e->args[0].get(), cg.t_i64());
                 Ty* inner = hint && hint->k == Ty::arena_ ? hint->args[0] : cg.t_i64();
                 std::string r = reg();
-                line(r + " = call ptr @beans_arena_new(i64 " + cap.first + ", i64 " +
-                     std::string(is_slot_rc(inner) ? "1" : "0") + ", i64 " +
-                     std::to_string(e->line) + ", i64 " + std::to_string(e->col) + ")");
+                if (uses_typed_owned_storage(inner)) {
+                    if (has_owned_refs(inner) && !pointer_mask_fits(inner))
+                        cg.err(e->line, e->col,
+                               "arena element ARC layout exceeds runtime metadata capacity");
+                    line(r + " = call ptr @beans_arena_new_typed(i64 " + cap.first +
+                         ", i64 " + std::to_string(CG2::value_size(inner)) +
+                         ", i64 " + std::to_string(pointer_mask(inner)) +
+                         ", i64 " + std::to_string(cycle_pointer_mask(inner)) +
+                         ", i64 " + std::to_string(e->line) + ", i64 " +
+                         std::to_string(e->col) + ")");
+                } else {
+                    line(r + " = call ptr @beans_arena_new(i64 " + cap.first +
+                         ", i64 " + std::string(is_slot_rc(inner) ? "1" : "0") +
+                         ", i64 " + std::to_string(e->line) + ", i64 " +
+                         std::to_string(e->col) + ")");
+                }
                 Ty* result = cg.t_arena(inner);
                 own(r, result);
                 return {r, result};
@@ -4723,10 +5921,23 @@ struct FnEmit {
                 EV v = eval(e->args[0].get(), inner);
                 transfer_in(v);
                 std::string r = reg();
-                line(r + " = call ptr @beans_box_new(i64 " + to_slot(v, true) +
-                     ", i64 " + std::string(is_slot_rc(v.second) ? "1" : "0") +
-                     ")");
-                Ty* result = cg.t_box(inner ? inner : v.second);
+                Ty* value_type = inner ? inner : v.second;
+                if (uses_typed_owned_storage(value_type)) {
+                    if (has_owned_refs(value_type) && !pointer_mask_fits(value_type))
+                        cg.err(e->line, e->col,
+                               "box value ARC layout exceeds runtime metadata capacity");
+                    std::string slot = spill_list_element(v, "box.new");
+                    line(r + " = call ptr @beans_box_new_typed(ptr " + slot +
+                         ", i64 " + std::to_string(CG2::value_size(value_type)) +
+                         ", i64 " + std::to_string(pointer_mask(value_type)) +
+                         ", i64 " + std::to_string(cycle_pointer_mask(value_type)) +
+                         ")");
+                } else {
+                    line(r + " = call ptr @beans_box_new(i64 " + to_slot(v, true) +
+                         ", i64 " + std::string(is_slot_rc(v.second) ? "1" : "0") +
+                         ")");
+                }
+                Ty* result = cg.t_box(value_type);
                 own(r, result);
                 return {r, result};
             }
@@ -4735,10 +5946,21 @@ struct FnEmit {
                 EV v = eval(e->args[0].get(), inner);
                 transfer_in(v);
                 std::string r = reg();
-                line(r + " = call ptr @beans_shared_new(i64 " + to_slot(v, true) +
-                     ", i64 " + std::string(is_slot_rc(v.second) ? "1" : "0") +
-                     ")");
-                Ty* result = cg.t_shared(inner ? inner : v.second);
+                Ty* value_type = inner ? inner : v.second;
+                if (is_typed_list_element(value_type)) {
+                    if (has_owned_refs(value_type) && !pointer_mask_fits(value_type))
+                        cg.err(e->line, e->col,
+                               "shared value ARC layout exceeds runtime metadata capacity");
+                    std::string slot = spill_list_element(v, "shared.new");
+                    line(r + " = call ptr @beans_shared_new_typed(ptr " + slot +
+                         ", i64 " + std::to_string(CG2::value_size(value_type)) +
+                         ", i64 " + std::to_string(pointer_mask(value_type)) + ")");
+                } else {
+                    line(r + " = call ptr @beans_shared_new(i64 " + to_slot(v, true) +
+                         ", i64 " + std::string(is_slot_rc(v.second) ? "1" : "0") +
+                         ")");
+                }
+                Ty* result = cg.t_shared(value_type);
                 own(r, result);
                 return {r, result};
             }
@@ -4747,18 +5969,38 @@ struct FnEmit {
                 EV v = eval(e->args[0].get(), inner);
                 transfer_in(v);
                 std::string r = reg();
-                line(r + " = call ptr @beans_mutex_new(i64 " + to_slot(v, true) +
-                     ", i64 " + std::string(is_slot_rc(v.second) ? "1" : "0") +
-                     ")");
+                Ty* value_type = inner ? inner : v.second;
+                if (is_typed_list_element(value_type)) {
+                    if (has_owned_refs(value_type) && !pointer_mask_fits(value_type))
+                        cg.err(e->line, e->col,
+                               "mutex value ARC layout exceeds runtime metadata capacity");
+                    std::string slot = spill_list_element(v, "mutex.new");
+                    line(r + " = call ptr @beans_mutex_new_typed(ptr " + slot +
+                         ", i64 " + std::to_string(CG2::value_size(value_type)) +
+                         ", i64 " + std::to_string(pointer_mask(value_type)) + ")");
+                } else {
+                    line(r + " = call ptr @beans_mutex_new(i64 " + to_slot(v, true) +
+                         ", i64 " + std::string(is_slot_rc(v.second) ? "1" : "0") +
+                         ")");
+                }
                 own(r, cg.t_kind1(Ty::mutex_, v.second));
-                return {r, cg.t_kind1(Ty::mutex_, inner ? inner : v.second)};
+                return {r, cg.t_kind1(Ty::mutex_, value_type)};
             }
             if (n == "Channel" && mname == "new") {
                 EV cap = eval(e->args[0].get());
                 Ty* elem = hint && hint->k == Ty::chan_ ? hint->args[0] : cg.t_i64();
                 std::string r = reg();
-                line(r + " = call ptr @beans_chan_new(i64 " + cap.first + ", i64 " +
-                     std::string(is_slot_rc(elem) ? "1" : "0") + ")");
+                if (is_typed_list_element(elem)) {
+                    if (has_owned_refs(elem) && !pointer_mask_fits(elem))
+                        cg.err(e->line, e->col,
+                               "channel element ARC layout exceeds runtime metadata capacity");
+                    line(r + " = call ptr @beans_chan_new_typed(i64 " + cap.first +
+                         ", i64 " + std::to_string(CG2::value_size(elem)) +
+                         ", i64 " + std::to_string(pointer_mask(elem)) + ")");
+                } else {
+                    line(r + " = call ptr @beans_chan_new(i64 " + cap.first + ", i64 " +
+                         std::string(is_slot_rc(elem) ? "1" : "0") + ")");
+                }
                 own(r, cg.t_kind1(Ty::chan_, elem));
                 return {r, cg.t_kind1(Ty::chan_, elem)};
             }
@@ -4796,16 +6038,24 @@ struct FnEmit {
             if (cg.enum_decls.count(tn)) {
                 const EnumVariant* var = cg.variant_decl(tn, mname);
                 int tag = cg.variant_tag(tn, mname);
+                Ty* enum_type = hint && hint->k == Ty::enum_ && hint->name == tn
+                                    ? hint
+                                    : cg.t_enum(tn, {});
+                std::map<std::string, Ty*> enum_env;
+                const EnumDecl* declaration = cg.enum_decls[tn];
+                for (size_t i = 0;
+                     i < declaration->generics.size() && i < enum_type->args.size(); i++)
+                    enum_env[declaration->generics[i].name] = enum_type->args[i];
                 std::vector<EV> payload;
                 for (size_t i = 0; i < e->args.size(); i++) {
                     Ty* h = var && i < var->payload.size()
-                                ? cg.resolve(var->payload[i].type.get(), CG2::empty_env(),
+                                ? cg.resolve(var->payload[i].type.get(), enum_env,
                                              e->line, e->col)
                                 : nullptr;
                     payload.push_back(eval(e->args[i].get(), h));
                 }
                 std::string b = box_enum(tag, payload);
-                return {b, cg.t_enum(tn, {})};
+                return {b, enum_type};
             }
             auto cit = cg.class_decls.find(tn);
             if (cit != cg.class_decls.end() && !cit->second->is_interface) {
@@ -4821,11 +6071,108 @@ struct FnEmit {
             }
         }
 
-        // Scalarize the very common `list.pop().or(default)` chain. A scalar
-        // Option is still boxed at ABI/storage boundaries, but this temporary
-        // never escapes: keep its has-bit in control flow and move the popped
-        // slot straight to the result. Besides avoiding allocation, this keeps
-        // source order: pop happens before the eagerly evaluated default.
+        // `channel.recv().or(default)` is the hot bounded-queue shape. The
+        // Option does not escape, so keep the runtime's value/found pair in
+        // SSA and avoid one enum allocation per message.
+        if (mname == "or" && e->args.size() == 1 && obj->kind == Expr::Kind::call &&
+            obj->args.empty() && obj->callee &&
+            obj->callee->kind == Expr::Kind::field && obj->callee->name == "recv" &&
+            obj->callee->object) {
+            const Expr* channel_expr = obj->callee->object.get();
+            TypeId checked = cg.checked_type(channel_expr);
+            bool checked_channel = checked && checked->k == Type::K::class_ &&
+                                   checked->name == "Channel" &&
+                                   checked->args.size() == 1;
+            bool checked_scalar = checked_channel &&
+                                  (checked->args[0]->is_int() ||
+                                   checked->args[0]->is_float() ||
+                                   checked->args[0]->k == Type::K::bool_);
+            if (checked_scalar) {
+                EV channel = eval(channel_expr);
+                pin_borrow(channel_expr, channel);
+                if (channel.second->k == Ty::chan_) {
+                    Ty* value_type = channel.second->args[0];
+                    std::string ok_slot = fresh_slot("channel.or.ok", cg.t_i64());
+                    std::string raw = reg(), found = reg(), has = reg();
+                    line(raw + " = call i64 @beans_chan_recv(ptr " + channel.first +
+                         ", ptr " + ok_slot + ")");
+                    line(found + " = load i64, ptr " + ok_slot);
+                    line(has + " = icmp ne i64 " + found + ", 0");
+                    EV fallback = eval(e->args[0].get(), value_type);
+                    std::string received = from_slot(raw, value_type);
+                    std::string result = reg();
+                    line(result + " = select i1 " + has + ", " +
+                         std::string(ll(value_type)) + " " + received + ", " +
+                         std::string(ll(value_type)) + " " + fallback.first);
+                    return {result, value_type};
+                }
+            }
+        }
+
+        // Scalarize the very common `map.get(key).or(default)` chain. The
+        // Option never escapes, so keep the runtime's (value, found) pair in
+        // SSA instead of allocating a box for every lookup. The default stays
+        // eagerly evaluated after the lookup, matching Option.or semantics.
+        if (mname == "or" && e->args.size() == 1 && obj->kind == Expr::Kind::call &&
+            obj->args.size() == 1 && obj->callee &&
+            obj->callee->kind == Expr::Kind::field && obj->callee->name == "get" &&
+            obj->callee->object) {
+            const Expr* map_expr = obj->callee->object.get();
+            TypeId checked = cg.checked_type(map_expr);
+            bool checked_map = checked && checked->k == Type::K::class_ &&
+                               (checked->name == "Map" ||
+                                checked->name == "OrderedMap");
+            bool checked_scalar = checked_map && checked->args.size() == 2 &&
+                                  (checked->args[1]->is_int() ||
+                                   checked->args[1]->is_float() ||
+                                   checked->args[1]->k == Type::K::bool_);
+            if (checked_scalar) {
+                EV map = eval(map_expr);
+                pin_borrow(map_expr, map);
+                if (map.second->k == Ty::map_) {
+                    Ty* key_type = map.second->args[0];
+                    Ty* value_type = map.second->args[1];
+                    if (value_type->k == Ty::i64_ || value_type->k == Ty::i1_ ||
+                        value_type->k == Ty::f64_) {
+                        EV key = eval(obj->args[0].get(), key_type);
+                        const int kind = map_key_kind(key_type);
+                        std::string key_argument =
+                            emit_map_key_argument(key, key_type, false);
+                        std::string raw = reg(), found = reg();
+                        if (kind == 0) {
+                            std::string pair = reg();
+                            line(pair + " = call {i64, i64} @beans_map_get_raw(ptr " +
+                                 map.first + ", i64 " + key_argument + ")");
+                            line(raw + " = extractvalue {i64, i64} " + pair + ", 0");
+                            line(found + " = extractvalue {i64, i64} " + pair + ", 1");
+                        } else {
+                            std::string found_slot =
+                                fresh_slot("map.or.found", cg.t_i64());
+                            line(raw + " = call i64 @beans_map_get(ptr " + map.first +
+                                 ", i64 " + key_argument + ", i64 " +
+                                 std::to_string(kind) + ", ptr " + found_slot +
+                                 ", ptr " + eq_thunk(key_type, kind) + ", ptr " +
+                                 hash_thunk(key_type, kind) + ")");
+                            line(found + " = load i64, ptr " + found_slot);
+                        }
+                        std::string has = reg();
+                        line(has + " = icmp ne i64 " + found + ", 0");
+                        EV dflt = eval(e->args[0].get(), value_type);
+                        std::string value = from_slot(raw, value_type);
+                        std::string result = reg();
+                        line(result + " = select i1 " + has + ", " + ll(value_type) +
+                             " " + value + ", " + ll(value_type) + " " + dflt.first);
+                        return {result, value_type};
+                    }
+                }
+                err(obj, "Map.get.or");
+                return {"0", cg.t_i64()};
+            }
+        }
+
+        // `list.pop().or(default)` needs control flow because a popped
+        // reference transfers ownership. Keep the payload unboxed and move it
+        // straight to the result while preserving eager default evaluation.
         if (mname == "or" && e->args.size() == 1 && obj->kind == Expr::Kind::call &&
             obj->args.empty() && obj->callee &&
             obj->callee->kind == Expr::Kind::field && obj->callee->name == "pop") {
@@ -4843,12 +6190,8 @@ struct FnEmit {
                 std::string n1 = reg();
                 line(n1 + " = sub i64 " + len + ", 1");
                 store_at(list.first, 8, n1, cg.t_i64());
-                std::string data = load_at(list.first, 0, cg.t_str());
-                std::string ep = reg(), raw = reg();
-                line(ep + " = getelementptr i64, ptr " + data + ", i64 " + n1);
-                line(raw + " = load i64, ptr " + ep);
-                std::string popped = from_slot(raw, elem, true);
-                line("store " + std::string(ll(elem)) + " " + popped + ", ptr " +
+                EV popped = load_list_element(list.first, n1, elem, true);
+                line("store " + std::string(ll(elem)) + " " + popped.first + ", ptr " +
                      popped_slot);
                 line("br label %" + popped_end);
                 label(noneb);
@@ -4856,7 +6199,7 @@ struct FnEmit {
                 label(popped_end);
 
                 EV dflt = eval(e->args[0].get(), elem);
-                if (is_rc(elem)) transfer_in(dflt);
+                if (has_owned_refs(elem)) transfer_in(dflt);
                 std::string use_popped = bb(), use_default = bb(), end = bb();
                 std::string out = fresh_slot("popor", elem);
                 line("br i1 " + has + ", label %" + use_popped + ", label %" +
@@ -4865,7 +6208,7 @@ struct FnEmit {
                 std::string value = reg();
                 line(value + " = load " + std::string(ll(elem)) + ", ptr " +
                      popped_slot);
-                if (is_rc(elem)) emit_release(dflt.first);
+                if (has_owned_refs(elem)) emit_release_value(dflt.first, elem);
                 line("store " + std::string(ll(elem)) + " " + value + ", ptr " + out);
                 line("br label %" + end);
                 label(use_default);
@@ -5522,79 +6865,83 @@ struct FnEmit {
                 if (mname == "push") {
                     EV v = eval(e->args[0].get(), elem);
                     transfer_in(v);
-                    line("call void @beans_list_push(ptr " + recv.first + ", i64 " +
-                         to_slot(v, true) + ")");
+                    emit_list_push(recv.first, v);
                     return {"", cg.t_unit()};
                 }
                 if (mname == "len") {
                     return {load_at(recv.first, 8, cg.t_i64()), cg.t_i64()};
                 }
                 if (mname == "pop") {
+                    Ty* option = cg.t_option(elem);
                     std::string len = load_at(recv.first, 8, cg.t_i64());
                     std::string c = reg();
                     line(c + " = icmp sgt i64 " + len + ", 0");
                     std::string someb = bb(), noneb = bb(), endb = bb();
-                    std::string slot = fresh_slot("pop", cg.t_str());
+                    std::string slot = fresh_slot("pop", option);
                     line("br i1 " + c + ", label %" + someb + ", label %" + noneb);
                     label(someb);
                     std::string n1 = reg();
                     line(n1 + " = sub i64 " + len + ", 1");
                     store_at(recv.first, 8, n1, cg.t_i64());
-                    std::string data = load_at(recv.first, 0, cg.t_str());
-                    std::string ep = reg(), raw = reg();
-                    line(ep + " = getelementptr i64, ptr " + data + ", i64 " + n1);
-                    line(raw + " = load i64, ptr " + ep);
-                    std::string popped = from_slot(raw, elem, true);
-                    own(popped, elem); // moved out of the list
-                    std::string sb = make_option_some({popped, elem}, elem);
+                    EV popped = load_list_element(recv.first, n1, elem, true);
+                    own(popped.first, elem); // moved out of the list
+                    std::string sb = make_option_some(popped, elem);
                     consume(sb);
-                    line("store ptr " + sb + ", ptr " + slot);
+                    line("store " + std::string(ll(option)) + " " + sb + ", ptr " + slot);
                     line("br label %" + endb);
                     label(noneb);
                     std::string nb = make_option_none(elem);
                     consume(nb);
-                    line("store ptr " + nb + ", ptr " + slot);
+                    line("store " + std::string(ll(option)) + " " + nb + ", ptr " + slot);
                     line("br label %" + endb);
                     label(endb);
                     std::string r = reg();
-                    line(r + " = load ptr, ptr " + slot);
-                    own(r, cg.t_option(elem));
-                    return {r, cg.t_option(elem)};
+                    line(r + " = load " + std::string(ll(option)) + ", ptr " + slot);
+                    own(r, option);
+                    return {r, option};
                 }
                 if (mname == "get") {
+                    Ty* option = cg.t_option(elem);
                     EV idx = eval(e->args[0].get());
                     std::string len = load_at(recv.first, 8, cg.t_i64());
                     std::string c = reg();
                     line(c + " = icmp ult i64 " + idx.first + ", " + len);
                     std::string someb = bb(), noneb = bb(), endb = bb();
-                    std::string slot = fresh_slot("get", cg.t_str());
+                    std::string slot = fresh_slot("get", option);
                     line("br i1 " + c + ", label %" + someb + ", label %" + noneb);
                     label(someb);
-                    std::string data = load_at(recv.first, 0, cg.t_str());
-                    std::string ep = reg(), raw = reg();
-                    line(ep + " = getelementptr i64, ptr " + data + ", i64 " + idx.first);
-                    line(raw + " = load i64, ptr " + ep);
-                    std::string sb = make_option_some({from_slot(raw, elem), elem}, elem);
+                    EV value = load_list_element(recv.first, idx.first, elem);
+                    std::string sb = make_option_some(value, elem);
                     consume(sb);
-                    line("store ptr " + sb + ", ptr " + slot);
+                    line("store " + std::string(ll(option)) + " " + sb + ", ptr " + slot);
                     line("br label %" + endb);
                     label(noneb);
                     std::string nb = make_option_none(elem);
                     consume(nb);
-                    line("store ptr " + nb + ", ptr " + slot);
+                    line("store " + std::string(ll(option)) + " " + nb + ", ptr " + slot);
                     line("br label %" + endb);
                     label(endb);
                     std::string r = reg();
-                    line(r + " = load ptr, ptr " + slot);
-                    own(r, cg.t_option(elem));
-                    return {r, cg.t_option(elem)};
+                    line(r + " = load " + std::string(ll(option)) + ", ptr " + slot);
+                    own(r, option);
+                    return {r, option};
                 }
                 if (mname == "max") {
-                    int kind = order_kind(elem);
                     std::string okf = fresh_slot("mokf", cg.t_i64());
-                    std::string raw = reg();
-                    line(raw + " = call i64 @beans_list_max(ptr " + recv.first +
-                         ", i64 " + std::to_string(kind) + ", ptr " + okf + ")");
+                    std::string value;
+                    if (elem->k == Ty::dec_) {
+                        std::string out = fresh_slot("mout", elem);
+                        line("call void @beans_list_decv_max(ptr " + recv.first +
+                             ", ptr " + out + ", ptr " + okf + ")");
+                        value = reg();
+                        line(value + " = load i128, ptr " + out);
+                    } else {
+                        int kind = order_kind(elem);
+                        std::string raw = reg();
+                        line(raw + " = call i64 @beans_list_max(ptr " + recv.first +
+                             ", i64 " + std::to_string(kind) + ", ptr " + okf + ")");
+                        value = from_slot(raw, elem);
+                    }
                     std::string okv = reg(), c = reg();
                     line(okv + " = load i64, ptr " + okf);
                     line(c + " = icmp ne i64 " + okv + ", 0");
@@ -5602,7 +6949,7 @@ struct FnEmit {
                     std::string slot = fresh_slot("max", cg.t_str());
                     line("br i1 " + c + ", label %" + someb + ", label %" + noneb);
                     label(someb);
-                    std::string sb = make_option_some({from_slot(raw, elem), elem}, elem);
+                    std::string sb = make_option_some({value, elem}, elem);
                     consume(sb);
                     line("store ptr " + sb + ", ptr " + slot);
                     line("br label %" + endb);
@@ -5619,11 +6966,17 @@ struct FnEmit {
                 }
                 if (mname == "contains") {
                     EV v = eval(e->args[0].get(), elem);
-                    int kind = eq_kind(elem);
                     std::string c = reg(), r = reg();
-                    line(c + " = call i64 @beans_list_contains(ptr " + recv.first +
-                         ", i64 " + to_slot(v) + ", i64 " + std::to_string(kind) +
-                         ", ptr " + eq_thunk(elem, kind) + ")");
+                    if (elem->k == Ty::dec_) {
+                        line(c + " = call i64 @beans_list_decv_contains(ptr " + recv.first +
+                             ", i128 " + v.first + ")");
+                    } else {
+                        int kind = eq_kind(elem);
+                        line(c + " = call i64 @beans_list_contains(ptr " + recv.first +
+                             ", i64 " + to_slot(v) + ", i64 " +
+                             std::to_string(kind) + ", ptr " + eq_thunk(elem, kind) +
+                             ")");
+                    }
                     line(r + " = icmp ne i64 " + c + ", 0");
                     return {r, cg.t_bool()};
                 }
@@ -5639,7 +6992,10 @@ struct FnEmit {
                                : elem->k == Ty::i64_ ? 0
                                                      : -1;
                     std::string r = reg();
-                    if (kind < 0) {
+                    if (elem->k == Ty::dec_) {
+                        line(r + " = call ptr @beans_list_decv_join(ptr " + recv.first +
+                             ", ptr " + sep.first + ")");
+                    } else if (kind < 0) {
                         std::string es = cg.request_show(elem);
                         line(r + " = call ptr @beans_list_join_show(ptr " +
                              recv.first + ", ptr " + sep.first + ", ptr " + es + ")");
@@ -5652,11 +7008,12 @@ struct FnEmit {
                     return {r, cg.t_str()};
                 }
                 if (mname == "first" || mname == "last") {
+                    Ty* option = cg.t_option(elem);
                     std::string len = load_at(recv.first, 8, cg.t_i64());
                     std::string c = reg();
                     line(c + " = icmp sgt i64 " + len + ", 0");
                     std::string someb = bb(), noneb = bb(), endb = bb();
-                    std::string slot = fresh_slot("fl", cg.t_str());
+                    std::string slot = fresh_slot("fl", option);
                     line("br i1 " + c + ", label %" + someb + ", label %" + noneb);
                     label(someb);
                     std::string at = "0";
@@ -5664,31 +7021,38 @@ struct FnEmit {
                         at = reg();
                         line(at + " = sub i64 " + len + ", 1");
                     }
-                    std::string data = load_at(recv.first, 0, cg.t_str());
-                    std::string ep = reg(), raw = reg();
-                    line(ep + " = getelementptr i64, ptr " + data + ", i64 " + at);
-                    line(raw + " = load i64, ptr " + ep);
-                    std::string sb = make_option_some({from_slot(raw, elem), elem}, elem);
+                    EV value = load_list_element(recv.first, at, elem);
+                    std::string sb = make_option_some(value, elem);
                     consume(sb);
-                    line("store ptr " + sb + ", ptr " + slot);
+                    line("store " + std::string(ll(option)) + " " + sb + ", ptr " + slot);
                     line("br label %" + endb);
                     label(noneb);
                     std::string nb = make_option_none(elem);
                     consume(nb);
-                    line("store ptr " + nb + ", ptr " + slot);
+                    line("store " + std::string(ll(option)) + " " + nb + ", ptr " + slot);
                     line("br label %" + endb);
                     label(endb);
                     std::string r = reg();
-                    line(r + " = load ptr, ptr " + slot);
-                    own(r, cg.t_option(elem));
-                    return {r, cg.t_option(elem)};
+                    line(r + " = load " + std::string(ll(option)) + ", ptr " + slot);
+                    own(r, option);
+                    return {r, option};
                 }
                 if (mname == "min") {
-                    int kind = order_kind(elem);
                     std::string okf = fresh_slot("mnok", cg.t_i64());
-                    std::string raw = reg();
-                    line(raw + " = call i64 @beans_list_min(ptr " + recv.first +
-                         ", i64 " + std::to_string(kind) + ", ptr " + okf + ")");
+                    std::string value;
+                    if (elem->k == Ty::dec_) {
+                        std::string out = fresh_slot("mnout", elem);
+                        line("call void @beans_list_decv_min(ptr " + recv.first +
+                             ", ptr " + out + ", ptr " + okf + ")");
+                        value = reg();
+                        line(value + " = load i128, ptr " + out);
+                    } else {
+                        int kind = order_kind(elem);
+                        std::string raw = reg();
+                        line(raw + " = call i64 @beans_list_min(ptr " + recv.first +
+                             ", i64 " + std::to_string(kind) + ", ptr " + okf + ")");
+                        value = from_slot(raw, elem);
+                    }
                     std::string okv = reg(), c = reg();
                     line(okv + " = load i64, ptr " + okf);
                     line(c + " = icmp ne i64 " + okv + ", 0");
@@ -5696,7 +7060,7 @@ struct FnEmit {
                     std::string slot = fresh_slot("min", cg.t_str());
                     line("br i1 " + c + ", label %" + someb + ", label %" + noneb);
                     label(someb);
-                    std::string sb = make_option_some({from_slot(raw, elem), elem}, elem);
+                    std::string sb = make_option_some({value, elem}, elem);
                     consume(sb);
                     line("store ptr " + sb + ", ptr " + slot);
                     line("br label %" + endb);
@@ -5713,12 +7077,18 @@ struct FnEmit {
                 }
                 if (mname == "index_of") {
                     EV v = eval(e->args[0].get(), elem);
-                    int kind = eq_kind(elem);
                     std::string okf = fresh_slot("ixok", cg.t_i64());
                     std::string raw = reg();
-                    line(raw + " = call i64 @beans_list_index(ptr " + recv.first +
-                         ", i64 " + to_slot(v) + ", i64 " + std::to_string(kind) +
-                         ", ptr " + okf + ", ptr " + eq_thunk(elem, kind) + ")");
+                    if (elem->k == Ty::dec_) {
+                        line(raw + " = call i64 @beans_list_decv_index(ptr " + recv.first +
+                             ", i128 " + v.first + ", ptr " + okf + ")");
+                    } else {
+                        int kind = eq_kind(elem);
+                        line(raw + " = call i64 @beans_list_index(ptr " + recv.first +
+                             ", i64 " + to_slot(v) + ", i64 " +
+                             std::to_string(kind) + ", ptr " + okf + ", ptr " +
+                             eq_thunk(elem, kind) + ")");
+                    }
                     std::string okv = reg(), c = reg();
                     line(okv + " = load i64, ptr " + okf);
                     line(c + " = icmp ne i64 " + okv + ", 0");
@@ -5745,14 +7115,33 @@ struct FnEmit {
                     EV idx = eval(e->args[0].get());
                     EV v = eval(e->args[1].get(), elem);
                     transfer_in(v);
-                    line("call void @beans_list_insert(ptr " + recv.first + ", i64 " +
-                         idx.first + ", i64 " + to_slot(v, true) + ", i64 " +
-                         std::to_string(e->line) + ", i64 " + std::to_string(e->col) +
-                         ")");
+                    if (is_typed_list_element(elem)) {
+                        std::string slot = spill_list_element(v, "list.insert");
+                        line("call void @beans_list_insert_typed(ptr " + recv.first +
+                             ", i64 " + idx.first + ", ptr " + slot + ", i64 " +
+                             std::to_string(e->line) + ", i64 " +
+                             std::to_string(e->col) + ")");
+                    } else {
+                        line("call void @beans_list_insert(ptr " + recv.first + ", i64 " +
+                             idx.first + ", i64 " + to_slot(v, true) + ", i64 " +
+                             std::to_string(e->line) + ", i64 " +
+                             std::to_string(e->col) + ")");
+                    }
                     return {"", cg.t_unit()};
                 }
                 if (mname == "remove") {
                     EV idx = eval(e->args[0].get());
+                    if (is_typed_list_element(elem)) {
+                        std::string slot = fresh_slot("list.remove", elem);
+                        line("call void @beans_list_remove_typed(ptr " + recv.first +
+                             ", i64 " + idx.first + ", ptr " + slot + ", i64 " +
+                             std::to_string(e->line) + ", i64 " +
+                             std::to_string(e->col) + ")");
+                        std::string value = reg();
+                        line(value + " = load " + std::string(ll(elem)) + ", ptr " + slot);
+                        own(value, elem);
+                        return {value, elem};
+                    }
                     std::string raw = reg();
                     line(raw + " = call i64 @beans_list_remove(ptr " + recv.first +
                          ", i64 " + idx.first + ", i64 " + std::to_string(e->line) +
@@ -5781,23 +7170,32 @@ struct FnEmit {
                     return {r, rt_};
                 }
                 if (mname == "sort") {
-                    int kind = order_kind(elem);
-                    line("call void @beans_list_sort(ptr " + recv.first + ", i64 " +
-                         std::to_string(kind) + ")");
+                    if (elem->k == Ty::dec_) {
+                        line("call void @beans_list_decv_sort(ptr " + recv.first + ")");
+                    } else {
+                        int kind = order_kind(elem);
+                        line("call void @beans_list_sort(ptr " + recv.first + ", i64 " +
+                             std::to_string(kind) + ")");
+                    }
                     return {"", cg.t_unit()};
                 }
                 if (mname == "sort_by") {
                     EV clo = eval(e->args[0].get());
                     std::string thunk = cg.request_sort_thunk(elem);
-                    line("call void @beans_list_sort_by(ptr " + recv.first + ", ptr " +
-                         thunk + ", ptr " + clo.first + ")");
+                    line("call void @beans_list_" +
+                         std::string(elem->k == Ty::dec_ ? "decv_sort_by" : "sort_by") +
+                         "(ptr " + recv.first + ", ptr " + thunk + ", ptr " + clo.first +
+                         ")");
                     return {"", cg.t_unit()};
                 }
                 if (mname == "sort_by_key") {
                     EV clo = eval(e->args[0].get());
                     std::string thunk = cg.request_sort_key_thunk(elem);
-                    line("call void @beans_list_sort_by_key(ptr " + recv.first +
-                         ", ptr " + thunk + ", ptr " + clo.first + ")");
+                    line("call void @beans_list_" +
+                         std::string(elem->k == Ty::dec_ ? "decv_sort_by_key"
+                                                        : "sort_by_key") +
+                         "(ptr " + recv.first + ", ptr " + thunk + ", ptr " + clo.first +
+                         ")");
                     return {"", cg.t_unit()};
                 }
                 break;
@@ -5805,7 +7203,7 @@ struct FnEmit {
             case Ty::map_: {
                 Ty* K = rt_->args[0];
                 Ty* V = rt_->args[1];
-                int kind = eq_kind(K);
+                int kind = map_key_kind(K);
                 std::string keq = eq_thunk(K, kind);
                 std::string khash = hash_thunk(K, kind);
                 if (mname == "clone") {
@@ -5829,17 +7227,7 @@ struct FnEmit {
                     EV v = eval(e->args[1].get(), V);
                     transfer_in(k);
                     transfer_in(v);
-                    if (kind == 0) {
-                        line("call void @beans_map_set_raw(ptr " + recv.first +
-                             ", i64 " + to_slot(k, true) + ", i64 " +
-                             to_slot(v, true) + ")");
-                    } else {
-                        line("call void @beans_map_set(ptr " + recv.first + ", i64 " +
-                             to_slot(k, true) + ", i64 " + to_slot(v, true) +
-                             ", i64 " +
-                             std::to_string(kind) + ", ptr " + keq + ", ptr " +
-                             khash + ")");
-                    }
+                    emit_map_set(recv.first, k, v, K, V, kind);
                     return {"", cg.t_unit()};
                 }
                 if (mname == "insert") {
@@ -5847,67 +7235,90 @@ struct FnEmit {
                     EV v = eval(e->args[1].get(), V);
                     transfer_in(k);
                     transfer_in(v);
-                    std::string raw = reg(), result = reg();
-                    if (kind == 0) {
-                        line(raw + " = call i64 @beans_map_insert_raw(ptr " +
-                             recv.first + ", i64 " + to_slot(k, true) + ", i64 " +
-                             to_slot(v, true) + ")");
-                    } else {
-                        line(raw + " = call i64 @beans_map_insert(ptr " + recv.first +
-                             ", i64 " + to_slot(k, true) + ", i64 " +
-                             to_slot(v, true) + ", i64 " + std::to_string(kind) +
-                             ", ptr " + keq + ", ptr " + khash + ")");
-                    }
+                    std::string raw = emit_map_insert(recv.first, k, v, K, V, kind);
+                    std::string result = reg();
                     line(result + " = icmp ne i64 " + raw + ", 0");
                     return {result, cg.t_bool()};
                 }
                 if (mname == "get") {
                     EV k = eval(e->args[0].get(), K);
-                    std::string raw = reg();
+                    std::string key_argument =
+                        emit_map_key_argument(k, K, false);
+                    bool typed_value = is_typed_map_value(V);
+                    std::string raw;
+                    std::string value_slot;
                     std::string okv = reg(), c = reg();
-                    if (kind == 0) {
+                    if (typed_value) {
+                        value_slot = fresh_slot("map.get", V);
+                        if (kind == 0) {
+                            line(okv + " = call i64 @beans_map_get_typed_raw(ptr " +
+                                 recv.first + ", i64 " + key_argument + ", ptr " +
+                                 value_slot + ")");
+                        } else {
+                            line(okv + " = call i64 @beans_map_get_typed(ptr " +
+                                 recv.first + ", i64 " + key_argument + ", i64 " +
+                                 std::to_string(kind) + ", ptr " + value_slot +
+                                 ", ptr " + keq + ", ptr " + khash + ")");
+                        }
+                    } else if (kind == 0) {
+                        raw = reg();
                         std::string pair = reg();
                         line(pair + " = call {i64, i64} @beans_map_get_raw(ptr " +
-                             recv.first + ", i64 " + to_slot(k) + ")");
+                             recv.first + ", i64 " + key_argument + ")");
                         line(raw + " = extractvalue {i64, i64} " + pair + ", 0");
                         line(okv + " = extractvalue {i64, i64} " + pair + ", 1");
                     } else {
+                        raw = reg();
                         std::string okf = fresh_slot("gokf", cg.t_i64());
                         line(raw + " = call i64 @beans_map_get(ptr " + recv.first +
-                             ", i64 " + to_slot(k) + ", i64 " +
+                             ", i64 " + key_argument + ", i64 " +
                              std::to_string(kind) + ", ptr " + okf + ", ptr " + keq +
                              ", ptr " + khash + ")");
                         line(okv + " = load i64, ptr " + okf);
                     }
                     line(c + " = icmp ne i64 " + okv + ", 0");
                     std::string someb = bb(), noneb = bb(), endb = bb();
-                    std::string slot = fresh_slot("mg", cg.t_str());
+                    Ty* option = cg.t_option(V);
+                    std::string slot = fresh_slot("mg", option);
                     line("br i1 " + c + ", label %" + someb + ", label %" + noneb);
                     label(someb);
-                    std::string sb = make_option_some({from_slot(raw, V), V}, V);
+                    EV found_value;
+                    if (typed_value) {
+                        std::string value = reg();
+                        line(value + " = load " + std::string(ll(V)) + ", ptr " +
+                             value_slot);
+                        found_value = {value, V};
+                    } else {
+                        found_value = {from_slot(raw, V), V};
+                    }
+                    std::string sb = make_option_some(found_value, V);
                     consume(sb);
-                    line("store ptr " + sb + ", ptr " + slot);
+                    line("store " + std::string(ll(option)) + " " + sb + ", ptr " +
+                         slot);
                     line("br label %" + endb);
                     label(noneb);
                     std::string nb = make_option_none(V);
                     consume(nb);
-                    line("store ptr " + nb + ", ptr " + slot);
+                    line("store " + std::string(ll(option)) + " " + nb + ", ptr " +
+                         slot);
                     line("br label %" + endb);
                     label(endb);
                     std::string r = reg();
-                    line(r + " = load ptr, ptr " + slot);
-                    own(r, cg.t_option(V));
-                    return {r, cg.t_option(V)};
+                    line(r + " = load " + std::string(ll(option)) + ", ptr " + slot);
+                    own(r, option);
+                    return {r, option};
                 }
                 if (mname == "len") {
                     return {load_at(recv.first, 8, cg.t_i64()), cg.t_i64()};
                 }
                 if (mname == "contains") {
                     EV k = eval(e->args[0].get(), K);
+                    std::string key_argument =
+                        emit_map_key_argument(k, K, false);
                     if (kind == 0) {
                         std::string raw = reg(), r = reg();
                         line(raw + " = call i64 @beans_map_contains_raw(ptr " +
-                             recv.first + ", i64 " + to_slot(k) + ")");
+                             recv.first + ", i64 " + key_argument + ")");
                         line(r + " = icmp ne i64 " + raw + ", 0");
                         return {r, cg.t_bool()};
                     }
@@ -5916,7 +7327,7 @@ struct FnEmit {
                     (void)raw;
                     std::string d = reg();
                     line(d + " = call i64 @beans_map_get(ptr " + recv.first + ", i64 " +
-                         to_slot(k) + ", i64 " + std::to_string(kind) + ", ptr " + okf +
+                         key_argument + ", i64 " + std::to_string(kind) + ", ptr " + okf +
                          ", ptr " + keq + ", ptr " + khash + ")");
                     std::string okv = reg(), r = reg();
                     line(okv + " = load i64, ptr " + okf);
@@ -5925,13 +7336,15 @@ struct FnEmit {
                 }
                 if (mname == "remove") {
                     EV k = eval(e->args[0].get(), K);
+                    std::string key_argument =
+                        emit_map_key_argument(k, K, false);
                     std::string c = reg(), r = reg();
                     if (kind == 0) {
                         line(c + " = call i64 @beans_map_remove_raw(ptr " + recv.first +
-                             ", i64 " + to_slot(k) + ")");
+                             ", i64 " + key_argument + ")");
                     } else {
                         line(c + " = call i64 @beans_map_remove(ptr " + recv.first +
-                             ", i64 " + to_slot(k) + ", i64 " + std::to_string(kind) +
+                             ", i64 " + key_argument + ", i64 " + std::to_string(kind) +
                              ", ptr " + keq + ", ptr " + khash + ")");
                     }
                     line(r + " = icmp ne i64 " + c + ", 0");
@@ -5940,8 +7353,14 @@ struct FnEmit {
                 if (mname == "keys" || mname == "values") {
                     Ty* elem = mname == "keys" ? K : V;
                     std::string r = reg();
-                    line(r + " = call ptr @beans_map_" + mname + "(ptr " + recv.first +
-                         ")");
+                    if (mname == "keys" && is_typed_map_key(K)) {
+                        line(r + " = call ptr @beans_map_keys_typed(ptr " + recv.first +
+                             ", i64 " + std::to_string(CG2::value_size(K)) +
+                             ", i64 " + std::to_string(pointer_mask(K)) + ")");
+                    } else {
+                        line(r + " = call ptr @beans_map_" + mname + "(ptr " +
+                             recv.first + ")");
+                    }
                     own(r, cg.t_list(elem));
                     return {r, cg.t_list(elem)};
                 }
@@ -5957,48 +7376,89 @@ struct FnEmit {
                     EV value = eval(e->args[0].get(), inner);
                     transfer_in(value);
                     std::string handle = reg();
-                    line(handle + " = call i64 @beans_arena_put(ptr " + recv.first +
-                         ", i64 " + to_slot(value, true) + ")");
+                    if (uses_typed_owned_storage(inner)) {
+                        std::string slot = spill_list_element(value, "arena.put");
+                        line(handle + " = call i64 @beans_arena_put_typed(ptr " +
+                             recv.first + ", ptr " + slot + ")");
+                    } else {
+                        line(handle + " = call i64 @beans_arena_put(ptr " + recv.first +
+                             ", i64 " + to_slot(value, true) + ")");
+                    }
                     return {handle, cg.t_i64()};
                 }
                 if (mname == "get") {
                     EV handle = eval(e->args[0].get(), cg.t_i64());
-                    std::string ok_slot = fresh_slot("arena.ok", cg.t_i64());
-                    std::string raw = reg();
-                    line(raw + " = call i64 @beans_arena_get(ptr " + recv.first +
-                         ", i64 " + handle.first + ", ptr " + ok_slot + ")");
-                    std::string ok = reg(), cond = reg();
-                    line(ok + " = load i64, ptr " + ok_slot);
-                    line(cond + " = icmp ne i64 " + ok + ", 0");
+                    bool typed = uses_typed_owned_storage(inner);
+                    std::string raw;
+                    std::string value_slot;
+                    std::string found = reg(), cond = reg();
+                    if (typed) {
+                        value_slot = fresh_slot("arena.get", inner);
+                        line(found + " = call i64 @beans_arena_get_typed(ptr " +
+                             recv.first + ", i64 " + handle.first + ", ptr " +
+                             value_slot + ")");
+                    } else {
+                        raw = reg();
+                        std::string ok_slot = fresh_slot("arena.ok", cg.t_i64());
+                        line(raw + " = call i64 @beans_arena_get(ptr " + recv.first +
+                             ", i64 " + handle.first + ", ptr " + ok_slot + ")");
+                        line(found + " = load i64, ptr " + ok_slot);
+                    }
+                    line(cond + " = icmp ne i64 " + found + ", 0");
                     std::string someb = bb(), noneb = bb(), endb = bb();
-                    std::string slot = fresh_slot("arena.option", cg.t_str());
+                    Ty* option = cg.t_option(inner);
+                    std::string slot = fresh_slot("arena.option", option);
                     line("br i1 " + cond + ", label %" + someb + ", label %" + noneb);
                     label(someb);
-                    std::string sb = make_option_some({from_slot(raw, inner), inner}, inner);
+                    EV value;
+                    if (typed) {
+                        std::string loaded = reg();
+                        line(loaded + " = load " + std::string(ll(inner)) + ", ptr " +
+                             value_slot);
+                        value = {loaded, inner};
+                    } else {
+                        value = {from_slot(raw, inner), inner};
+                    }
+                    std::string sb = make_option_some(value, inner);
                     consume(sb);
-                    line("store ptr " + sb + ", ptr " + slot);
+                    line("store " + std::string(ll(option)) + " " + sb + ", ptr " +
+                         slot);
                     line("br label %" + endb);
                     label(noneb);
                     std::string nb = make_option_none(inner);
                     consume(nb);
-                    line("store ptr " + nb + ", ptr " + slot);
+                    line("store " + std::string(ll(option)) + " " + nb + ", ptr " +
+                         slot);
                     line("br label %" + endb);
                     label(endb);
                     std::string result = reg();
-                    line(result + " = load ptr, ptr " + slot);
-                    own(result, cg.t_option(inner));
-                    return {result, cg.t_option(inner)};
+                    line(result + " = load " + std::string(ll(option)) + ", ptr " +
+                         slot);
+                    own(result, option);
+                    return {result, option};
                 }
                 if (mname == "at") {
                     EV handle = eval(e->args[0].get(), cg.t_i64());
-                    std::string raw = reg();
-                    line(raw + " = call i64 @beans_arena_at(ptr " + recv.first +
-                         ", i64 " + handle.first + ", i64 " +
-                         std::to_string(e->line) + ", i64 " +
-                         std::to_string(e->col) + ")");
-                    std::string value = from_slot(raw, inner);
-                    if (is_rc(inner)) {
-                        emit_retain(value);
+                    std::string value;
+                    if (uses_typed_owned_storage(inner)) {
+                        std::string slot = fresh_slot("arena.at", inner);
+                        line("call void @beans_arena_at_typed(ptr " + recv.first +
+                             ", i64 " + handle.first + ", ptr " + slot + ", i64 " +
+                             std::to_string(e->line) + ", i64 " +
+                             std::to_string(e->col) + ")");
+                        value = reg();
+                        line(value + " = load " + std::string(ll(inner)) + ", ptr " +
+                             slot);
+                    } else {
+                        std::string raw = reg();
+                        line(raw + " = call i64 @beans_arena_at(ptr " + recv.first +
+                             ", i64 " + handle.first + ", i64 " +
+                             std::to_string(e->line) + ", i64 " +
+                             std::to_string(e->col) + ")");
+                        value = from_slot(raw, inner);
+                    }
+                    if (has_owned_refs(inner)) {
+                        emit_retain_value(value, inner);
                         own(value, inner);
                     }
                     return {value, inner};
@@ -6017,11 +7477,23 @@ struct FnEmit {
             case Ty::box_: {
                 Ty* inner = rt_->args[0];
                 if (mname == "get") {
-                    std::string raw = reg();
-                    line(raw + " = call i64 @beans_box_get(ptr " + recv.first + ")");
-                    std::string value = from_slot(raw, inner);
-                    if (is_rc(inner)) {
-                        emit_retain(value);
+                    std::string value;
+                    if (uses_typed_owned_storage(inner)) {
+                        std::string slot = fresh_slot("box.get", inner);
+                        line("call void @beans_box_get_typed(ptr " + recv.first +
+                             ", ptr " + slot + ", i64 " +
+                             std::to_string(CG2::value_size(inner)) + ")");
+                        value = reg();
+                        line(value + " = load " + std::string(ll(inner)) + ", ptr " +
+                             slot);
+                    } else {
+                        std::string raw = reg();
+                        line(raw + " = call i64 @beans_box_get(ptr " + recv.first +
+                             ")");
+                        value = from_slot(raw, inner);
+                    }
+                    if (has_owned_refs(inner)) {
+                        emit_retain_value(value, inner);
                         own(value, inner);
                     }
                     return {value, inner};
@@ -6029,8 +7501,17 @@ struct FnEmit {
                 if (mname == "set") {
                     EV value = eval(e->args[0].get(), inner);
                     transfer_in(value);
-                    line("call void @beans_box_set(ptr " + recv.first + ", i64 " +
-                         to_slot(value, true) + ")");
+                    if (uses_typed_owned_storage(inner)) {
+                        std::string slot = spill_list_element(value, "box.set");
+                        line("call void @beans_box_set_typed(ptr " + recv.first +
+                             ", ptr " + slot + ", i64 " +
+                             std::to_string(CG2::value_size(inner)) + ", i64 " +
+                             std::to_string(pointer_mask(inner)) + ", i64 " +
+                             std::to_string(cycle_pointer_mask(inner)) + ")");
+                    } else {
+                        line("call void @beans_box_set(ptr " + recv.first + ", i64 " +
+                             to_slot(value, true) + ")");
+                    }
                     return {"", cg.t_unit()};
                 }
                 break;
@@ -6038,11 +7519,23 @@ struct FnEmit {
             case Ty::shared_: {
                 Ty* inner = rt_->args[0];
                 if (mname == "get") {
-                    std::string raw = reg();
-                    line(raw + " = call i64 @beans_shared_get(ptr " + recv.first + ")");
-                    std::string value = from_slot(raw, inner);
-                    if (is_rc(inner)) {
-                        emit_retain(value);
+                    std::string value;
+                    if (is_typed_list_element(inner)) {
+                        std::string slot = fresh_slot("shared.get", inner);
+                        line("call void @beans_shared_get_typed(ptr " + recv.first +
+                             ", ptr " + slot + ", i64 " +
+                             std::to_string(CG2::value_size(inner)) + ")");
+                        value = reg();
+                        line(value + " = load " + std::string(ll(inner)) + ", ptr " +
+                             slot);
+                    } else {
+                        std::string raw = reg();
+                        line(raw + " = call i64 @beans_shared_get(ptr " + recv.first +
+                             ")");
+                        value = from_slot(raw, inner);
+                    }
+                    if (has_owned_refs(inner)) {
+                        emit_retain_value(value, inner);
                         own(value, inner);
                     }
                     return {value, inner};
@@ -6078,10 +7571,23 @@ struct FnEmit {
             case Ty::thread_: {
                 if (mname == "join") {
                     Ty* ret = rt_->args[0];
+                    if (is_typed_list_element(ret)) {
+                        std::string slot = fresh_slot("thread.result", ret);
+                        line("call void @beans_thread_join_typed(ptr " + recv.first +
+                             ", ptr " + slot + ", i64 " +
+                             std::to_string(CG2::value_size(ret)) + ")");
+                        std::string value = reg();
+                        line(value + " = load " + std::string(ll(ret)) + ", ptr " +
+                             slot);
+                        own(value, ret);
+                        return {value, ret};
+                    }
                     std::string raw = reg();
                     line(raw + " = call i64 @beans_thread_join(ptr " + recv.first + ")");
                     if (ret->k == Ty::unit_) return {"", cg.t_unit()};
-                    return {from_slot(raw, ret, true), ret};
+                    std::string value = from_slot(raw, ret, true);
+                    own(value, ret);
+                    return {value, ret};
                 }
                 break;
             }
@@ -6089,9 +7595,21 @@ struct FnEmit {
                 if (mname == "with") {
                     Ty* inner = rt_->args[0];
                     EV clo = eval(e->args[0].get());
-                    std::string raw = reg();
-                    line(raw + " = call i64 @beans_mutex_lock(ptr " + recv.first + ")");
-                    std::string iv = from_slot(raw, inner);
+                    std::string iv;
+                    if (is_typed_list_element(inner)) {
+                        std::string slot = fresh_slot("mutex.value", inner);
+                        line("call void @beans_mutex_lock_typed(ptr " + recv.first +
+                             ", ptr " + slot + ", i64 " +
+                             std::to_string(CG2::value_size(inner)) + ")");
+                        iv = reg();
+                        line(iv + " = load " + std::string(ll(inner)) + ", ptr " +
+                             slot);
+                    } else {
+                        std::string raw = reg();
+                        line(raw + " = call i64 @beans_mutex_lock(ptr " + recv.first +
+                             ")");
+                        iv = from_slot(raw, inner);
+                    }
                     std::string fp = load_at(clo.first, 0, cg.t_str());
                     line("call void " + fp + "(ptr " + clo.first + ", " +
                          std::string(ll(inner)) + " " + iv + ")");
@@ -6106,8 +7624,14 @@ struct FnEmit {
                     EV v = eval(e->args[0].get(), elem);
                     transfer_in(v);
                     std::string ok = reg();
-                    line(ok + " = call i64 @beans_chan_send(ptr " + recv.first + ", i64 " +
-                         to_slot(v, true) + ")");
+                    if (is_typed_list_element(elem)) {
+                        std::string slot = spill_list_element(v, "channel.send");
+                        line(ok + " = call i64 @beans_chan_send_typed(ptr " +
+                             recv.first + ", ptr " + slot + ")");
+                    } else {
+                        line(ok + " = call i64 @beans_chan_send(ptr " + recv.first +
+                             ", i64 " + to_slot(v, true) + ")");
+                    }
                     std::string c = reg();
                     line(c + " = icmp ne i64 " + ok + ", 0");
                     std::string okb = bb(), badb = bb();
@@ -6121,33 +7645,51 @@ struct FnEmit {
                     return {"", cg.t_unit()};
                 }
                 if (mname == "recv") {
-                    std::string okf = fresh_slot("rokf", cg.t_i64());
-                    std::string raw = reg();
-                    line(raw + " = call i64 @beans_chan_recv(ptr " + recv.first + ", ptr " +
-                         okf + ")");
-                    std::string okv = reg(), c = reg();
-                    line(okv + " = load i64, ptr " + okf);
-                    line(c + " = icmp ne i64 " + okv + ", 0");
+                    bool typed = is_typed_list_element(elem);
+                    std::string raw, value_slot;
+                    std::string found = reg(), c = reg();
+                    if (typed) {
+                        value_slot = fresh_slot("channel.recv", elem);
+                        line(found + " = call i64 @beans_chan_recv_typed(ptr " +
+                             recv.first + ", ptr " + value_slot + ")");
+                    } else {
+                        std::string okf = fresh_slot("channel.ok", cg.t_i64());
+                        raw = reg();
+                        line(raw + " = call i64 @beans_chan_recv(ptr " + recv.first +
+                             ", ptr " + okf + ")");
+                        line(found + " = load i64, ptr " + okf);
+                    }
+                    line(c + " = icmp ne i64 " + found + ", 0");
                     std::string someb = bb(), noneb = bb(), endb = bb();
-                    std::string slot = fresh_slot("rv", cg.t_str());
+                    Ty* option = cg.t_option(elem);
+                    std::string slot = fresh_slot("channel.option", option);
                     line("br i1 " + c + ", label %" + someb + ", label %" + noneb);
                     label(someb);
-                    std::string recvd = from_slot(raw, elem, true);
+                    std::string recvd;
+                    if (typed) {
+                        recvd = reg();
+                        line(recvd + " = load " + std::string(ll(elem)) + ", ptr " +
+                             value_slot);
+                    } else {
+                        recvd = from_slot(raw, elem, true);
+                    }
                     own(recvd, elem); // the queue's ref moves to us
                     std::string sb = make_option_some({recvd, elem}, elem);
                     consume(sb);
-                    line("store ptr " + sb + ", ptr " + slot);
+                    line("store " + std::string(ll(option)) + " " + sb + ", ptr " +
+                         slot);
                     line("br label %" + endb);
                     label(noneb);
                     std::string nb = make_option_none(elem);
                     consume(nb);
-                    line("store ptr " + nb + ", ptr " + slot);
+                    line("store " + std::string(ll(option)) + " " + nb + ", ptr " +
+                         slot);
                     line("br label %" + endb);
                     label(endb);
                     std::string r = reg();
-                    line(r + " = load ptr, ptr " + slot);
-                    own(r, cg.t_option(elem));
-                    return {r, cg.t_option(elem)};
+                    line(r + " = load " + std::string(ll(option)) + ", ptr " + slot);
+                    own(r, option);
+                    return {r, option};
                 }
                 if (mname == "close") {
                     line("call void @beans_chan_close(ptr " + recv.first + ")");
@@ -6184,7 +7726,104 @@ struct FnEmit {
     }
 
     // ---- match ----
+    // A block match over Map.get normally builds a short-lived Option box.
+    // Keep the runtime's (value, found) pair in SSA when the payload itself is
+    // one slot. This is the common lookup-loop form and removes one allocation
+    // per probe without changing the public Option representation.
+    bool eval_scalar_map_match(const Expr* e, EV& out) {
+        const Expr* subject = e->subject.get();
+        if (!subject || subject->kind != Expr::Kind::call ||
+            subject->args.size() != 1 || !subject->callee ||
+            subject->callee->kind != Expr::Kind::field ||
+            subject->callee->name != "get" ||
+            !subject->callee->object ||
+            subject->callee->object->kind != Expr::Kind::ident)
+            return false;
+        TypeId checked = cg.checked_type(subject->callee->object.get());
+        if (!checked || checked->k != Type::K::class_ ||
+            (checked->name != "Map" && checked->name != "OrderedMap"))
+            return false;
+        if (checked->args.size() != 2 ||
+            !(checked->args[1]->is_int() || checked->args[1]->is_float() ||
+              checked->args[1]->k == Type::K::bool_))
+            return false;
+        for (const MatchArm& arm : e->arms) {
+            if (!arm.is_block) return false;
+            if (arm.pat->kind == Pattern::Kind::wildcard) continue;
+            if (arm.pat->kind != Pattern::Kind::name ||
+                (arm.pat->name != "some" && arm.pat->name != "none"))
+                return false;
+            if (arm.pat->name == "some" && arm.pat->bindings.size() > 1)
+                return false;
+        }
+
+        EV map = eval(subject->callee->object.get());
+        if (map.second->k != Ty::map_) {
+            err(subject, "Map.get match");
+            out = {"", cg.t_unit()};
+            return true;
+        }
+        Ty* key_type = map.second->args[0];
+        Ty* value_type = map.second->args[1];
+        EV key = eval(subject->args[0].get(), key_type);
+        const int kind = map_key_kind(key_type);
+        std::string key_argument =
+            emit_map_key_argument(key, key_type, false);
+        std::string raw = reg(), found = reg();
+        if (kind == 0) {
+            std::string pair = reg();
+            line(pair + " = call {i64, i64} @beans_map_get_raw(ptr " + map.first +
+                 ", i64 " + key_argument + ")");
+            line(raw + " = extractvalue {i64, i64} " + pair + ", 0");
+            line(found + " = extractvalue {i64, i64} " + pair + ", 1");
+        } else {
+            std::string found_slot = fresh_slot("match.map.found", cg.t_i64());
+            line(raw + " = call i64 @beans_map_get(ptr " + map.first + ", i64 " +
+                 key_argument + ", i64 " + std::to_string(kind) + ", ptr " +
+                 found_slot + ", ptr " + eq_thunk(key_type, kind) + ", ptr " +
+                 hash_thunk(key_type, kind) + ")");
+            line(found + " = load i64, ptr " + found_slot);
+        }
+        std::string has = reg();
+        line(has + " = icmp ne i64 " + found + ", 0");
+        std::string end = bb();
+        for (size_t index = 0; index < e->arms.size(); ++index) {
+            const MatchArm& arm = e->arms[index];
+            std::string condition;
+            if (arm.pat->kind == Pattern::Kind::wildcard) {
+                condition = "true";
+            } else if (arm.pat->name == "some") {
+                condition = has;
+            } else {
+                condition = reg();
+                line(condition + " = xor i1 " + has + ", true");
+            }
+            std::string body_block = bb();
+            std::string next = index + 1 < e->arms.size() ? bb() : end;
+            line("br i1 " + condition + ", label %" + body_block + ", label %" +
+                 next);
+            label(body_block);
+            scopes.emplace_back();
+            if (arm.pat->kind == Pattern::Kind::name &&
+                arm.pat->name == "some" && !arm.pat->bindings.empty()) {
+                const std::string& name = arm.pat->bindings[0].name;
+                std::string binding = alloc_slot(name, value_type);
+                line("store " + std::string(ll(value_type)) + " " +
+                     from_slot(raw, value_type) + ", ptr " + binding);
+            }
+            exec_block(arm.body);
+            scopes.pop_back();
+            if (!terminated) line("br label %" + end);
+            if (index + 1 < e->arms.size()) label(next);
+        }
+        label(end);
+        out = {"", cg.t_unit()};
+        return true;
+    }
+
     EV eval_match(const Expr* e, Ty* hint) {
+        EV scalar_map_result;
+        if (eval_scalar_map_match(e, scalar_map_result)) return scalar_map_result;
         EV subj = eval(e->subject.get());
         if (cg.hir.mir().match_subject_needs_pin(e)) pin_borrow(e->subject.get(), subj);
         std::string endb = bb();
@@ -6362,8 +8001,15 @@ struct FnEmit {
         }
         std::vector<Ty*> out;
         if (const EnumVariant* v = cg.variant_decl(enum_name, variant)) {
+            std::map<std::string, Ty*> env;
+            auto declaration = cg.enum_decls.find(enum_name);
+            if (declaration != cg.enum_decls.end()) {
+                for (size_t i = 0;
+                     i < declaration->second->generics.size() && i < subj_args.size(); i++)
+                    env[declaration->second->generics[i].name] = subj_args[i];
+            }
             for (const Param& p : v->payload) {
-                out.push_back(cg.resolve(p.type.get(), CG2::empty_env(), line_, col_));
+                out.push_back(cg.resolve(p.type.get(), env, line_, col_));
             }
         }
         return out;
@@ -6373,14 +8019,17 @@ struct FnEmit {
         if (p->kind != Pattern::Kind::name || p->bindings.empty()) return;
         std::vector<Ty*> ptys =
             payload_types(subj.second->name, p->name, subj.second->args, p->line, p->col);
+        std::vector<int> offsets = enum_payload_offsets(ptys);
         for (size_t i = 0; i < p->bindings.size() && i < ptys.size(); i++) {
             std::string v;
             if (subj.second->name == "Option" && i == 0) {
                 v = option_payload(subj, ptys[i]);
             } else if (subj.second->name == "Result" && i == 0) {
                 v = result_payload(subj, p->name == "ok");
+            } else if (enum_typed_payload(ptys[i])) {
+                v = load_at(subj.first, offsets[i], ptys[i]);
             } else {
-                v = load_slot_at(subj.first, 8 + 8 * static_cast<int>(i), ptys[i]);
+                v = load_slot_at(subj.first, offsets[i], ptys[i]);
             }
             std::string slot = alloc_slot(p->bindings[i].name, ptys[i]);
             line("store " + std::string(ll(ptys[i])) + " " + v + ", ptr " + slot);
@@ -6410,7 +8059,10 @@ struct FnEmit {
                 Ty* t = rt(s->type.get(), s->line, s->col);
                 if (t->k == Ty::bad_ || t->k == Ty::unit_) return;
                 bool borrow = false;
-                if (has_owned_refs(t) && s->init && s->init->kind == Expr::Kind::ident) {
+                // Pointer aliases can borrow one owner. Inline aggregates are
+                // real value copies: each copy must retain its nested fields,
+                // because assigning one copy must not invalidate the other.
+                if (is_rc(t) && s->init && s->init->kind == Expr::Kind::ident) {
                     std::string src(s->init->text);
                     Var* sv = find_var(src);
                     borrow = sv && !sv->boxed && !boxed_names.count(s->name) &&
@@ -6422,8 +8074,18 @@ struct FnEmit {
                 alloc_slot(s->name, t);
                 Var* var = find_var(s->name);
                 var->owned = !borrow && (has_owned_refs(t) || var->boxed);
-                if (t->k == Ty::dec_)
+                if (t->k == Ty::dec_) {
                     var->decimal_scale = known_decimal_scale(s->init.get());
+                    if (!var->boxed && var->decimal_scale >= 0 &&
+                        can_shadow_decimal(s->name, var->decimal_scale)) {
+                        var->decimal_coeff_slot = fresh_slot("decimal.coeff", t);
+                        std::string shifted = reg(), coefficient = reg();
+                        line(shifted + " = shl i128 " + v.first + ", 16");
+                        line(coefficient + " = ashr i128 " + shifted + ", 16");
+                        line("store i128 " + coefficient + ", ptr " +
+                             var->decimal_coeff_slot);
+                    }
+                }
                 if (s->init && s->init->kind == Expr::Kind::closure &&
                     !ever_assigned(s->name)) {
                     auto known = closure_symbols.find(s->init.get());
@@ -6460,8 +8122,10 @@ struct FnEmit {
                 }
                 EV v = eval(s->value.get(), t);
                 if (s->op == TokenKind::assign) {
-                    if (local_var && t->k == Ty::dec_)
+                    if (local_var && t->k == Ty::dec_) {
                         local_var->decimal_scale = -1;
+                        local_var->decimal_coeff_slot.clear();
+                    }
                     if (has_owned_refs(t)) {
                         transfer_in(v);
                         std::string old = reg();
@@ -6486,8 +8150,55 @@ struct FnEmit {
                     }
                     return;
                 }
-                std::string cur = reg();
-                line(cur + " = load " + std::string(ll(t)) + ", ptr " + ptr);
+                if (t->k == Ty::dec_ && local_var &&
+                    !local_var->decimal_coeff_slot.empty() &&
+                    (s->op == TokenKind::plus_eq ||
+                     s->op == TokenKind::minus_eq)) {
+                    Decimal literal;
+                    if (decimal_literal_value(s->value.get(), literal) &&
+                        local_var->decimal_scale == literal.scale) {
+                        const __int128 coeff_min =
+                            -(static_cast<__int128>(1) << 111);
+                        const __int128 coeff_max =
+                            (static_cast<__int128>(1) << 111) - 1;
+                        const __int128 delta =
+                            s->op == TokenKind::minus_eq ? -literal.coeff
+                                                         : literal.coeff;
+                        const __int128 limit =
+                            delta >= 0 ? coeff_max - delta : coeff_min - delta;
+                        std::string coefficient = reg(), overflow = reg();
+                        line(coefficient + " = load i128, ptr " +
+                             local_var->decimal_coeff_slot);
+                        line(overflow + " = icmp " +
+                             std::string(delta >= 0 ? "sgt" : "slt") +
+                             " i128 " + coefficient + ", " +
+                             u128_str(static_cast<unsigned __int128>(limit)));
+                        std::string bad = bb(), okay = bb();
+                        line("br i1 " + overflow + ", label %" + bad +
+                             ", label %" + okay);
+                        label(bad);
+                        line("call void @beans_panic(ptr " +
+                             cg.intern_string("decimal overflow") + ", i64 " +
+                             std::to_string(s->value->line) + ", i64 " +
+                             std::to_string(s->value->col) + ")");
+                        line("unreachable");
+                        label(okay);
+                        std::string sum = reg();
+                        line(sum + " = add i128 " + coefficient + ", " +
+                             u128_str(static_cast<unsigned __int128>(delta)));
+                        line("store i128 " + sum + ", ptr " +
+                             local_var->decimal_coeff_slot);
+                        return;
+                    }
+                }
+                std::string cur;
+                if (t->k == Ty::dec_ && local_var &&
+                    !local_var->decimal_coeff_slot.empty()) {
+                    cur = var_read(local_var);
+                } else {
+                    cur = reg();
+                    line(cur + " = load " + std::string(ll(t)) + ", ptr " + ptr);
+                }
                 std::string r = reg();
                 if (t->k == Ty::dec_) {
                     Decimal literal;
@@ -6504,10 +8215,16 @@ struct FnEmit {
                         if (local_var && known_scale >= 0 &&
                             literal.scale > known_scale)
                             local_var->decimal_scale = -1;
+                        if (local_var) {
+                            local_var->decimal_coeff_slot.clear();
+                        }
                         line("store i128 " + updated.first + ", ptr " + ptr);
                         return;
                     }
-                    if (local_var) local_var->decimal_scale = -1;
+                    if (local_var) {
+                        local_var->decimal_scale = -1;
+                        local_var->decimal_coeff_slot.clear();
+                    }
                     const char* fn = s->op == TokenKind::plus_eq    ? "add"
                                      : s->op == TokenKind::minus_eq ? "sub"
                                      : s->op == TokenKind::star_eq  ? "mul"
@@ -6757,8 +8474,16 @@ struct FnEmit {
             line(pointer + " = getelementptr " + std::string(ll(it.second)) +
                  ", ptr " + storage + ", i64 0, i64 " + i);
             line(item + " = load " + std::string(ll(elem)) + ", ptr " + pointer);
-            line("store " + std::string(ll(elem)) + " " + item + ", ptr " +
-                 var_ptr(lv));
+            if (lv->boxed && has_owned_refs(elem)) {
+                std::string cell = var_ptr(lv), old = reg();
+                line(old + " = load " + std::string(ll(elem)) + ", ptr " + cell);
+                emit_retain_value(item, elem);
+                line("store " + std::string(ll(elem)) + " " + item + ", ptr " + cell);
+                emit_release_value(old, elem);
+            } else {
+                line("store " + std::string(ll(elem)) + " " + item + ", ptr " +
+                     var_ptr(lv));
+            }
             loop_stack.push_back({end, step, scopes.size()});
             exec_block(s->body);
             loop_stack.pop_back();
@@ -6792,18 +8517,15 @@ struct FnEmit {
         line(c + " = icmp slt i64 " + i + ", " + len);
         line("br i1 " + c + ", label %" + body_bb + ", label %" + end);
         label(body_bb);
-        std::string data = load_at(it.first, 0, cg.t_str());
-        std::string ep = reg(), raw = reg();
-        line(ep + " = getelementptr i64, ptr " + data + ", i64 " + i);
-        line(raw + " = load i64, ptr " + ep);
-        std::string elem_val = from_slot(raw, elem);
-        if (lv->boxed && is_rc(elem)) {
+        EV item = load_list_element(it.first, i, elem);
+        std::string elem_val = item.first;
+        if (lv->boxed && has_owned_refs(elem)) {
             std::string cellp = var_ptr(lv);
             std::string old = reg();
-            line(old + " = load ptr, ptr " + cellp);
-            emit_retain(elem_val);
+            line(old + " = load " + std::string(ll(elem)) + ", ptr " + cellp);
+            emit_retain_value(elem_val, elem);
             line("store " + std::string(ll(elem)) + " " + elem_val + ", ptr " + cellp);
-            emit_release(old);
+            emit_release_value(old, elem);
         } else {
             line("store " + std::string(ll(elem)) + " " + elem_val + ", ptr " +
                  var_ptr(lv));
@@ -6832,6 +8554,7 @@ struct FnEmit {
             ClosureScan scan;
             scan.block(body_ref);
             boxed_names = std::move(scan.captured);
+            assigned_capture_names = std::move(scan.assigned_captures);
             taken_names = std::move(scan.taken);
         }
         {
@@ -6839,14 +8562,25 @@ struct FnEmit {
             if (has_self) scan.declarations["self"] += 1;
             for (const Param& param : params_ref) scan.declarations[param.name] += 1;
             if (captured) {
-                for (const auto& [name, type] : *captured) {
-                    (void)type;
-                    scan.declarations[name] += 1;
+                for (const Capture& capture : *captured) {
+                    scan.declarations[capture.name] += 1;
                 }
             }
             scan.block(body_ref);
             remaining_reads = std::move(scan.reads);
             declaration_counts = std::move(scan.declarations);
+        }
+        {
+            SingleReadScan scan;
+            if (has_self) scan.bind("self");
+            for (const Param& param : params_ref) scan.bind(param.name);
+            if (captured)
+                for (const Capture& capture : *captured) {
+                    scan.bind(capture.name);
+                }
+            scan.block(body_ref, false);
+            scan.finish();
+            single_read_moves = std::move(scan.single_reads);
         }
 
         Ty* self_ty = nullptr;
@@ -6880,7 +8614,7 @@ struct FnEmit {
             header += "ptr %self.arg";
             first = false;
             std::string slot = alloc_slot("self", self_ty, true);
-            bool bx = boxed_names.count("self") > 0;
+            bool bx = scopes.back()["self"].boxed;
             store_param("%self.arg", slot, "ptr", bx, self_ty, false);
             if (bx) scopes.back()["self"].owned = true; // the frame made the cell
         }
@@ -6893,12 +8627,13 @@ struct FnEmit {
             if (params_ref[i].passing == Param::Passing::inout) {
                 header += "ptr " + preg;
                 scopes.back()[params_ref[i].name] = {
-                    preg, "", pt, false, false, true, "", next_seq++, loop_stack.size()};
+                    preg, "", pt, false, false, true, "", next_seq++,
+                    loop_stack.size(), -1, ""};
                 continue;
             }
             header += std::string(ll(pt)) + " " + preg;
             std::string slot = alloc_slot(params_ref[i].name, pt, true);
-            bool bx = boxed_names.count(params_ref[i].name) > 0;
+            bool bx = scopes.back()[params_ref[i].name].boxed;
             bool takes = params_ref[i].passing == Param::Passing::take;
             store_param(preg, slot, ll(pt), bx, pt, takes);
             Var& param_var = scopes.back()[params_ref[i].name];
@@ -6909,20 +8644,40 @@ struct FnEmit {
         }
         header += ") {\nentry:\n";
 
-        // captured cells arrive behind %env: {fnptr @0, cell0 @8, cell1 @16, ...}
+        // Captures arrive behind %env: {fnptr @0, capture0 @8, capture1 @16, ...}.
         if (captured) {
             for (size_t i = 0; i < captured->size(); i++) {
-                const auto& [name, ty] = (*captured)[i];
-                std::string slot = "%v" + std::to_string(next_reg++) + "." + name;
-                allocas += "  " + slot + " = alloca ptr\n";
+                const Capture& capture = (*captured)[i];
+                const std::string& name = capture.name;
+                Ty* ty = capture.ty;
                 std::string cp = "%cap" + std::to_string(i);
                 entry_inits += "  " + cp + " = getelementptr i8, ptr %env, i64 " +
                                std::to_string(8 + 8 * i) + "\n";
+                if (capture.by_value) {
+                    std::string value = cp + ".v";
+                    entry_inits += "  " + value + " = load " + ll(ty) + ", ptr " +
+                                   cp + "\n";
+                    std::string slot = alloc_slot(name, ty, true);
+                    Var& local = scopes.back()[name];
+                    if (local.boxed) {
+                        std::string cell = cp + ".cell";
+                        entry_inits += "  " + cell + " = load ptr, ptr " + slot + "\n";
+                        entry_inits += "  store " + std::string(ll(ty)) + " " + value +
+                                       ", ptr " + cell + "\n";
+                        local.owned = true;
+                    } else {
+                        entry_inits += "  store " + std::string(ll(ty)) + " " + value +
+                                       ", ptr " + slot + "\n";
+                    }
+                    continue;
+                }
+                std::string slot = "%v" + std::to_string(next_reg++) + "." + name;
+                allocas += "  " + slot + " = alloca ptr\n";
                 std::string cell = cp + ".c";
                 entry_inits += "  " + cell + " = load ptr, ptr " + cp + "\n";
                 entry_inits += "  store ptr " + cell + ", ptr " + slot + "\n";
                 scopes.back()[name] = {slot, "", ty, true, false, false, "", next_seq++,
-                                       loop_stack.size()};
+                                       loop_stack.size(), -1, ""};
             }
         }
 
@@ -7202,21 +8957,33 @@ std::string CodeGen::generate() {
     out += "declare ptr @beans_box_new(i64, i64)\n";
     out += "declare i64 @beans_box_get(ptr)\n";
     out += "declare void @beans_box_set(ptr, i64)\n";
+    out += "declare ptr @beans_box_new_typed(ptr, i64, i64, i64)\n";
+    out += "declare void @beans_box_get_typed(ptr, ptr, i64)\n";
+    out += "declare void @beans_box_set_typed(ptr, ptr, i64, i64, i64)\n";
     out += "declare ptr @beans_shared_new(i64, i64)\n";
     out += "declare i64 @beans_shared_get(ptr)\n";
+    out += "declare ptr @beans_shared_new_typed(ptr, i64, i64)\n";
+    out += "declare void @beans_shared_get_typed(ptr, ptr, i64)\n";
     out += "declare ptr @beans_shared_downgrade(ptr)\n";
     out += "declare ptr @beans_weak_upgrade(ptr)\n";
     out += "declare i64 @beans_weak_expired(ptr)\n";
     out += "declare ptr @beans_arena_new(i64, i64, i64, i64)\n";
+    out += "declare ptr @beans_arena_new_typed(i64, i64, i64, i64, i64, i64)\n";
     out += "declare i64 @beans_arena_put(ptr, i64)\n";
+    out += "declare i64 @beans_arena_put_typed(ptr, ptr)\n";
     out += "declare i64 @beans_arena_get(ptr, i64, ptr)\n";
+    out += "declare i64 @beans_arena_get_typed(ptr, i64, ptr)\n";
     out += "declare i64 @beans_arena_at(ptr, i64, i64, i64)\n";
+    out += "declare void @beans_arena_at_typed(ptr, i64, ptr, i64, i64)\n";
     out += "declare i64 @beans_arena_len(ptr)\n";
     out += "declare void @beans_arena_clear(ptr)\n";
     out += "declare ptr @beans_list_new(i64)\n";
+    out += "declare ptr @beans_list_new_typed(i64, i64)\n";
     out += "declare ptr @beans_list_clone(ptr)\n";
     out += "declare ptr @beans_list_join(ptr, ptr, i64)\n";
+    out += "declare ptr @beans_list_decv_join(ptr, ptr)\n";
     out += "declare ptr @beans_show_list(ptr, ptr)\n";
+    out += "declare ptr @beans_show_list_decv(ptr)\n";
     out += "declare ptr @beans_show_run(ptr, i64)\n";
     out += "declare void @beans_show_append(ptr, ptr)\n";
     out += "declare void @beans_show_push_val(ptr, ptr, i64)\n";
@@ -7224,21 +8991,32 @@ std::string CodeGen::generate() {
     out += "declare void @beans_show_list_iter(ptr, ptr, ptr)\n";
     out += "declare ptr @beans_list_join_show(ptr, ptr, ptr)\n";
     out += "declare void @beans_list_push(ptr, i64)\n";
+    out += "declare void @beans_list_push_typed(ptr, ptr)\n";
     out += "declare void @beans_list_reserve(ptr, i64, i64, i64)\n";
     out += "declare i64 @beans_list_min(ptr, i64, ptr)\n";
     out += "declare i64 @beans_list_index(ptr, i64, i64, ptr, ptr)\n";
     out += "declare i64 @beans_str_eq(ptr, ptr)\n";
     out += "declare void @beans_list_insert(ptr, i64, i64, i64, i64)\n";
+    out += "declare void @beans_list_insert_typed(ptr, i64, ptr, i64, i64)\n";
     out += "declare i64 @beans_list_remove(ptr, i64, i64, i64)\n";
+    out += "declare void @beans_list_remove_typed(ptr, i64, ptr, i64, i64)\n";
     out += "declare void @beans_list_reverse(ptr)\n";
     out += "declare void @beans_list_clear(ptr)\n";
     out += "declare ptr @beans_list_slice(ptr, i64, i64, i64, i64)\n";
     out += "declare void @beans_list_sort(ptr, i64)\n";
     out += "declare void @beans_list_sort_by(ptr, ptr, ptr)\n";
     out += "declare void @beans_list_sort_by_key(ptr, ptr, ptr)\n";
+    out += "declare void @beans_list_decv_max(ptr, ptr, ptr)\n";
+    out += "declare void @beans_list_decv_min(ptr, ptr, ptr)\n";
+    out += "declare i64 @beans_list_decv_contains(ptr, i128)\n";
+    out += "declare i64 @beans_list_decv_index(ptr, i128, ptr)\n";
+    out += "declare void @beans_list_decv_sort(ptr)\n";
+    out += "declare void @beans_list_decv_sort_by(ptr, ptr, ptr)\n";
+    out += "declare void @beans_list_decv_sort_by_key(ptr, ptr, ptr)\n";
     out += "declare i64 @beans_map_remove(ptr, i64, i64, ptr, ptr)\n";
     out += "declare i64 @beans_map_remove_raw(ptr, i64)\n";
     out += "declare ptr @beans_map_keys(ptr)\n";
+    out += "declare ptr @beans_map_keys_typed(ptr, i64, i64)\n";
     out += "declare ptr @beans_map_values(ptr)\n";
     out += "declare void @beans_map_clear(ptr)\n";
     out += "declare i64 @beans_slot_mix(i64)\n";
@@ -7262,6 +9040,7 @@ std::string CodeGen::generate() {
     out += "declare i128 @beans_decv_abs(i128)\n";
     out += "declare i128 @beans_decv_round(i128, i64)\n";
     out += "declare i32 @beans_decv_cmp(i128, i128)\n";
+    out += "declare i64 @beans_decv_hash(i128)\n";
     out += "declare ptr @beans_decv_str(i128)\n";
     out += "declare i128 @beans_decv_from_int(i64)\n";
     out += "declare i128 @beans_decv_from_f64(double)\n";
@@ -7270,23 +9049,39 @@ std::string CodeGen::generate() {
     out += "declare i64 @beans_list_max(ptr, i64, ptr)\n";
     out += "declare i64 @beans_list_contains(ptr, i64, i64, ptr)\n";
     out += "declare ptr @beans_map_new(i64, i64, i64)\n";
+    out += "declare ptr @beans_map_new_typed_value(i64, i64, i64, i64, i64)\n";
     out += "declare ptr @beans_map_clone(ptr, i64, ptr)\n";
     out += "declare void @beans_map_reserve(ptr, i64, i64, ptr, i64, i64)\n";
     out += "declare void @beans_map_set(ptr, i64, i64, i64, ptr, ptr)\n";
+    out += "declare void @beans_map_set_typed(ptr, i64, ptr, i64, ptr, ptr)\n";
+    out += "declare void @beans_map_set_typed_raw(ptr, i64, ptr)\n";
     out += "declare i64 @beans_map_insert(ptr, i64, i64, i64, ptr, ptr)\n";
+    out += "declare i64 @beans_map_insert_typed(ptr, i64, ptr, i64, ptr, ptr)\n";
+    out += "declare i64 @beans_map_insert_typed_raw(ptr, i64, ptr)\n";
     out += "declare i64 @beans_map_get(ptr, i64, i64, ptr, ptr, ptr)\n";
+    out += "declare i64 @beans_map_get_typed(ptr, i64, i64, ptr, ptr, ptr)\n";
+    out += "declare i64 @beans_map_get_typed_raw(ptr, i64, ptr)\n";
     out += "declare void @beans_map_set_raw(ptr, i64, i64)\n";
+    out += "declare void @beans_map_add_raw(ptr, i64, i64)\n";
+    out += "declare void @beans_map_add(ptr, i64, i64, i64, ptr, ptr)\n";
     out += "declare i64 @beans_map_insert_raw(ptr, i64, i64)\n";
     out += "declare {i64, i64} @beans_map_get_raw(ptr, i64)\n";
     out += "declare i64 @beans_map_contains_raw(ptr, i64)\n";
-    out += "declare ptr @beans_thread_spawn(ptr, ptr)\n";
+    out += "declare ptr @beans_thread_spawn(ptr, ptr, i64)\n";
+    out += "declare ptr @beans_thread_spawn_typed(ptr, ptr, i64, i64)\n";
     out += "declare i64 @beans_thread_join(ptr)\n";
+    out += "declare void @beans_thread_join_typed(ptr, ptr, i64)\n";
     out += "declare ptr @beans_mutex_new(i64, i64)\n";
     out += "declare i64 @beans_mutex_lock(ptr)\n";
+    out += "declare ptr @beans_mutex_new_typed(ptr, i64, i64)\n";
+    out += "declare void @beans_mutex_lock_typed(ptr, ptr, i64)\n";
     out += "declare void @beans_mutex_unlock(ptr)\n";
     out += "declare ptr @beans_chan_new(i64, i64)\n";
+    out += "declare ptr @beans_chan_new_typed(i64, i64, i64)\n";
     out += "declare i64 @beans_chan_send(ptr, i64)\n";
+    out += "declare i64 @beans_chan_send_typed(ptr, ptr)\n";
     out += "declare i64 @beans_chan_recv(ptr, ptr)\n";
+    out += "declare i64 @beans_chan_recv_typed(ptr, ptr)\n";
     out += "declare void @beans_chan_close(ptr)\n";
     out += "declare ptr @beans_atomic_new(i64)\n";
     out += "declare i64 @beans_atomic_add(ptr, i64)\n";
@@ -7301,3659 +9096,5 @@ std::string CodeGen::generate() {
     return out;
 }
 
-const char* CodeGen::runtime_c() {
-    return R"RT(// beans native runtime — reference-counted heap + cycle collector.
-// Every heap value has a 16-byte header just before its payload:
-//   { long long rc, long long meta }   (rc ops turn atomic at first spawn)
-// meta bits 0-2 = kind, bits 3-60 = per-kind shape payload:
-//   0 leaf | 1 fixed (bitmask of pointer slots) | 2 list (elem_ptr)
-//   3 map (key_ptr | val_ptr<<1) | 4 chan (elem_ptr) | 5 mutex (inner_ptr)
-//   6 OS resource (shape bit 0: 0 = file — drop closes the fd,
-//                               1 = mmap — drop unmaps)
-//   7 arena (elem_ptr)
-// meta bits 61-62 = collector color, bit 63 = in the root buffer.
-// String constants carry an immortal header emitted by the compiler.
-//
-// Cycles: plain RC can't free A<->B. The collector is Bacon-Rajan trial
-// deletion (Nim's ORC family): a decrement that doesn't reach zero parks the
-// object as a possible cycle root; a collection trial-deletes each root's
-// subgraph, restores whatever still has external counts, frees the rest.
-// It only runs when no worker threads are live (checked in beans_alloc and
-// at exit), so the mutator is exactly one thread: ourselves, between
-// statements. Everything is iterative — a million-node ring must not
-// overflow the C stack.
-#include <dirent.h>
-#include <errno.h>
-#include <fcntl.h>
-#include <math.h>
-#include <pthread.h>
-#include <stdarg.h>
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-#include <sys/file.h>
-#include <sys/mman.h>
-#include <sys/stat.h>
-#include <time.h>
-#include <unistd.h>
-
-#define BEANS_IMMORTAL (1LL << 62)
-
-// rc layout: bits 0-47 the count, bits 48-59 the allocation size class
-// (0 = plain malloc), bit 62 immortal. Retain/release preserve the class
-// bits by adding/subtracting 1; every test of the COUNT must mask with
-// RC_COUNT, and class 4095 * 16 bytes stays far under the immortal bit.
-#define RC_CLS_SHIFT 48
-#define RC_CLS_MAX 4095LL
-#define RC_COUNT(v) ((v) & ((1LL << RC_CLS_SHIFT) - 1))
-// rc bit 61: this object's class chain has a deinit — user code runs when the
-// count hits zero. Lives in the rc word (not meta) so pointer-mask walkers and
-// shell frees never see it; retain/release arithmetic can't carry into it.
-#define RC_FIN (1LL << 61)
-
-// meta layout
-#define CC_SHAPE ((1LL << 61) - 1)
-#define CC_COLOR (3LL << 61)
-#define CC_BLACK 0LL
-#define CC_GRAY (1LL << 61)
-#define CC_WHITE (2LL << 61)
-#define CC_PURPLE (3LL << 61)
-#define CC_BUF ((long long)(1ULL << 63))
-
-typedef struct {
-    long long rc;
-    long long meta;
-} BHead;
-
-static BHead* head_of(void* p) { return (BHead*)((char*)p - 16); }
-
-// counts are plain until the first thread spawns (cc_mt flips before
-// pthread_create, so no object is ever touched by two threads while the
-// flag is 0); after that retain/release use atomic ops. The collector
-// keeps plain ops either way — it only runs with zero workers live.
-static int cc_mt;
-static int cc_is_mt(void) {
-    return __atomic_load_n(&cc_mt, __ATOMIC_RELAXED);
-}
-static void cc_enable_mt(void) {
-    __atomic_store_n(&cc_mt, 1, __ATOMIC_RELAXED);
-}
-static long long cc_color(BHead* h) { return h->meta & CC_COLOR; }
-static void cc_set_color(BHead* h, long long c) { h->meta = (h->meta & ~CC_COLOR) | c; }
-
-static _Atomic long long cc_threads;  // live worker threads; collect only at 0
-static _Atomic int cc_pending;
-static int cc_collecting;
-static void cc_collect(int force);
-
-// vtable slot of deinit, emitted by codegen (-1 when no class has one).
-// Deinit runs inside a release cascade, where allocation used to be
-// impossible — beans_in_deinit keeps the collector out of that window,
-// because a mid-destroy object must never be walked.
-extern long long beans_deinit_sel;
-// NOT thread-local: a TLS read compiles to a _tlv_get_addr call. A shared
-// flag is exactly as correct — the collector only runs with zero worker
-// threads, so "any thread is mid-deinit" is the right gate anyway. Plain
-// int + __atomic builtins (an _Atomic type rejects __atomic_add_fetch).
-static int beans_in_deinit;
-
-// Profile builds recompile the emitted runtime with -DBEANS_ARC_STATS.
-// Normal benchmark binaries do not contain these counters, so measuring
-// ownership traffic cannot change the timed result.
-#ifdef BEANS_ARC_STATS
-static unsigned long long arc_allocations;
-static unsigned long long arc_allocated_bytes;
-static unsigned long long arc_retain_calls;
-static unsigned long long arc_release_calls;
-static unsigned long long arc_release_nodes;
-static unsigned long long arc_freed_shells;
-static unsigned long long arc_possible_roots;
-static unsigned long long arc_collections;
-static unsigned long long arc_cycle_objects;
-#define ARC_ADD(name, value) \
-    __atomic_add_fetch(&(name), (unsigned long long)(value), __ATOMIC_RELAXED)
-static void arc_report(void) {
-    fprintf(stderr,
-            "beans arc stats: allocations=%llu allocated_bytes=%llu "
-            "retains=%llu releases=%llu release_nodes=%llu frees=%llu "
-            "possible_roots=%llu collections=%llu cycle_objects=%llu\n",
-            (unsigned long long)arc_allocations,
-            (unsigned long long)arc_allocated_bytes,
-            (unsigned long long)arc_retain_calls,
-            (unsigned long long)arc_release_calls,
-            (unsigned long long)arc_release_nodes,
-            (unsigned long long)arc_freed_shells,
-            (unsigned long long)arc_possible_roots,
-            (unsigned long long)arc_collections,
-            (unsigned long long)arc_cycle_objects);
-}
-__attribute__((constructor)) static void arc_setup(void) { atexit(arc_report); }
-#else
-#define ARC_ADD(name, value) ((void)0)
-#endif
-
-// deinit, before the children go — outlined and cold: the indirect call must
-// stay out of beans_release's hot loop or the optimizer treats every
-// iteration as clobbered (that cost 50% on the churn bench). Count up to 1
-// and FIN off first: user code in there may retain and release self without
-// re-entering death, and death can't run twice (husk and collector paths see
-// FIN already gone). Count back to 0 after: the husk filter frees a parked
-// shell only when RC_COUNT is 0, so the bump must not outlive the call (it
-// leaked a buffered object's shell once).
-__attribute__((noinline, cold, preserve_most)) static void beans_do_deinit(
-    void* p, BHead* h, long long nrc) {
-    if (cc_is_mt()) __atomic_store_n(&h->rc, (nrc + 1) & ~RC_FIN, __ATOMIC_RELAXED);
-    else h->rc = (nrc + 1) & ~RC_FIN;
-    void** descriptor = *(void***)p;
-    void (**methods)(void*) = (void (**)(void*))descriptor;
-    __atomic_add_fetch(&beans_in_deinit, 1, __ATOMIC_RELAXED);
-    methods[beans_deinit_sel + 1](p);
-    __atomic_sub_fetch(&beans_in_deinit, 1, __ATOMIC_RELAXED);
-    if (cc_is_mt()) __atomic_store_n(&h->rc, nrc & ~RC_FIN, __ATOMIC_RELAXED);
-    else h->rc = nrc & ~RC_FIN;
-}
-
-// segregated per-thread freelists over 64KB slabs: one calloc per slab,
-// then carve; a free pushes the block on the freeing thread's list. Slabs
-// are registered globally so the leaks tool sees every allocation as
-// reachable; blocks stranded on a dead worker's freelist sit inside a
-// registered slab (wasted until exit, never a leak). BEANS_NO_POOL=1
-// routes everything through plain calloc/free so `leaks` can see
-// individual beans objects again when hunting a real leak.
-#define POOL_CLASSES 64 // pooled sizes 16..1008 bytes; bigger goes to malloc
-#define POOL_SLAB (64 << 10)
-static _Thread_local void* pool_free[POOL_CLASSES];
-static _Thread_local char* pool_cur;
-static _Thread_local char* pool_end;
-static void** pool_slabs;
-static long long pool_slab_len, pool_slab_cap;
-static pthread_mutex_t pool_mu = PTHREAD_MUTEX_INITIALIZER;
-static int pool_off;
-__attribute__((constructor)) static void pool_setup(void) {
-    pool_off = getenv("BEANS_NO_POOL") != NULL;
-}
-
-void beans_panic(const char* msg, long long line, long long col);
-void* beans_alloc(long long size, long long meta) {
-    ARC_ADD(arc_allocations, 1);
-    ARC_ADD(arc_allocated_bytes, size);
-    // allocation is the one safe point: never inside a release cascade,
-    // and every stored reference is already counted (a deinit body is the
-    // exception — cc_collect itself bails while one runs, so this exact
-    // condition stays byte-identical to keep clang's fast-path layout)
-    if (cc_pending && !cc_collecting && cc_threads == 0) cc_collect(0);
-    size_t total = (16 + (size_t)size + 15) & ~(size_t)15;
-    long long cls = (long long)(total >> 4);
-    BHead* h;
-    if (cls < POOL_CLASSES && !pool_off) {
-        if (pool_free[cls]) {
-            h = pool_free[cls];
-            pool_free[cls] = *(void**)h;
-            memset(h, 0, total); // recycled block; callers expect zeroed slots
-        } else {
-            if (!pool_cur || pool_cur + total > pool_end) {
-                pool_cur = calloc(1, POOL_SLAB);
-                if (!pool_cur) beans_panic("out of memory", 0, 0);
-                pool_end = pool_cur + POOL_SLAB;
-                pthread_mutex_lock(&pool_mu);
-                if (pool_slab_len == pool_slab_cap) {
-                    pool_slab_cap = pool_slab_cap ? pool_slab_cap * 2 : 64;
-                    pool_slabs = realloc(pool_slabs,
-                                         (size_t)pool_slab_cap * sizeof(void*));
-                }
-                pool_slabs[pool_slab_len++] = pool_cur;
-                pthread_mutex_unlock(&pool_mu);
-            }
-            h = (BHead*)pool_cur; // virgin slab memory, already zero
-            pool_cur += total;
-        }
-        h->rc = 1 | (cls << RC_CLS_SHIFT);
-    } else {
-        h = calloc(1, total);
-        if (!h) beans_panic("out of memory", 0, 0);
-        h->rc = 1;
-    }
-    h->meta = meta;
-    return (char*)h + 16;
-}
-
-void beans_retain(void* p) {
-    if (!p) return;
-    ARC_ADD(arc_retain_calls, 1);
-    BHead* h = head_of(p);
-    if (cc_is_mt()) {
-        if (__atomic_load_n(&h->rc, __ATOMIC_RELAXED) >= BEANS_IMMORTAL) return;
-        __atomic_add_fetch(&h->rc, 1, __ATOMIC_RELAXED);
-    } else {
-        if (h->rc >= BEANS_IMMORTAL) return;
-        h->rc += 1;
-    }
-}
-
-void beans_release(void* p);
-
-typedef struct {
-    long long* data;
-    long long len, cap;
-} BList;
-typedef struct {
-    long long* data;
-    long long len, cap;
-} BArena;
-typedef struct {
-    long long* data; // key,value interleaved — len stays at
-    long long len, cap; // offset 8: map.len() is a direct field load in IR
-    // open-addressed index over data: (hash hi32 << 32) | (pos+2), 0 empty,
-    // 1 tombstone. NULL until the map outgrows a linear scan.
-    unsigned long long* idx;
-    long long icap, tombs;
-    // OrderedMap removal leaves stable holes. Plain Map swap-removes and keeps
-    // used == len. deadbits NULL means there are no holes.
-    long long used;
-    unsigned long long* deadbits;
-    long long ordered;
-} BMap;
-typedef struct {
-    pthread_mutex_t m;
-    pthread_cond_t can_send, can_recv;
-    long long* q;
-    long long head, count, cap;
-    int closed;
-} BChan;
-typedef struct {
-    pthread_mutex_t m;
-    long long inner;
-} BMutex;
-
-// one shape-walker for destruction and all collector phases
-static void cc_walk(void* p, long long meta, void (*fn)(void*, void*), void* ctx) {
-    long long kind = meta & 7;
-    long long extra = (meta & CC_SHAPE) >> 3;
-    if (kind == 1) { // fixed: marked 8-byte slots
-        for (int i = 0; i < 58 && (extra >> i); i++) {
-            if ((extra >> i) & 1) {
-                void* c = *(void**)((char*)p + 8 * i);
-                if (c) fn(c, ctx);
-            }
-        }
-    } else if (kind == 2) {
-        BList* l = p;
-        if (extra & 1) {
-            for (long long i = 0; i < l->len; i++) {
-                if (l->data[i]) fn((void*)l->data[i], ctx);
-            }
-        }
-    } else if (kind == 3) {
-        BMap* m = p;
-        for (long long i = 0; i < m->used; i++) { // holes are zeroed: null-skip
-            if ((extra & 1) && m->data[i * 2]) fn((void*)m->data[i * 2], ctx);
-            if ((extra & 2) && m->data[i * 2 + 1]) fn((void*)m->data[i * 2 + 1], ctx);
-        }
-    } else if (kind == 4) {
-        BChan* c = p;
-        if (extra & 1) {
-            for (long long i = 0; i < c->count; i++) {
-                long long v = c->q[(c->head + i) % c->cap];
-                if (v) fn((void*)v, ctx);
-            }
-        }
-    } else if (kind == 5) {
-        BMutex* mu = p;
-        if ((extra & 1) && mu->inner) fn((void*)mu->inner, ctx);
-    } else if (kind == 7) {
-        BArena* arena = p;
-        if (extra & 1) {
-            for (long long i = 0; i < arena->len; i++) {
-                if (arena->data[i]) fn((void*)arena->data[i], ctx);
-            }
-        }
-    }
-}
-
-typedef struct {
-    long long fd;
-    long long closed;
-} BFile;
-typedef struct {
-    char* p;
-    long long len;
-    long long fd;
-    long long writable;
-    long long closed;
-} BMMap;
-
-typedef struct {
-    long long strong;
-    long long weak;
-    long long value;
-    long long value_ptr;
-} BSharedCtrl;
-typedef struct { BSharedCtrl* ctrl; } BSharedHandle;
-
-// kind 6, extra 2 = strong handle, extra 3 = weak handle. The control block
-// owns exactly one payload reference while any strong handle exists. Return
-// that child when the final strong shell dies so beans_release can keep its
-// existing iterative cascade.
-static void* shared_shell_drop(void* p, long long extra) {
-    BSharedCtrl* ctrl = ((BSharedHandle*)p)->ctrl;
-    if (extra & 1) {
-        if (__atomic_fetch_sub(&ctrl->weak, 1, __ATOMIC_ACQ_REL) == 1) free(ctrl);
-        return NULL;
-    }
-    void* child = NULL;
-    if (__atomic_fetch_sub(&ctrl->strong, 1, __ATOMIC_ACQ_REL) == 1) {
-        if (ctrl->value_ptr) child = (void*)ctrl->value;
-        ctrl->value = 0;
-        if (__atomic_fetch_sub(&ctrl->weak, 1, __ATOMIC_ACQ_REL) == 1) free(ctrl);
-    }
-    return child;
-}
-
-// free the box and its side allocations WITHOUT touching child refs
-static void* cc_free_shell(void* p, long long meta) {
-    ARC_ADD(arc_freed_shells, 1);
-    long long kind = meta & 7;
-    long long extra = (meta & CC_SHAPE) >> 3;
-    void* deferred_child = NULL;
-    if (kind == 2) free(((BList*)p)->data);
-    else if (kind == 7) free(((BArena*)p)->data);
-    else if (kind == 3) {
-        free(((BMap*)p)->data);
-        free(((BMap*)p)->idx);
-        free(((BMap*)p)->deadbits);
-    } else if (kind == 4) free(((BChan*)p)->q);
-    else if (kind == 6 && (extra & 2)) {
-        deferred_child = shared_shell_drop(p, extra);
-    } else if (kind == 6) { // OS resource — dropping the last ref is the safety
-        // close whatever is still open at the OS level, whether the handle was
-        // never closed or its close was deferred while threads ran (fd/p left
-        // valid, the logical `closed` flag already set). The last ref is gone,
-        // so no thread can be mid-op here — releasing now is safe.
-        if ((meta & CC_SHAPE) >> 3 & 1) { // shape bit 0: 0 = file, 1 = mmap
-            BMMap* m = p;
-            if (m->p) munmap(m->p, (size_t)m->len);
-            if (m->fd >= 0) close((int)m->fd);
-        } else {
-            BFile* f = p; // net; close() / f.close() is the real API
-            if (f->fd >= 0) close((int)f->fd);
-        }
-    }
-    BHead* h = head_of(p);
-    long long cls = (h->rc >> RC_CLS_SHIFT) & RC_CLS_MAX;
-    if (cls) {
-        *(void**)h = pool_free[cls];
-        pool_free[cls] = h;
-    } else {
-        free(h);
-    }
-    return deferred_child;
-}
-
-// explicit work stack, shared by release cascades and all collector phases
-typedef struct {
-    void** v;
-    long long len, cap;
-    void** local;
-} CCStack;
-static void cc_push(CCStack* s, void* p) {
-    if (s->len == s->cap) {
-        long long next = s->cap ? s->cap * 2 : 4096;
-        void** grown = malloc((size_t)next * sizeof(void*));
-        if (s->len) memcpy(grown, s->v, (size_t)s->len * sizeof(void*));
-        if (s->v != s->local) free(s->v);
-        s->v = grown;
-        s->cap = next;
-    }
-    s->v[s->len++] = p;
-}
-static void cc_visit_push(void* c, void* ctx) {
-    BHead* h = head_of(c);
-    long long rc = cc_is_mt() ? __atomic_load_n(&h->rc, __ATOMIC_RELAXED) : h->rc;
-    if (rc >= BEANS_IMMORTAL) return;
-    cc_push(ctx, c);
-}
-
-// Release cascades overwhelmingly walk fixed class objects. Keep this path
-// direct: the collector still uses the generic callback walker, but ordinary
-// ARC death should not pay an indirect call for every child.
-static inline void cc_release_children(void* p, long long meta, CCStack* st) {
-    long long kind = meta & 7;
-    long long extra = (meta & CC_SHAPE) >> 3;
-    if (kind != 1) {
-        cc_walk(p, meta, cc_visit_push, st);
-        return;
-    }
-    for (int i = 0; i < 58 && (extra >> i); i++) {
-        if (!((extra >> i) & 1)) continue;
-        void* child = *(void**)((char*)p + 8 * i);
-        if (!child) continue;
-        BHead* h = head_of(child);
-        long long rc = cc_is_mt() ? __atomic_load_n(&h->rc, __ATOMIC_RELAXED)
-                                  : h->rc;
-        if (rc < BEANS_IMMORTAL) cc_push(st, child);
-    }
-}
-
-// ---- possible-root buffer ----
-static void** cc_roots;
-static long long cc_len, cc_cap;
-static long long cc_threshold = 256;
-static pthread_mutex_t cc_mu = PTHREAD_MUTEX_INITIALIZER;
-
-static void cc_possible_root(void* p) {
-    BHead* h = head_of(p);
-    long long old = __atomic_fetch_or(&h->meta, CC_PURPLE | CC_BUF, __ATOMIC_RELAXED);
-    if (old & CC_BUF) return; // already parked
-    ARC_ADD(arc_possible_roots, 1);
-    // like the counts, the buffer goes unlocked until the first spawn: one
-    // thread exists, and after cc_mt flips every park takes the mutex
-    if (cc_is_mt()) pthread_mutex_lock(&cc_mu);
-    if (cc_len == cc_cap) {
-        cc_cap = cc_cap ? cc_cap * 2 : 1024;
-        cc_roots = realloc(cc_roots, (size_t)cc_cap * sizeof(void*));
-    }
-    cc_roots[cc_len++] = p;
-    if (cc_len >= cc_threshold) cc_pending = 1;
-    if (cc_is_mt()) pthread_mutex_unlock(&cc_mu);
-}
-
-// iterative: a dropped million-node chain pushes children on an explicit
-// stack instead of recursing the C stack. The stack stays empty (no malloc)
-// unless a death actually cascades.
-void beans_release(void* p) {
-    if (!p) return;
-    ARC_ADD(arc_release_calls, 1);
-    void* local[64];
-    CCStack st = {local, 0, 64, local};
-    void* cur = p;
-    for (;;) {
-        ARC_ADD(arc_release_nodes, 1);
-        BHead* h = head_of(cur);
-        long long rc0 = cc_is_mt() ? __atomic_load_n(&h->rc, __ATOMIC_RELAXED) : h->rc;
-        if (rc0 < BEANS_IMMORTAL) {
-            long long nrc = cc_is_mt() ? __atomic_sub_fetch(&h->rc, 1, __ATOMIC_ACQ_REL)
-                                  : (h->rc -= 1);
-            if (RC_COUNT(nrc) == 0) {
-                long long meta = h->meta;
-                // FIN is only ever set on class objects, so it alone decides
-                if (__builtin_expect(nrc & RC_FIN, 0)) {
-                    beans_do_deinit(cur, h, nrc);
-                    meta = h->meta; // colors can move while user code runs
-                }
-                cc_release_children(cur, meta, &st);
-                if (meta & CC_BUF) {
-                    // parked — the buffer still points here, so the collector
-                    // frees the shell later; mark black: this is a dead husk
-                    __atomic_and_fetch(&h->meta, ~CC_COLOR, __ATOMIC_RELAXED);
-                } else {
-                    void* child = cc_free_shell(cur, meta);
-                    if (child) cc_push(&st, child);
-                }
-            } else {
-                // could this shape sit on a cycle? leaves, pointer-free
-                // containers, and objects with an empty pointer mask never can
-                // — a cycle member needs an outgoing edge — which keeps
-                // int-field churn off the buffer
-                long long meta = h->meta;
-                long long kind = meta & 7;
-                int cyclic = (kind == 1 && ((meta & CC_SHAPE) >> 3) != 0) ||
-                             (kind == 3 && (meta & (3LL << 3))) ||
-                             ((kind == 2 || kind == 4 || kind == 5 || kind == 7) &&
-                              (meta & (1LL << 3)));
-                if (cyclic) cc_possible_root(cur);
-            }
-        }
-        if (!st.len) break;
-        cur = st.v[--st.len];
-    }
-    if (st.v != local) free(st.v);
-}
-
-// Box owns one slot. Checked Beans treats the outer handle as move-only; the
-// RC header is still used for uniform frame cleanup and cycle walking.
-void* beans_raw_alloc(long long count, long long size, long long line, long long col) {
-    if (count < 0) beans_panic("negative raw allocation count", line, col);
-    if (size <= 0 || count > (1LL << 58) / size)
-        beans_panic("raw allocation too large", line, col);
-    void* p = calloc((size_t)count, (size_t)size);
-    if (!p && count) beans_panic("out of memory", line, col);
-    return p;
-}
-void beans_raw_free(void* p) { free(p); }
-void beans_raw_copy(void* destination, void* source, long long count, long long size,
-                    long long line, long long col) {
-    if (count < 0) beans_panic("negative raw copy count", line, col);
-    if (size <= 0 || count > (1LL << 58) / size)
-        beans_panic("raw copy too large", line, col);
-    if (count && (!destination || !source))
-        beans_panic("null raw pointer copy", line, col);
-    memmove(destination, source, (size_t)count * (size_t)size);
-}
-void beans_raw_zero(void* destination, long long count, long long size,
-                    long long line, long long col) {
-    if (count < 0) beans_panic("negative raw zero count", line, col);
-    if (size <= 0 || count > (1LL << 58) / size)
-        beans_panic("raw zero too large", line, col);
-    if (count && !destination) beans_panic("null raw pointer zero", line, col);
-    memset(destination, 0, (size_t)count * (size_t)size);
-}
-
-void* beans_box_new(long long value, long long value_ptr) {
-    long long* box = beans_alloc(8, 1 | (value_ptr << 3));
-    box[0] = value;
-    return box;
-}
-long long beans_box_get(void* p) { return ((long long*)p)[0]; }
-void beans_box_set(void* p, long long value) {
-    long long* box = p;
-    if (((head_of(p)->meta & CC_SHAPE) >> 3) & 1) {
-        void* old = (void*)box[0];
-        if (old) beans_release(old);
-    }
-    box[0] = value;
-}
-
-void* beans_shared_new(long long value, long long value_ptr) {
-    BSharedCtrl* ctrl = calloc(1, sizeof(BSharedCtrl));
-    if (!ctrl) beans_panic("out of memory", 0, 0);
-    ctrl->strong = 1;
-    ctrl->weak = 1; // implicit weak held until strong reaches zero
-    ctrl->value = value;
-    ctrl->value_ptr = value_ptr;
-    BSharedHandle* handle = beans_alloc(sizeof(BSharedHandle), 6 | (2LL << 3));
-    handle->ctrl = ctrl;
-    return handle;
-}
-long long beans_shared_get(void* p) {
-    return ((BSharedHandle*)p)->ctrl->value;
-}
-void* beans_shared_downgrade(void* p) {
-    BSharedCtrl* ctrl = ((BSharedHandle*)p)->ctrl;
-    __atomic_add_fetch(&ctrl->weak, 1, __ATOMIC_RELAXED);
-    BSharedHandle* weak = beans_alloc(sizeof(BSharedHandle), 6 | (3LL << 3));
-    weak->ctrl = ctrl;
-    return weak;
-}
-void* beans_weak_upgrade(void* p) {
-    BSharedCtrl* ctrl = ((BSharedHandle*)p)->ctrl;
-    long long strong = __atomic_load_n(&ctrl->strong, __ATOMIC_ACQUIRE);
-    while (strong > 0) {
-        if (__atomic_compare_exchange_n(&ctrl->strong, &strong, strong + 1, 1,
-                                        __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
-            BSharedHandle* handle =
-                beans_alloc(sizeof(BSharedHandle), 6 | (2LL << 3));
-            handle->ctrl = ctrl;
-            return handle;
-        }
-    }
-    return NULL;
-}
-long long beans_weak_expired(void* p) {
-    BSharedCtrl* ctrl = ((BSharedHandle*)p)->ctrl;
-    return __atomic_load_n(&ctrl->strong, __ATOMIC_ACQUIRE) == 0;
-}
-
-void* beans_arena_new(long long capacity, long long elem_ptr,
-                      long long line, long long col) {
-    if (capacity < 0) {
-        char msg[96];
-        snprintf(msg, sizeof msg, "negative arena capacity %lld", capacity);
-        beans_panic(msg, line, col);
-    }
-    if (capacity > (1LL << 58)) beans_panic("arena capacity too large", line, col);
-    BArena* arena = beans_alloc(sizeof(BArena), 7 | (elem_ptr << 3));
-    if (capacity) {
-        arena->data = calloc((size_t)capacity, sizeof(long long));
-        if (!arena->data) beans_panic("out of memory", line, col);
-    }
-    arena->cap = capacity;
-    return arena;
-}
-long long beans_arena_put(void* p, long long value) {
-    BArena* arena = p;
-    if (arena->len == arena->cap) {
-        long long next = arena->cap ? arena->cap * 2 : 8;
-        long long* data = realloc(arena->data, (size_t)next * sizeof(long long));
-        if (!data) beans_panic("out of memory", 0, 0);
-        arena->data = data;
-        arena->cap = next;
-    }
-    long long handle = arena->len++;
-    arena->data[handle] = value;
-    return handle;
-}
-long long beans_arena_get(void* p, long long handle, long long* ok) {
-    BArena* arena = p;
-    if (handle < 0 || handle >= arena->len) {
-        *ok = 0;
-        return 0;
-    }
-    *ok = 1;
-    return arena->data[handle];
-}
-long long beans_arena_at(void* p, long long handle, long long line, long long col) {
-    BArena* arena = p;
-    if (handle < 0 || handle >= arena->len) {
-        char msg[112];
-        snprintf(msg, sizeof msg, "arena handle %lld out of range (len %lld)",
-                 handle, arena->len);
-        beans_panic(msg, line, col);
-    }
-    return arena->data[handle];
-}
-long long beans_arena_len(void* p) { return ((BArena*)p)->len; }
-void beans_arena_clear(void* p) {
-    BArena* arena = p;
-    if (((head_of(p)->meta & CC_SHAPE) >> 3) & 1) {
-        for (long long i = 0; i < arena->len; i++) {
-            if (arena->data[i]) beans_release((void*)arena->data[i]);
-        }
-    }
-    arena->len = 0;
-}
-
-// ---- the collector (single mutator: us) ----
-
-static void cc_visit_dec_push(void* c, void* ctx) {
-    BHead* h = head_of(c);
-    if (h->rc >= BEANS_IMMORTAL) return;
-    h->rc -= 1; // trial deletion: one decrement per internal edge
-    cc_push(ctx, c);
-}
-static void cc_mark_gray(void* root, CCStack* st) {
-    cc_push(st, root);
-    while (st->len) {
-        void* p = st->v[--st->len];
-        BHead* h = head_of(p);
-        if (cc_color(h) == CC_GRAY) continue;
-        cc_set_color(h, CC_GRAY);
-        cc_walk(p, h->meta, cc_visit_dec_push, st);
-    }
-}
-
-static void cc_visit_inc_push(void* c, void* ctx) {
-    BHead* h = head_of(c);
-    if (h->rc >= BEANS_IMMORTAL) return;
-    h->rc += 1; // undo the trial deletion along this edge
-    if (cc_color(h) != CC_BLACK) {
-        cc_set_color(h, CC_BLACK);
-        cc_push(ctx, c);
-    }
-}
-static void cc_scan_black(void* root, CCStack* st) {
-    cc_set_color(head_of(root), CC_BLACK);
-    cc_push(st, root);
-    while (st->len) {
-        void* p = st->v[--st->len];
-        cc_walk(p, head_of(p)->meta, cc_visit_inc_push, st);
-    }
-}
-
-static void cc_scan(void* root, CCStack* st, CCStack* aux) {
-    cc_push(st, root);
-    while (st->len) {
-        void* p = st->v[--st->len];
-        BHead* h = head_of(p);
-        if (cc_color(h) != CC_GRAY) continue;
-        if (RC_COUNT(h->rc) > 0) {
-            cc_scan_black(p, aux); // externally referenced — restore it all
-        } else {
-            cc_set_color(h, CC_WHITE);
-            cc_walk(p, h->meta, cc_visit_push, st);
-        }
-    }
-}
-
-static void cc_collect_white(void* root, CCStack* st, CCStack* dead) {
-    cc_push(st, root);
-    while (st->len) {
-        void* p = st->v[--st->len];
-        BHead* h = head_of(p);
-        if (cc_color(h) != CC_WHITE || (h->meta & CC_BUF)) continue;
-        cc_set_color(h, CC_BLACK); // visited; prevents duplicate frees
-        cc_walk(p, h->meta, cc_visit_push, st);
-        cc_push(dead, p);
-    }
-}
-
-static long long cc_walk_min = 256; // adaptive gate for trial deletion
-
-static void cc_collect(int force) {
-    if (cc_collecting) return;
-    // a deinit body is user code running mid-cascade: its allocations must
-    // not start a collection — a mid-destroy object must never be walked.
-    // cc_pending stays set, so the next allocation after the cascade retries.
-    if (__atomic_load_n(&beans_in_deinit, __ATOMIC_RELAXED)) return;
-    ARC_ADD(arc_collections, 1);
-    cc_collecting = 1;
-    if (cc_is_mt()) pthread_mutex_lock(&cc_mu);
-
-    // keep only live purple candidates; zombies (released while parked)
-    // just need their shells freed, everything else drops out
-    long long n = 0;
-    for (long long i = 0; i < cc_len; i++) {
-        void* p = cc_roots[i];
-        BHead* h = head_of(p);
-        if (cc_color(h) == CC_PURPLE && RC_COUNT(h->rc) > 0) {
-            cc_roots[n++] = p;
-        } else {
-            __atomic_and_fetch(&h->meta, ~CC_BUF, __ATOMIC_RELAXED);
-            if (RC_COUNT(h->rc) == 0) {
-                void* child = cc_free_shell(p, h->meta);
-                if (child) beans_release(child);
-            }
-        }
-    }
-    cc_len = n;
-
-    // The filter above is the cheap half and just ran: husk shells free at
-    // a steady cadence, so they can never pile past survivors + 256. Trial
-    // deletion is the expensive half — it walks everything reachable from
-    // the survivors — so it only runs once enough purple candidates pile
-    // up, and it backs off hard when a walk frees nothing: a live tree
-    // that gets borrow-pinned on every visit must not be re-walked every
-    // few hundred allocations (that made binary-trees 10x slower than Go).
-    if (cc_len && (force || cc_len >= cc_walk_min)) {
-        CCStack st = {0, 0, 0}, aux = {0, 0, 0}, dead = {0, 0, 0};
-        for (long long i = 0; i < cc_len; i++) cc_mark_gray(cc_roots[i], &st);
-        for (long long i = 0; i < cc_len; i++) cc_scan(cc_roots[i], &st, &aux);
-        for (long long i = 0; i < cc_len; i++) {
-            BHead* h = head_of(cc_roots[i]);
-            __atomic_and_fetch(&h->meta, ~CC_BUF, __ATOMIC_RELAXED);
-            cc_collect_white(cc_roots[i], &st, &dead);
-        }
-        cc_len = 0;
-        ARC_ADD(arc_cycle_objects, dead.len);
-        // nothing was freed while walking, so no stale pointer was ever
-        // read; now the whole white set goes at once
-        for (long long i = 0; i < dead.len; i++) {
-            void* child = cc_free_shell(dead.v[i], head_of(dead.v[i])->meta);
-            if (child) beans_release(child);
-        }
-        cc_walk_min = dead.len ? 256
-                               : (cc_walk_min * 4 > (1LL << 18) ? (1LL << 18)
-                                                                : cc_walk_min * 4);
-        free(st.v);
-        free(aux.v);
-        free(dead.v);
-    }
-    // geometric re-arm: survivors stay parked, so the next filter may scan
-    // them again — amortized O(1) per park only if the buffer must grow by
-    // its own size first. Husk shells thus wait at most 2·survivors + 256
-    // parks, which keeps RSS flat in practice (husk-heavy programs have few
-    // long-lived survivors)
-    cc_threshold = cc_len * 2 + 256;
-    cc_pending = 0;
-    if (cc_is_mt()) pthread_mutex_unlock(&cc_mu);
-    cc_collecting = 0;
-}
-
-static void cc_at_exit(void) {
-    if (cc_threads == 0) cc_collect(1); // forced: leaks must see 0 at exit
-}
-__attribute__((constructor)) static void cc_setup(void) { atexit(cc_at_exit); }
-
-void beans_panic(const char* msg, long long line, long long col) {
-    fflush(stdout); // ordered output: buffered stdout before the stderr panic
-    fprintf(stderr, "runtime panic at %lld:%lld: %s\n", line, col, msg);
-    exit(3);
-}
-// list bounds — message matches the interpreter's, index and length included
-void beans_panic_index(long long i, long long len, long long has_len,
-                       long long line, long long col) {
-    char b[96];
-    if (has_len) snprintf(b, sizeof b, "list index %lld out of range (len %lld)", i, len);
-    else snprintf(b, sizeof b, "list index %lld out of range", i);
-    beans_panic(b, line, col);
-}
-void beans_panic_array_index(long long i, long long len,
-                             long long line, long long col) {
-    char b[96];
-    snprintf(b, sizeof b, "array index %lld out of range (len %lld)", i, len);
-    beans_panic(b, line, col);
-}
-void beans_panic_slice_index(long long i, long long len,
-                             long long line, long long col) {
-    char b[96];
-    snprintf(b, sizeof b, "slice index %lld out of range (len %lld)", i, len);
-    beans_panic(b, line, col);
-}
-
-// ---- strings (leaf allocations) ----
-// a string's byte length lives in its meta shape bits (kind 0 uses none of
-// bits 3-60), so len is O(1) and never strlen. Read through beans_slen —
-// masking with CC_SHAPE is mandatory, colors share the word.
-static long long beans_slen(char* s) { return (head_of(s)->meta & CC_SHAPE) >> 3; }
-static char* str_make(const char* p, long long n);
-static char* rc_strdup(const char* s) {
-    size_t n = strlen(s);
-    char* r = beans_alloc((long long)n + 1, (long long)n << 3);
-    memcpy(r, s, n + 1);
-    return r;
-}
-// hand-rolled digits: snprintf("%lld") was ~1/3 of the string-build loop in
-// the strings bench (vfprintf machinery per call); this matches its output
-// byte for byte
-static long long uint_digits(unsigned long long v) {
-    long long n = 1;
-    while (v >= 10) { v /= 10; n += 1; }
-    return n;
-}
-static char* write_uint(char* out, unsigned long long v) {
-    long long n = uint_digits(v);
-    char* end = out + n;
-    char* p = end;
-    do {
-        *--p = (char)('0' + v % 10);
-        v /= 10;
-    } while (v);
-    return end;
-}
-static long long int_digits(long long v) {
-    unsigned long long u =
-        v < 0 ? (unsigned long long)-(v + 1) + 1 : (unsigned long long)v;
-    return uint_digits(u) + (v < 0);
-}
-static char* write_int(char* out, long long v) {
-    unsigned long long u =
-        v < 0 ? (unsigned long long)-(v + 1) + 1 : (unsigned long long)v;
-    if (v < 0) *out++ = '-';
-    return write_uint(out, u);
-}
-char* beans_from_int(long long v) {
-    char b[24];
-    char* e = b + sizeof b;
-    char* p = e;
-    unsigned long long u =
-        v < 0 ? (unsigned long long)-(v + 1) + 1 : (unsigned long long)v;
-    do {
-        *--p = (char)('0' + u % 10);
-        u /= 10;
-    } while (u);
-    if (v < 0) *--p = '-';
-    return str_make(p, e - p);
-}
-char* beans_from_uint(unsigned long long v) {
-    char b[24];
-    char* e = b + sizeof b;
-    char* p = e;
-    do {
-        *--p = (char)('0' + v % 10);
-        v /= 10;
-    } while (v);
-    return str_make(p, e - p);
-}
-char* beans_from_float(double v) {
-    char b[48];
-    snprintf(b, sizeof b, "%.10g", v);
-    return rc_strdup(b);
-}
-char* beans_from_bool(int v) { return rc_strdup(v ? "true" : "false"); }
-char* beans_concat(char* a, char* b) {
-    size_t la = (size_t)beans_slen(a), lb = (size_t)beans_slen(b);
-    char* r = beans_alloc((long long)(la + lb + 1), (long long)(la + lb) << 3);
-    memcpy(r, a, la);
-    memcpy(r + la, b, lb + 1);
-    return r;
-}
-char* beans_interpolate(long long n, ...) {
-    va_list ap;
-    va_start(ap, n);
-    long long total = 0;
-    for (long long i = 0; i < n; i++) {
-        long long kind = va_arg(ap, long long);
-        if (kind == 0) {
-            total += beans_slen(va_arg(ap, char*));
-        } else if (kind == 1) {
-            total += int_digits(va_arg(ap, long long));
-        } else if (kind == 2) {
-            total += uint_digits(va_arg(ap, unsigned long long));
-        } else if (kind == 3) {
-            char b[48];
-            total += snprintf(b, sizeof b, "%.10g", va_arg(ap, double));
-        } else {
-            total += va_arg(ap, int) ? 4 : 5;
-        }
-    }
-    va_end(ap);
-    char* r = beans_alloc(total + 1, total << 3);
-    char* w = r;
-    va_start(ap, n);
-    for (long long i = 0; i < n; i++) {
-        long long kind = va_arg(ap, long long);
-        if (kind == 0) {
-            char* part = va_arg(ap, char*);
-            long long len = beans_slen(part);
-            memcpy(w, part, (size_t)len);
-            w += len;
-        } else if (kind == 1) {
-            w = write_int(w, va_arg(ap, long long));
-        } else if (kind == 2) {
-            w = write_uint(w, va_arg(ap, unsigned long long));
-        } else if (kind == 3) {
-            char b[48];
-            int len = snprintf(b, sizeof b, "%.10g", va_arg(ap, double));
-            memcpy(w, b, (size_t)len);
-            w += len;
-        } else {
-            int value = va_arg(ap, int);
-            const char* text = value ? "true" : "false";
-            long long len = value ? 4 : 5;
-            memcpy(w, text, (size_t)len);
-            w += len;
-        }
-    }
-    va_end(ap);
-    return r;
-}
-// strings carry their byte length and may legally hold NUL (\0 escapes,
-// File.read) — every consumer here is length-based; C-string fns like fputs,
-// strcmp, and strstr would silently stop at the first NUL and diverge from
-// the interpreter
-static char* str_make(const char* p, long long n);
-void beans_println(char* s) {
-    fwrite(s, 1, (size_t)beans_slen(s), stdout);
-    fputc('\n', stdout);
-}
-void beans_print(char* s) { fwrite(s, 1, (size_t)beans_slen(s), stdout); }
-// std::string semantics: bytes compare unsigned over the shorter length,
-// ties break on length
-int beans_str_cmp(char* a, char* b) {
-    long long la = beans_slen(a), lb = beans_slen(b);
-    long long n = la < lb ? la : lb;
-    int c = n ? memcmp(a, b, (size_t)n) : 0;
-    if (c) return c;
-    return la < lb ? -1 : la > lb ? 1 : 0;
-}
-long long beans_str_len(char* s) { return beans_slen(s); }
-char* beans_str_last(char* s, long long n) {
-    long long len = beans_slen(s);
-    if (n < 0) n = 0;
-    if (n > len) n = len;
-    return str_make(s + (len - n), n);
-}
-// leftmost match: memchr for the first byte (SIMD in libc), memcmp for the
-// tail. memcmp-at-every-offset made contains/replace/split the hot spot of
-// the strings bench, 2x behind Go's bytealg search.
-static long long str_search(const char* s, long long n, const char* sub,
-                            long long m, long long from) {
-    if (m > n - from) return -1;
-    if (m == 0) return from;
-    const char* end = s + n;
-    const char* p = s + from;
-    for (;;) {
-        long long room = (end - p) - (m - 1);
-        if (room <= 0) return -1;
-        const char* hit = memchr(p, sub[0], (size_t)room);
-        if (!hit) return -1;
-        if (m == 1 || memcmp(hit + 1, sub + 1, (size_t)(m - 1)) == 0) {
-            return hit - s;
-        }
-        p = hit + 1;
-    }
-}
-long long beans_str_contains(char* s, char* sub) {
-    long long n = beans_slen(s), m = beans_slen(sub);
-    if (m == 0) return 1;
-    return str_search(s, n, sub, m, 0) >= 0;
-}
-
-// a ready-made Error box: [vtable null][-1][msg][kind] — the exact 32-byte
-// layout codegen's make_error builds; meta 97 marks slots 2 and 3 as pointers
-static void* mk_error(const char* msg, const char* kind) {
-    long long* e = beans_alloc(32, 97);
-    e[1] = -1;
-    e[2] = (long long)rc_strdup(msg);
-    e[3] = (long long)rc_strdup(kind);
-    return e;
-}
-// like mk_error, but msg is already an rc string carrying its exact byte
-// length — user text can hold NUL and must not pass through strlen
-static void* mk_error_own(char* msg_rc, const char* kind) {
-    long long* e = beans_alloc(32, 97);
-    e[1] = -1;
-    e[2] = (long long)msg_rc;
-    e[3] = (long long)rc_strdup(kind);
-    return e;
-}
-
-// fallible-builtin ABI: 16 bytes so C and IR both return it in registers.
-// err null = ok(val); err set = a ready Error object the caller boxes.
-typedef struct {
-    long long val;
-    void* err;
-} BRes;
-
-static BRes parse_fail(const char* s, const char* what) {
-    // s is the beans receiver string — splice it by its stored length so an
-    // embedded NUL keeps the message byte-identical to the interpreter's
-    const char* p1 = "can't read '";
-    const char* p2 = "' as ";
-    long long ls = beans_slen((char*)s);
-    size_t l1 = strlen(p1), l2 = strlen(p2), lw = strlen(what);
-    long long total = (long long)l1 + ls + (long long)l2 + (long long)lw;
-    char* m = beans_alloc(total + 1, total << 3);
-    char* w = m;
-    memcpy(w, p1, l1);
-    w += l1;
-    memcpy(w, s, (size_t)ls);
-    w += ls;
-    memcpy(w, p2, l2);
-    w += l2;
-    memcpy(w, what, lw);
-    return (BRes){0, mk_error_own(m, "")};
-}
-
-BRes beans_str_to_int(char* s) {
-    char* end = NULL;
-    long long v = strtoll(s, &end, 10);
-    if (end == s || *end != '\0') return parse_fail(s, "int");
-    return (BRes){v, NULL};
-}
-
-BRes beans_str_to_float(char* s) {
-    char* end = NULL;
-    double d = strtod(s, &end);
-    if (end == s || *end != '\0') return parse_fail(s, "float");
-    BRes r;
-    r.err = NULL;
-    memcpy(&r.val, &d, 8);
-    return r;
-}
-
-// Option-shaped ABI: has 0 = none
-typedef struct {
-    long long val;
-    long long has;
-} BOpt;
-
-// explicit-length string maker; the terminator byte is already zero
-// because every allocation path hands back zeroed memory
-static char* str_make(const char* p, long long n) {
-    char* r = beans_alloc(n + 1, n << 3);
-    memcpy(r, p, (size_t)n);
-    return r;
-}
-
-long long beans_str_is_empty(char* s) { return beans_slen(s) == 0; }
-char* beans_str_first(char* s, long long n) {
-    long long len = beans_slen(s);
-    if (n < 0) n = 0;
-    if (n > len) n = len;
-    return str_make(s, n);
-}
-long long beans_str_starts_with(char* s, char* p) {
-    long long pl = beans_slen(p);
-    return pl <= beans_slen(s) && memcmp(s, p, (size_t)pl) == 0;
-}
-long long beans_str_ends_with(char* s, char* p) {
-    long long n = beans_slen(s), pl = beans_slen(p);
-    return pl <= n && memcmp(s + n - pl, p, (size_t)pl) == 0;
-}
-// empty needle: find says 0, rfind says len — the C++ side agrees
-BOpt beans_str_find(char* s, char* sub) {
-    long long n = beans_slen(s), m = beans_slen(sub);
-    if (m == 0) return (BOpt){0, 1};
-    long long i = str_search(s, n, sub, m, 0);
-    if (i >= 0) return (BOpt){i, 1};
-    return (BOpt){0, 0};
-}
-BOpt beans_str_rfind(char* s, char* sub) {
-    long long n = beans_slen(s), m = beans_slen(sub);
-    if (m == 0) return (BOpt){n, 1};
-    for (long long i = n - m; i >= 0; i--) {
-        if (memcmp(s + i, sub, (size_t)m) == 0) return (BOpt){i, 1};
-    }
-    return (BOpt){0, 0};
-}
-char* beans_str_slice(char* s, long long from, long long to, long long line,
-                      long long col) {
-    long long n = beans_slen(s);
-    if (from < 0 || to < from || to > n) {
-        char m[96];
-        snprintf(m, sizeof m, "slice %lld..%lld out of range (len %lld)", from, to, n);
-        beans_panic(m, line, col);
-    }
-    return str_make(s + from, to - from);
-}
-long long beans_str_byte_at(char* s, long long i, long long line, long long col) {
-    long long n = beans_slen(s);
-    if (i < 0 || i >= n) {
-        char m[80];
-        snprintf(m, sizeof m, "byte index %lld out of range (len %lld)", i, n);
-        beans_panic(m, line, col);
-    }
-    return (long long)(unsigned char)s[i];
-}
-static int str_is_ws(char c) {
-    return c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\f' || c == '\v';
-}
-char* beans_str_trim(char* s) {
-    long long b = 0, e = beans_slen(s);
-    while (b < e && str_is_ws(s[b])) b++;
-    while (e > b && str_is_ws(s[e - 1])) e--;
-    return str_make(s + b, e - b);
-}
-char* beans_str_trim_start(char* s) {
-    long long b = 0, e = beans_slen(s);
-    while (b < e && str_is_ws(s[b])) b++;
-    return str_make(s + b, e - b);
-}
-char* beans_str_trim_end(char* s) {
-    long long e = beans_slen(s);
-    while (e > 0 && str_is_ws(s[e - 1])) e--;
-    return str_make(s, e);
-}
-char* beans_str_to_upper(char* s) {
-    long long n = beans_slen(s);
-    char* r = str_make(s, n);
-    for (long long i = 0; i < n; i++) {
-        if (r[i] >= 'a' && r[i] <= 'z') r[i] = (char)(r[i] - 'a' + 'A');
-    }
-    return r;
-}
-char* beans_str_to_lower(char* s) {
-    long long n = beans_slen(s);
-    char* r = str_make(s, n);
-    for (long long i = 0; i < n; i++) {
-        if (r[i] >= 'A' && r[i] <= 'Z') r[i] = (char)(r[i] - 'A' + 'a');
-    }
-    return r;
-}
-char* beans_str_replace(char* s, char* old, char* nw) {
-    long long n = beans_slen(s), m = beans_slen(old), rl = beans_slen(nw);
-    if (m == 0) return str_make(s, n); // replacing nothing changes nothing
-    long long count = 0;
-    for (long long i = str_search(s, n, old, m, 0); i >= 0;
-         i = str_search(s, n, old, m, i + m)) {
-        count++;
-    }
-    if (count == 0) return str_make(s, n);
-    long long outn = n + count * (rl - m);
-    char* out = beans_alloc(outn + 1, outn << 3);
-    char* w = out;
-    long long i = 0;
-    for (;;) {
-        long long j = str_search(s, n, old, m, i);
-        if (j < 0) break;
-        memcpy(w, s + i, (size_t)(j - i));
-        w += j - i;
-        memcpy(w, nw, (size_t)rl);
-        w += rl;
-        i = j + m;
-    }
-    memcpy(w, s + i, (size_t)(n - i));
-    return out;
-}
-char* beans_str_repeat(char* s, long long n, long long line, long long col) {
-    if (n < 0) {
-        char m[64];
-        snprintf(m, sizeof m, "negative repeat count %lld", n);
-        beans_panic(m, line, col);
-    }
-    long long len = beans_slen(s);
-    long long outn = len * n;
-    char* out = beans_alloc(outn + 1, outn << 3);
-    for (long long i = 0; i < n; i++) memcpy(out + i * len, s, (size_t)len);
-    return out;
-}
-long long beans_f64_round(double v) { return llround(v); }
-
-// ---- lists ----
-BList* beans_list_new(long long elem_ptr) {
-    BList* l = beans_alloc(sizeof(BList), 2 | (elem_ptr << 3));
-    l->cap = 4;
-    l->data = calloc(4, 8);
-    return l;
-}
-void beans_list_push(BList* l, long long v) {
-    if (l->len == l->cap) {
-        l->cap *= 2;
-        l->data = realloc(l->data, (size_t)l->cap * 8);
-    }
-    l->data[l->len++] = v;
-}
-void beans_list_reserve(BList* l, long long capacity, long long line, long long col) {
-    if (capacity < 0) {
-        char b[64];
-        snprintf(b, sizeof b, "negative reserve capacity %lld", capacity);
-        beans_panic(b, line, col);
-    }
-    if (capacity > (1LL << 58)) beans_panic("reserve capacity too large", line, col);
-    if (capacity <= l->cap) return;
-    long long cap = l->cap;
-    while (cap < capacity && cap <= (1LL << 60)) cap *= 2;
-    if (cap < capacity) cap = capacity;
-    l->data = realloc(l->data, (size_t)cap * 8);
-    if (!l->data) beans_panic("out of memory", line, col);
-    l->cap = cap;
-}
-
-// ---- class hierarchy (table emitted by the compiler) ----
-extern long long beans_class_parents[];
-long long beans_is_a(long long id, long long target) {
-    while (id >= 0) {
-        if (id == target) return 1;
-        id = beans_class_parents[id];
-    }
-    return 0;
-}
-
-// ---- list search helpers (kind: 0 int-ish, 1 f64, 2 string, 3 decimal,
-// 4 unordered — everything compares equal, so sort keeps the original order
-// and min/max return the first element, like the interpreter's value_less
-// returning false) ----
-struct BDec;
-int beans_dec_cmp(struct BDec* a, struct BDec* b);
-static int slot_cmp(long long a, long long b, long long kind) {
-    if (kind == 1) {
-        double x, y;
-        memcpy(&x, &a, 8);
-        memcpy(&y, &b, 8);
-        return x < y ? -1 : x > y ? 1 : 0;
-    }
-    if (kind == 2) return beans_str_cmp((char*)a, (char*)b);
-    if (kind == 3) return beans_dec_cmp((struct BDec*)a, (struct BDec*)b);
-    if (kind == 4) return 0;
-    if (kind == 5) {
-        unsigned long long x = (unsigned long long)a;
-        unsigned long long y = (unsigned long long)b;
-        return x < y ? -1 : x > y ? 1 : 0;
-    }
-    if (kind == 6) {
-        unsigned aa = (unsigned)a, bb = (unsigned)b;
-        float x, y;
-        memcpy(&x, &aa, 4);
-        memcpy(&y, &bb, 4);
-        return x < y ? -1 : x > y ? 1 : 0;
-    }
-    return a < b ? -1 : a > b ? 1 : 0;
-}
-// content equality for strings — length header first, bytes second; strcmp
-// would stop at an embedded NUL and lie
-long long beans_str_eq(char* a, char* b) {
-    long long n = beans_slen(a);
-    return n == beans_slen(b) && memcmp(a, b, (size_t)n) == 0;
-}
-// equality kinds (separate lattice from the ordering kinds above), matching
-// the interpreter's value_eq arm for arm: 0 raw slot (ints, bools, pointer
-// identity), 1 f64 by IEEE value (NaN equals nothing), 2 string content,
-// 3 decimal value, 4 caller-supplied structural eq (enums, Bytes), 5 never
-// equal (maps and resource handles — value_eq's default arm)
-static long long slot_eq(long long a, long long b, long long kind,
-                         long long (*eq)(long long, long long)) {
-    if (kind == 0) return a == b;
-    if (kind == 1) {
-        double x, y;
-        memcpy(&x, &a, 8);
-        memcpy(&y, &b, 8);
-        return x == y;
-    }
-    if (kind == 2) return beans_str_eq((char*)a, (char*)b);
-    if (kind == 3) return beans_dec_cmp((struct BDec*)a, (struct BDec*)b) == 0;
-    if (kind == 4) return eq(a, b) != 0;
-    if (kind == 6) {
-        unsigned aa = (unsigned)a, bb = (unsigned)b;
-        float x, y;
-        memcpy(&x, &aa, 4);
-        memcpy(&y, &bb, 4);
-        return x == y;
-    }
-    return 0;
-}
-// hashes for the map index, one per equality kind. The contract is only that
-// slot_eq-equal keys hash equal; the interpreter hashes differently and that
-// is fine — nothing observable depends on hash values, iteration walks data.
-static unsigned long long beans_mix64(unsigned long long x) {
-    // One multiply is enough for an in-process table: unlike a persisted
-    // cryptographic hash, this only needs to spread sequential integers and
-    // aligned pointers across a power-of-two index. The old Murmur finalizer
-    // used two multiplies and six dependent operations on every lookup.
-    x ^= x >> 32;
-    x *= 0xd6e8feb86659fd93ULL;
-    x ^= x >> 32;
-    return x;
-}
-long long beans_slot_mix(long long v) { return (long long)beans_mix64((unsigned long long)v); }
-long long beans_f64_hash(long long v) {
-    double x;
-    memcpy(&x, &v, 8);
-    if (x == 0.0) return (long long)beans_mix64(0); // -0.0 == 0.0
-    return (long long)beans_mix64((unsigned long long)v);
-}
-long long beans_f32_hash(long long v) {
-    unsigned bits = (unsigned)v;
-    float x;
-    memcpy(&x, &bits, 4);
-    if (x == 0.0f) return (long long)beans_mix64(0);
-    return (long long)beans_mix64(bits);
-}
-long long beans_str_hash(char* s) {
-    long long n = beans_slen(s);
-    unsigned long long h = 1469598103934665603ULL;
-    for (long long i = 0; i < n; i++) {
-        h ^= (unsigned char)s[i];
-        h *= 1099511628211ULL;
-    }
-    return (long long)beans_mix64(h);
-}
-long long beans_dec_hash(struct BDec* d);
-long long beans_bytes_hash(BList* b) {
-    unsigned long long h = 1469598103934665603ULL;
-    for (long long i = 0; i < b->len; i++) {
-        h ^= ((unsigned char*)b->data)[i];
-        h *= 1099511628211ULL;
-    }
-    return (long long)beans_mix64(h);
-}
-static unsigned long long slot_hash(long long v, long long kind,
-                                    long long (*hf)(long long)) {
-    if (kind == 1) return (unsigned long long)beans_f64_hash(v);
-    if (kind == 2) return (unsigned long long)beans_str_hash((char*)v);
-    if (kind == 3) return (unsigned long long)beans_dec_hash((struct BDec*)v);
-    if (kind == 4) return (unsigned long long)hf(v);
-    if (kind == 6) return (unsigned long long)beans_f32_hash(v);
-    return beans_mix64((unsigned long long)v); // raw, and never-equal keys
-}
-long long beans_list_max(BList* l, long long kind, long long* ok) {
-    *ok = l->len > 0;
-    if (!*ok) return 0;
-    long long best = l->data[0];
-    for (long long i = 1; i < l->len; i++) {
-        if (slot_cmp(l->data[i], best, kind) > 0) best = l->data[i];
-    }
-    return best;
-}
-long long beans_list_contains(BList* l, long long v, long long kind, void* eq) {
-    for (long long i = 0; i < l->len; i++) {
-        if (slot_eq(l->data[i], v, kind, (long long (*)(long long, long long))eq)) return 1;
-    }
-    return 0;
-}
-long long beans_list_min(BList* l, long long kind, long long* ok) {
-    *ok = l->len > 0;
-    if (!*ok) return 0;
-    long long best = l->data[0];
-    for (long long i = 1; i < l->len; i++) {
-        if (slot_cmp(l->data[i], best, kind) < 0) best = l->data[i];
-    }
-    return best;
-}
-long long beans_list_index(BList* l, long long v, long long kind, long long* ok,
-                           void* eq) {
-    for (long long i = 0; i < l->len; i++) {
-        if (slot_eq(l->data[i], v, kind, (long long (*)(long long, long long))eq)) {
-            *ok = 1;
-            return i;
-        }
-    }
-    *ok = 0;
-    return 0;
-}
-void beans_list_insert(BList* l, long long i, long long v, long long line,
-                       long long col) {
-    if (i < 0 || i > l->len) {
-        char b[96];
-        snprintf(b, sizeof b, "insert at %lld out of range (len %lld)", i, l->len);
-        beans_panic(b, line, col);
-    }
-    if (l->len == l->cap) {
-        l->cap *= 2;
-        l->data = realloc(l->data, (size_t)l->cap * 8);
-    }
-    memmove(l->data + i + 1, l->data + i, (size_t)(l->len - i) * 8);
-    l->data[i] = v;
-    l->len += 1;
-}
-long long beans_list_remove(BList* l, long long i, long long line, long long col) {
-    if (i < 0 || i >= l->len) {
-        char b[96];
-        snprintf(b, sizeof b, "list index %lld out of range (len %lld)", i, l->len);
-        beans_panic(b, line, col);
-    }
-    long long v = l->data[i];
-    memmove(l->data + i, l->data + i + 1, (size_t)(l->len - i - 1) * 8);
-    l->len -= 1;
-    return v; // the caller now owns the moved-out ref
-}
-void beans_list_reverse(BList* l) {
-    for (long long i = 0, j = l->len - 1; i < j; i++, j--) {
-        long long t = l->data[i];
-        l->data[i] = l->data[j];
-        l->data[j] = t;
-    }
-}
-void beans_list_clear(BList* l) {
-    // last element first — deinit made death order observable, and the
-    // interpreter's vector teardown destroys back to front
-    if ((head_of(l)->meta & CC_SHAPE) >> 3 & 1) {
-        for (long long i = l->len; i-- > 0;) {
-            if (l->data[i]) beans_release((void*)l->data[i]);
-        }
-    }
-    l->len = 0;
-}
-BList* beans_list_slice(BList* l, long long from, long long to, long long line,
-                        long long col) {
-    if (from < 0 || to < from || to > l->len) {
-        char b[96];
-        snprintf(b, sizeof b, "slice %lld..%lld out of range (len %lld)", from, to,
-                 l->len);
-        beans_panic(b, line, col);
-    }
-    long long rc = (head_of(l)->meta & CC_SHAPE) >> 3 & 1;
-    long long n = to - from;
-    BList* r = beans_alloc(sizeof(BList), 2 | (rc << 3));
-    r->len = n;
-    r->cap = n > 4 ? n : 4;
-    r->data = malloc((size_t)r->cap * sizeof(long long));
-    if (!r->data) beans_panic("out of memory", line, col);
-    memcpy(r->data, l->data + from, (size_t)n * sizeof(long long));
-    if (rc) {
-        for (long long i = 0; i < n; i++) {
-            if (r->data[i]) beans_retain((void*)r->data[i]);
-        }
-    }
-    return r;
-}
-BList* beans_list_clone(BList* l) {
-    long long rc = (head_of(l)->meta & CC_SHAPE) >> 3 & 1;
-    BList* r = beans_alloc(sizeof(BList), 2 | (rc << 3));
-    r->len = l->len;
-    r->cap = l->len > 4 ? l->len : 4;
-    r->data = malloc((size_t)r->cap * sizeof(long long));
-    if (!r->data) beans_panic("out of memory", 0, 0);
-    memcpy(r->data, l->data, (size_t)l->len * sizeof(long long));
-    if (rc) {
-        for (long long i = 0; i < r->len; i++) {
-            if (r->data[i]) beans_retain((void*)r->data[i]);
-        }
-    }
-    return r;
-}
-
-// bottom-up stable merge — structurally identical to the interpreter's
-// stable_merge, so both backends produce the same order for ANY predicate,
-// even one that is not a strict weak ordering
-static long long sort_less(long long x, long long y, long long kind, void* thunk,
-                           void* box) {
-    if (thunk) return ((long long (*)(void*, long long, long long))thunk)(box, x, y);
-    return slot_cmp(x, y, kind) < 0;
-}
-static void list_merge_sort(long long* a, long long n, long long kind, void* thunk,
-                            void* box) {
-    if (n < 2) return;
-    long long* buf = malloc((size_t)n * 8);
-    for (long long w = 1; w < n; w *= 2) {
-        for (long long lo = 0; lo < n; lo += 2 * w) {
-            long long mid = lo + w < n ? lo + w : n;
-            long long hi = lo + 2 * w < n ? lo + 2 * w : n;
-            if (mid >= hi) continue;
-            long long i = lo, j = mid, o = lo;
-            while (i < mid && j < hi) {
-                if (!sort_less(a[j], a[i], kind, thunk, box)) buf[o++] = a[i++];
-                else buf[o++] = a[j++];
-            }
-            while (i < mid) buf[o++] = a[i++];
-            while (j < hi) buf[o++] = a[j++];
-            memcpy(a + lo, buf + lo, (size_t)(hi - lo) * 8);
-        }
-    }
-    free(buf);
-}
-// Signed integer slots have a much cheaper stable path: four 16-bit passes,
-// with the sign bit flipped for normal two's-complement ordering.
-// This avoids a comparator branch for every merge comparison and keeps equal
-// values in input order. bool uses the same path (its slots are 0/1).
-static void list_radix_sort_int(long long* a, long long n) {
-    if (n < 2) return;
-    long long* buf = malloc((size_t)n * 8);
-    long long* src = a;
-    long long* dst = buf;
-    size_t* count = malloc(65536 * sizeof(size_t));
-    size_t* at = malloc(65536 * sizeof(size_t));
-    for (int pass = 0; pass < 4; pass++) {
-        memset(count, 0, 65536 * sizeof(size_t));
-        int shift = pass * 16;
-        for (long long i = 0; i < n; i++) {
-            unsigned long long key = (unsigned long long)src[i] ^ (1ULL << 63);
-            count[(key >> shift) & 65535]++;
-        }
-        size_t sum = 0;
-        for (int word = 0; word < 65536; word++) {
-            at[word] = sum;
-            sum += count[word];
-        }
-        for (long long i = 0; i < n; i++) {
-            unsigned long long key = (unsigned long long)src[i] ^ (1ULL << 63);
-            dst[at[(key >> shift) & 65535]++] = src[i];
-        }
-        long long* swap = src;
-        src = dst;
-        dst = swap;
-    }
-    // Four passes land back in `a`; keep this copy for defensive use if the
-    // pass count changes later.
-    if (src != a) memcpy(a, src, (size_t)n * 8);
-    free(count);
-    free(at);
-    free(buf);
-}
-void beans_list_sort(BList* l, long long kind) {
-    if (kind == 0) list_radix_sort_int(l->data, l->len);
-    else list_merge_sort(l->data, l->len, kind, NULL, NULL);
-}
-void beans_list_sort_by(BList* l, void* thunk, void* box) {
-    list_merge_sort(l->data, l->len, 0, thunk, box);
-}
-void beans_list_sort_by_key(BList* l, void* thunk, void* box) {
-    long long n = l->len;
-    if (n < 2) return;
-    long long* keys = malloc((size_t)n * 8);
-    long long* key_buf = malloc((size_t)n * 8);
-    long long* val_buf = malloc((size_t)n * 8);
-    size_t* count = malloc(65536 * sizeof(size_t));
-    size_t* at = malloc(65536 * sizeof(size_t));
-    long long (*key_fn)(void*, long long) =
-        (long long (*)(void*, long long))thunk;
-    for (long long i = 0; i < n; i++) keys[i] = key_fn(box, l->data[i]);
-    long long* key_src = keys;
-    long long* key_dst = key_buf;
-    long long* val_src = l->data;
-    long long* val_dst = val_buf;
-    for (int pass = 0; pass < 4; pass++) {
-        memset(count, 0, 65536 * sizeof(size_t));
-        int shift = pass * 16;
-        for (long long i = 0; i < n; i++) {
-            unsigned long long key = (unsigned long long)key_src[i] ^ (1ULL << 63);
-            count[(key >> shift) & 65535]++;
-        }
-        size_t sum = 0;
-        for (int word = 0; word < 65536; word++) {
-            at[word] = sum;
-            sum += count[word];
-        }
-        for (long long i = 0; i < n; i++) {
-            unsigned long long key = (unsigned long long)key_src[i] ^ (1ULL << 63);
-            size_t out = at[(key >> shift) & 65535]++;
-            key_dst[out] = key_src[i];
-            val_dst[out] = val_src[i];
-        }
-        long long* swap = key_src; key_src = key_dst; key_dst = swap;
-        swap = val_src; val_src = val_dst; val_dst = swap;
-    }
-    if (val_src != l->data) memcpy(l->data, val_src, (size_t)n * 8);
-    free(keys);
-    free(key_buf);
-    free(val_buf);
-    free(count);
-    free(at);
-}
-
-// ---- maps ----
-// A flat key/value array plus an open-addressed index. OrderedMap leaves stable
-// removal holes. Map swap-removes. Small maps have no index and scan linearly.
-#define MAP_LINEAR_MAX 8
-#define IDX_POS 0xffffffffULL /* low 32: pos+2, 1 = tombstone */
-#define IDX_FRAG 0xffffffff00000000ULL /* high 32: hash fragment */
-#define MAP_DEAD(m, p) ((m)->deadbits && (m)->deadbits[(p) >> 6] >> ((p)&63) & 1)
-BMap* beans_map_new(long long key_ptr, long long val_ptr, long long ordered) {
-    BMap* m = beans_alloc(sizeof(BMap), 3 | (key_ptr << 3) | (val_ptr << 4));
-    m->cap = 4;
-    m->data = calloc(8, 8); // idx/tombs/used/deadbits start zero: beans_alloc zeroes
-    m->ordered = ordered;
-    return m;
-}
-// (re)build the index sized for the current entry count, dropping tombstones
-// and compacting holes. Only moves slots and writes index words — never
-// retains or releases.
-static void map_reindex_to(BMap* m, long long kind, long long (*hf)(long long),
-                           long long reserve) {
-    if (m->deadbits) {
-        long long w = 0;
-        for (long long p = 0; p < m->used; p++) {
-            if (MAP_DEAD(m, p)) continue;
-            if (w != p) {
-                m->data[w * 2] = m->data[p * 2];
-                m->data[w * 2 + 1] = m->data[p * 2 + 1];
-            }
-            w += 1;
-        }
-        free(m->deadbits);
-        m->deadbits = NULL;
-        m->used = w; // == m->len
-    }
-    long long wanted = m->len > reserve ? m->len : reserve;
-    long long cap = 16;
-    while (wanted * 3 >= cap * 2) cap <<= 1;
-    free(m->idx);
-    m->idx = calloc((size_t)cap, 8);
-    m->icap = cap;
-    m->tombs = 0;
-    unsigned long long mask = (unsigned long long)cap - 1;
-    for (long long p = 0; p < m->len; p++) {
-        unsigned long long h = slot_hash(m->data[p * 2], kind, hf);
-        unsigned long long i = h & mask;
-        while (m->idx[i] & IDX_POS) i = (i + 1) & mask;
-        m->idx[i] = (h & IDX_FRAG) | (unsigned long long)(p + 2);
-    }
-}
-static void map_reindex(BMap* m, long long kind, long long (*hf)(long long)) {
-    map_reindex_to(m, kind, hf, 0);
-}
-void beans_map_reserve(BMap* m, long long capacity, long long kind, void* hash,
-                       long long line, long long col) {
-    if (capacity < 0) {
-        char b[64];
-        snprintf(b, sizeof b, "negative reserve capacity %lld", capacity);
-        beans_panic(b, line, col);
-    }
-    if (capacity > (1LL << 58)) beans_panic("reserve capacity too large", line, col);
-    if (capacity > m->cap) {
-        long long cap = m->cap;
-        while (cap < capacity && cap <= (1LL << 59)) cap *= 2;
-        if (cap < capacity) cap = capacity;
-        m->data = realloc(m->data, (size_t)cap * 16);
-        if (!m->data) beans_panic("out of memory", line, col);
-        if (m->deadbits) {
-            long long old_words = (m->cap + 63) >> 6;
-            long long new_words = (cap + 63) >> 6;
-            m->deadbits = realloc(m->deadbits, (size_t)new_words * 8);
-            memset(m->deadbits + old_words, 0,
-                   (size_t)(new_words - old_words) * 8);
-        }
-        m->cap = cap;
-    }
-    map_reindex_to(m, kind, (long long (*)(long long))hash, capacity);
-}
-// keys compare with the same equality lattice as list search (slot_eq): raw,
-// f64 value, string content, decimal value, structural thunk, never-equal.
-// *hout is filled iff the index is active, so set can reuse it; *slot_out
-// (may be NULL) gets the hit's index slot so remove can tombstone it O(1).
-static long long map_find(BMap* m, long long key, long long kind, void* eq,
-                          long long (*hf)(long long), unsigned long long* hout,
-                          unsigned long long* slot_out) {
-    if (!m->idx) {
-        for (long long i = 0; i < m->len; i++) {
-            if (slot_eq(m->data[i * 2], key, kind,
-                        (long long (*)(long long, long long))eq)) return i;
-        }
-        return -1;
-    }
-    unsigned long long h = slot_hash(key, kind, hf);
-    *hout = h;
-    unsigned long long mask = (unsigned long long)m->icap - 1;
-    unsigned long long frag = h & IDX_FRAG;
-    unsigned long long first_tomb = ~0ULL;
-    for (unsigned long long i = h & mask;; i = (i + 1) & mask) {
-        unsigned long long w = m->idx[i];
-        unsigned long long st = w & IDX_POS;
-        if (st == 0) {
-            if (slot_out) *slot_out = first_tomb != ~0ULL ? first_tomb : i;
-            return -1;
-        }
-        if (st == 1 && first_tomb == ~0ULL) first_tomb = i;
-        if (st >= 2 && (w & IDX_FRAG) == frag) {
-            long long p = (long long)st - 2;
-            if (slot_eq(m->data[p * 2], key, kind,
-                        (long long (*)(long long, long long))eq)) {
-                if (slot_out) *slot_out = i;
-                return p;
-            }
-        }
-    }
-}
-// Raw-slot keys (integers, bools, and identity keys) are the common map case.
-// Keep their probe loop separate so every occupied bucket does not branch
-// through the full equality/hash kind lattice.
-static long long map_find_raw(BMap* m, long long key, unsigned long long* hout,
-                              unsigned long long* slot_out) {
-    if (!m->idx) {
-        for (long long i = 0; i < m->len; i++) {
-            if (m->data[i * 2] == key) return i;
-        }
-        return -1;
-    }
-    unsigned long long h = beans_mix64((unsigned long long)key);
-    *hout = h;
-    unsigned long long mask = (unsigned long long)m->icap - 1;
-    unsigned long long frag = h & IDX_FRAG;
-    unsigned long long first_tomb = ~0ULL;
-    for (unsigned long long i = h & mask;; i = (i + 1) & mask) {
-        unsigned long long w = m->idx[i];
-        unsigned long long st = w & IDX_POS;
-        if (st == 0) {
-            if (slot_out) *slot_out = first_tomb != ~0ULL ? first_tomb : i;
-            return -1;
-        }
-        if (st == 1 && first_tomb == ~0ULL) first_tomb = i;
-        if (st >= 2 && (w & IDX_FRAG) == frag) {
-            long long p = (long long)st - 2;
-            if (m->data[p * 2] == key) {
-                if (slot_out) *slot_out = i;
-                return p;
-            }
-        }
-    }
-}
-
-static void map_insert_miss(BMap* m, long long key, long long val,
-                            unsigned long long h, long long kind,
-                            long long (*hf)(long long),
-                            unsigned long long insert_slot) {
-    if (m->used == m->cap) {
-        long long ow = (m->cap + 63) >> 6;
-        m->cap *= 2;
-        m->data = realloc(m->data, (size_t)m->cap * 16);
-        if (m->deadbits) {
-            long long nw = (m->cap + 63) >> 6;
-            m->deadbits = realloc(m->deadbits, (size_t)nw * 8);
-            memset(m->deadbits + ow, 0, (size_t)(nw - ow) * 8);
-        }
-    }
-    m->data[m->used * 2] = key;
-    m->data[m->used * 2 + 1] = val;
-    m->used += 1;
-    m->len += 1;
-    if (!m->idx) {
-        if (m->len > MAP_LINEAR_MAX) map_reindex(m, kind, hf);
-    } else if ((m->used + m->tombs) * 3 >= m->icap * 2) {
-        map_reindex(m, kind, hf);
-    } else { // the miss probe already found the insertion slot
-        if ((m->idx[insert_slot] & IDX_POS) == 1) m->tombs -= 1;
-        m->idx[insert_slot] =
-            (h & IDX_FRAG) | (unsigned long long)(m->used + 1);
-    }
-}
-
-// note: the map owns key and value refs; the caller retains before calling
-void beans_map_set(BMap* m, long long key, long long val, long long kind, void* eq,
-                   void* hash) {
-    long long (*hf)(long long) = (long long (*)(long long))hash;
-    unsigned long long h = 0, slot = 0;
-    long long i = map_find(m, key, kind, eq, hf, &h, &slot);
-    if (i >= 0) {
-        long long flags = (head_of(m)->meta & CC_SHAPE) >> 3;
-        if (flags & 1) beans_release((void*)key); // duplicate key not stored
-        if (flags & 2) beans_release((void*)m->data[i * 2 + 1]);
-        m->data[i * 2 + 1] = val;
-        return;
-    }
-    map_insert_miss(m, key, val, h, kind, hf, slot);
-}
-
-void beans_map_set_raw(BMap* m, long long key, long long val) {
-    unsigned long long h = 0, slot = 0;
-    long long i = map_find_raw(m, key, &h, &slot);
-    if (i >= 0) {
-        long long flags = (head_of(m)->meta & CC_SHAPE) >> 3;
-        if (flags & 1) beans_release((void*)key);
-        if (flags & 2) beans_release((void*)m->data[i * 2 + 1]);
-        m->data[i * 2 + 1] = val;
-        return;
-    }
-    map_insert_miss(m, key, val, h, 0, NULL, slot);
-}
-
-long long beans_map_insert(BMap* m, long long key, long long val, long long kind,
-                           void* eq, void* hash) {
-    long long (*hf)(long long) = (long long (*)(long long))hash;
-    unsigned long long h = 0, slot = 0;
-    if (map_find(m, key, kind, eq, hf, &h, &slot) >= 0) {
-        long long flags = (head_of(m)->meta & CC_SHAPE) >> 3;
-        if (flags & 1) beans_release((void*)key);
-        if (flags & 2) beans_release((void*)val);
-        return 0;
-    }
-    map_insert_miss(m, key, val, h, kind, hf, slot);
-    return 1;
-}
-
-long long beans_map_insert_raw(BMap* m, long long key, long long val) {
-    unsigned long long h = 0, slot = 0;
-    if (map_find_raw(m, key, &h, &slot) >= 0) {
-        long long flags = (head_of(m)->meta & CC_SHAPE) >> 3;
-        if (flags & 1) beans_release((void*)key);
-        if (flags & 2) beans_release((void*)val);
-        return 0;
-    }
-    map_insert_miss(m, key, val, h, 0, NULL, slot);
-    return 1;
-}
-
-BOpt beans_map_get_raw(BMap* m, long long key) {
-    unsigned long long h = 0;
-    long long i = map_find_raw(m, key, &h, NULL);
-    return i >= 0 ? (BOpt){m->data[i * 2 + 1], 1} : (BOpt){0, 0};
-}
-
-long long beans_map_contains_raw(BMap* m, long long key) {
-    unsigned long long h = 0;
-    return map_find_raw(m, key, &h, NULL) >= 0;
-}
-
-long long beans_map_get(BMap* m, long long key, long long kind, long long* ok,
-                        void* eq, void* hash) {
-    unsigned long long h = 0;
-    long long i = map_find(m, key, kind, eq, (long long (*)(long long))hash, &h, 0);
-    *ok = i >= 0;
-    return i >= 0 ? m->data[i * 2 + 1] : 0;
-}
-static long long map_remove_found(BMap* m, long long i,
-                                  unsigned long long slot, long long kind,
-                                  long long (*hf)(long long)) {
-    long long flags = (head_of(m)->meta & CC_SHAPE) >> 3;
-    if ((flags & 1) && m->data[i * 2]) beans_release((void*)m->data[i * 2]);
-    if ((flags & 2) && m->data[i * 2 + 1]) beans_release((void*)m->data[i * 2 + 1]);
-    if (!m->idx) {
-        if (m->ordered) {
-            memmove(m->data + i * 2, m->data + (i + 1) * 2,
-                    (size_t)(m->used - i - 1) * 16);
-        } else if (i != m->used - 1) {
-            m->data[i * 2] = m->data[(m->used - 1) * 2];
-            m->data[i * 2 + 1] = m->data[(m->used - 1) * 2 + 1];
-        }
-        m->len -= 1;
-        m->used -= 1;
-        return 1;
-    }
-    if (!m->ordered) {
-        long long last = m->used - 1;
-        m->idx[slot] = 1;
-        m->tombs += 1;
-        if (i != last) {
-            long long moved_key = m->data[last * 2];
-            unsigned long long h = slot_hash(moved_key, kind, hf);
-            unsigned long long mask = (unsigned long long)m->icap - 1;
-            for (unsigned long long at = h & mask;; at = (at + 1) & mask) {
-                unsigned long long state = m->idx[at] & IDX_POS;
-                if (state == (unsigned long long)(last + 2)) {
-                    m->idx[at] = (m->idx[at] & IDX_FRAG) |
-                                 (unsigned long long)(i + 2);
-                    break;
-                }
-            }
-            m->data[i * 2] = m->data[last * 2];
-            m->data[i * 2 + 1] = m->data[last * 2 + 1];
-        }
-        m->data[last * 2] = 0;
-        m->data[last * 2 + 1] = 0;
-        m->len -= 1;
-        m->used -= 1;
-        if (m->tombs > m->len) map_reindex(m, kind, hf);
-        return 1;
-    }
-    // indexed: zero the pair into a hole — no entry moves, so no index
-    // position needs fixing and delete is O(1). Reindex compacts once
-    // holes outnumber live entries, so the cost is amortized.
-    m->data[i * 2] = 0;
-    m->data[i * 2 + 1] = 0;
-    if (!m->deadbits) m->deadbits = calloc((size_t)((m->cap + 63) >> 6), 8);
-    m->deadbits[i >> 6] |= 1ULL << (i & 63);
-    m->len -= 1;
-    m->idx[slot] = 1; // map_find landed on the hit's slot
-    m->tombs += 1;
-    if (m->used > m->len * 2) map_reindex(m, kind, hf);
-    return 1;
-}
-long long beans_map_remove(BMap* m, long long key, long long kind, void* eq,
-                           void* hash) {
-    long long (*hf)(long long) = (long long (*)(long long))hash;
-    unsigned long long h = 0, slot = 0;
-    long long i = map_find(m, key, kind, eq, hf, &h, &slot);
-    return i < 0 ? 0 : map_remove_found(m, i, slot, kind, hf);
-}
-long long beans_map_remove_raw(BMap* m, long long key) {
-    unsigned long long h = 0, slot = 0;
-    long long i = map_find_raw(m, key, &h, &slot);
-    return i < 0 ? 0 : map_remove_found(m, i, slot, 0, NULL);
-}
-BMap* beans_map_clone(BMap* m, long long kind, void* hash) {
-    long long flags = (head_of(m)->meta & CC_SHAPE) >> 3;
-    BMap* copy = beans_map_new(flags & 1, (flags >> 1) & 1, m->ordered);
-    if (m->len > copy->cap) {
-        copy->cap = m->len;
-        copy->data = realloc(copy->data, (size_t)copy->cap * 16);
-        if (!copy->data) beans_panic("out of memory", 0, 0);
-    }
-    for (long long i = 0; i < m->used; i++) {
-        if (MAP_DEAD(m, i)) continue;
-        long long key = m->data[i * 2];
-        long long value = m->data[i * 2 + 1];
-        if ((flags & 1) && key) beans_retain((void*)key);
-        if ((flags & 2) && value) beans_retain((void*)value);
-        copy->data[copy->used * 2] = key;
-        copy->data[copy->used * 2 + 1] = value;
-        copy->used += 1;
-        copy->len += 1;
-    }
-    if (copy->len > MAP_LINEAR_MAX)
-        map_reindex(copy, kind, (long long (*)(long long))hash);
-    return copy;
-}
-BList* beans_map_keys(BMap* m) {
-    long long flags = (head_of(m)->meta & CC_SHAPE) >> 3;
-    BList* l = beans_list_new(flags & 1);
-    for (long long i = 0; i < m->used; i++) {
-        if (MAP_DEAD(m, i)) continue;
-        long long k = m->data[i * 2];
-        if ((flags & 1) && k) beans_retain((void*)k);
-        beans_list_push(l, k);
-    }
-    return l;
-}
-BList* beans_map_values(BMap* m) {
-    long long flags = (head_of(m)->meta & CC_SHAPE) >> 3;
-    BList* l = beans_list_new((flags >> 1) & 1);
-    for (long long i = 0; i < m->used; i++) {
-        if (MAP_DEAD(m, i)) continue;
-        long long v = m->data[i * 2 + 1];
-        if ((flags & 2) && v) beans_retain((void*)v);
-        beans_list_push(l, v);
-    }
-    return l;
-}
-void beans_map_clear(BMap* m) {
-    long long flags = (head_of(m)->meta & CC_SHAPE) >> 3;
-    // reverse, value before key: the interpreter's pair teardown runs members
-    // last-first, entries back to front — observable once a deinit prints
-    for (long long i = m->used; i-- > 0;) { // holes are zeroed: null-skip
-        if ((flags & 2) && m->data[i * 2 + 1]) beans_release((void*)m->data[i * 2 + 1]);
-        if ((flags & 1) && m->data[i * 2]) beans_release((void*)m->data[i * 2]);
-    }
-    m->len = 0;
-    m->used = 0;
-    free(m->deadbits);
-    m->deadbits = NULL;
-    free(m->idx);
-    m->idx = NULL;
-    m->icap = 0;
-    m->tombs = 0;
-}
-
-// element rendering matches the interpreter's display(): the kind code says
-// how each slot turns into text (0 int, 1 f64, 2 str, 3 dec, 4 bool)
-char* beans_dec_str(struct BDec* a);
-char* beans_list_join(BList* l, char* sep, long long kind) {
-    long long sl = beans_slen(sep);
-    char** parts = malloc((size_t)(l->len ? l->len : 1) * sizeof(char*));
-    long long total = 0;
-    for (long long i = 0; i < l->len; i++) {
-        long long v = l->data[i];
-        char* s;
-        if (kind == 2) {
-            s = (char*)v;
-        } else if (kind == 0) {
-            s = beans_from_int(v);
-        } else if (kind == 1) {
-            double d;
-            memcpy(&d, &v, 8);
-            s = beans_from_float(d);
-        } else if (kind == 3) {
-            s = beans_dec_str((struct BDec*)v);
-        } else {
-            s = beans_from_bool((int)v);
-        }
-        parts[i] = s;
-        total += beans_slen(s);
-        if (i) total += sl;
-    }
-    char* out = beans_alloc(total + 1, total << 3);
-    char* w = out;
-    for (long long i = 0; i < l->len; i++) {
-        if (i) {
-            memcpy(w, sep, (size_t)sl);
-            w += sl;
-        }
-        long long n = beans_slen(parts[i]);
-        memcpy(w, parts[i], (size_t)n);
-        w += n;
-        if (kind != 2) beans_release(parts[i]); // rendered copies are ours
-    }
-    free(parts);
-    return out;
-}
-
-// UTF-8 sequences, one string per character; a malformed lead or truncated
-// tail comes through one byte at a time — byte slicing, no validation
-BList* beans_str_chars(char* s) {
-    long long len = beans_slen(s);
-    BList* l = beans_list_new(1);
-    long long i = 0;
-    while (i < len) {
-        unsigned char c = (unsigned char)s[i];
-        long long n = c < 0x80          ? 1
-                      : (c >> 5) == 0x6 ? 2
-                      : (c >> 4) == 0xE ? 3
-                      : (c >> 3) == 0x1E ? 4
-                                         : 1;
-        if (i + n > len) {
-            n = 1;
-        } else {
-            for (long long k = 1; k < n; k++) {
-                if (((unsigned char)s[i + k] >> 6) != 0x2) {
-                    n = 1;
-                    break;
-                }
-            }
-        }
-        beans_list_push(l, (long long)str_make(s + i, n));
-        i += n;
-    }
-    return l;
-}
-long long beans_str_count_chars(char* s, long long from, long long to,
-                                long long line, long long col) {
-    long long len = beans_slen(s);
-    if (from < 0 || to < from || to > len) {
-        char m[112];
-        snprintf(m, sizeof m, "character range %lld..%lld out of range (len %lld)",
-                 from, to, len);
-        beans_panic(m, line, col);
-    }
-    long long count = 0;
-    for (long long i = from; i < to; count++) {
-        unsigned char c = (unsigned char)s[i];
-        long long n = c < 0x80           ? 1
-                      : (c >> 5) == 0x6  ? 2
-                      : (c >> 4) == 0xE  ? 3
-                      : (c >> 3) == 0x1E ? 4
-                                         : 1;
-        if (i + n > to) {
-            n = 1;
-        } else {
-            for (long long k = 1; k < n; k++) {
-                if (((unsigned char)s[i + k] >> 6) != 0x2) {
-                    n = 1;
-                    break;
-                }
-            }
-        }
-        i += n;
-    }
-    return count;
-}
-
-// ---- display through per-type show fns (emitted by the compiler) ----
-// show(slot) returns an owned string; we copy and release it per element
-static char* show_join(BList* l, const char* sep, long long sl,
-                       char* (*show)(long long), int brackets) {
-    long long cap = 16, len = 0;
-    char* buf = malloc((size_t)cap);
-    if (brackets) buf[len++] = '[';
-    for (long long i = 0; i < l->len; i++) {
-        char* s = show(l->data[i]);
-        long long n = beans_slen(s);
-        long long need = len + n + sl + 2;
-        if (need > cap) {
-            while (cap < need) cap *= 2;
-            buf = realloc(buf, (size_t)cap);
-        }
-        if (i) {
-            memcpy(buf + len, sep, (size_t)sl);
-            len += sl;
-        }
-        memcpy(buf + len, s, (size_t)n);
-        len += n;
-        beans_release(s);
-    }
-    if (brackets) buf[len++] = ']';
-    char* out = str_make(buf, len);
-    free(buf);
-    return out;
-}
-// ---- iterative show driver ----
-// printing recursed on data depth (a 400k-link enum chain smashed the C
-// stack); generated @bstep fns append their own text and PUSH child work
-// instead of calling each other, and this driver drains the stack. Text
-// items are borrowed (interned constants or C literals); scalar steps
-// append their temporary and release it.
-typedef struct {
-    void* fn; // step fn, or null for a text item
-    long long v;
-    const char* text;
-    long long tlen;
-} BShowItem;
-typedef struct BShowCtx {
-    BShowItem* items;
-    long long len, cap;
-    char* out;
-    long long olen, ocap;
-} BShowCtx;
-static void show_out(BShowCtx* c, const char* p, long long n) {
-    if (c->olen + n + 1 > c->ocap) {
-        c->ocap = (c->olen + n + 1) * 2 + 16;
-        c->out = realloc(c->out, (size_t)c->ocap);
-    }
-    memcpy(c->out + c->olen, p, (size_t)n);
-    c->olen += n;
-}
-void beans_show_append(BShowCtx* c, char* s) { show_out(c, s, beans_slen(s)); }
-static void show_push(BShowCtx* c, void* fn, long long v, const char* t, long long tn) {
-    if (c->len == c->cap) {
-        c->cap = c->cap ? c->cap * 2 : 32;
-        c->items = realloc(c->items, (size_t)c->cap * sizeof(BShowItem));
-    }
-    BShowItem it = {fn, v, t, tn};
-    c->items[c->len++] = it;
-}
-void beans_show_push_val(BShowCtx* c, void* fn, long long v) {
-    show_push(c, fn, v, NULL, 0);
-}
-void beans_show_push_lit(BShowCtx* c, char* s) {
-    show_push(c, NULL, 0, s, beans_slen(s));
-}
-void beans_show_list_iter(BShowCtx* c, BList* l, void* elem_step) {
-    show_out(c, "[", 1);
-    show_push(c, NULL, 0, "]", 1);
-    for (long long i = l->len; i-- > 1;) {
-        show_push(c, elem_step, l->data[i], NULL, 0);
-        show_push(c, NULL, 0, ", ", 2);
-    }
-    if (l->len > 0) show_push(c, elem_step, l->data[0], NULL, 0);
-}
-char* beans_show_run(void* fn, long long v) {
-    BShowCtx c = {0, 0, 0, 0, 0, 0};
-    show_push(&c, fn, v, NULL, 0);
-    while (c.len > 0) {
-        BShowItem it = c.items[--c.len];
-        if (it.fn) ((void (*)(BShowCtx*, long long))it.fn)(&c, it.v);
-        else show_out(&c, it.text, it.tlen);
-    }
-    char* r = str_make(c.out ? c.out : "", c.olen);
-    free(c.out);
-    free(c.items);
-    return r;
-}
-
-char* beans_show_list(BList* l, char* (*show)(long long)) {
-    return show_join(l, ", ", 2, show, 1);
-}
-char* beans_list_join_show(BList* l, char* sep, char* (*show)(long long)) {
-    return show_join(l, sep, beans_slen(sep), show, 0);
-}
-
-// ---- string ops that build lists ----
-BList* beans_str_split(char* s, char* sep) {
-    BList* l = beans_list_new(1);
-    long long n = beans_slen(s), m = beans_slen(sep);
-    if (m == 0) { // no separator: the whole string, one piece
-        beans_list_push(l, (long long)str_make(s, n));
-        return l;
-    }
-    long long i = 0;
-    for (long long j = str_search(s, n, sep, m, 0); j >= 0;
-         j = str_search(s, n, sep, m, i)) {
-        beans_list_push(l, (long long)str_make(s + i, j - i));
-        i = j + m;
-    }
-    beans_list_push(l, (long long)str_make(s + i, n - i));
-    return l;
-}
-BList* beans_str_lines(char* s) {
-    BList* l = beans_list_new(1);
-    long long n = beans_slen(s), i = 0;
-    for (long long j = 0; j < n; j++) {
-        if (s[j] == '\n') {
-            beans_list_push(l, (long long)str_make(s + i, j - i));
-            i = j + 1;
-        }
-    }
-    // a trailing newline doesn't make an empty final line
-    if (i < n) beans_list_push(l, (long long)str_make(s + i, n - i));
-    return l;
-}
-
-// ---- Bytes: kind 2 with no element pointers — data freed, never walked ----
-static BList* bytes_mk(long long n) {
-    BList* b = beans_alloc(sizeof(BList), 2);
-    long long cap = n < 8 ? 8 : n;
-    b->data = calloc((size_t)cap, 1);
-    if (!b->data) beans_panic("out of memory", 0, 0);
-    b->len = n;
-    b->cap = cap;
-    return b;
-}
-BList* beans_bytes_new(long long n, long long line, long long col) {
-    if (n < 0) {
-        char m[48];
-        snprintf(m, sizeof m, "negative size %lld", n);
-        beans_panic(m, line, col);
-    }
-    return bytes_mk(n);
-}
-BList* beans_bytes_from(char* s) {
-    long long n = beans_slen(s);
-    BList* b = bytes_mk(n);
-    memcpy(b->data, s, (size_t)n);
-    return b;
-}
-long long beans_bytes_len(BList* b) { return b->len; }
-long long beans_bytes_eq(BList* a, BList* b) {
-    return a->len == b->len && memcmp(a->data, b->data, (size_t)a->len) == 0;
-}
-
-// unsigned LEB128 over the 64-bit two's-complement pattern (negatives take
-// 10 bytes); crc32 is the IEEE polynomial, table-driven — builtins.cpp
-// computes the identical table
-static void bytes_grow(BList* b, long long need);
-void beans_bytes_append_varint(BList* b, long long x) {
-    unsigned long long v = (unsigned long long)x;
-    while (v >= 0x80) {
-        bytes_grow(b, b->len + 1);
-        ((unsigned char*)b->data)[b->len++] = (unsigned char)(v | 0x80);
-        v >>= 7;
-    }
-    bytes_grow(b, b->len + 1);
-    ((unsigned char*)b->data)[b->len++] = (unsigned char)v;
-}
-long long beans_bytes_get_varint(BList* b, long long pos, long long line,
-                                 long long col) {
-    unsigned long long v = 0;
-    long long shift = 0;
-    long long i = pos < 0 ? b->len : pos;
-    while (1) {
-        if (pos < 0 || i >= b->len) {
-            char m[96];
-            snprintf(m, sizeof m, "varint read at %lld out of range (len %lld)", pos,
-                     b->len);
-            beans_panic(m, line, col);
-        }
-        if (shift >= 64) {
-            char m[96];
-            snprintf(m, sizeof m, "varint too long at %lld", pos);
-            beans_panic(m, line, col);
-        }
-        unsigned char byte = ((unsigned char*)b->data)[i++];
-        v |= (unsigned long long)(byte & 0x7f) << shift;
-        if (!(byte & 0x80)) break;
-        shift += 7;
-    }
-    return (long long)v;
-}
-long long beans_bytes_varint_size(long long x) {
-    unsigned long long v = (unsigned long long)x;
-    long long n = 1;
-    while (v >= 0x80) {
-        v >>= 7;
-        n++;
-    }
-    return n;
-}
-static unsigned int crc_table[256];
-static int crc_ready = 0;
-long long beans_bytes_crc32(BList* b, long long from, long long to, long long line,
-                            long long col) {
-    if (from < 0 || to < from || to > b->len) {
-        char m[96];
-        snprintf(m, sizeof m, "crc32 %lld..%lld out of range (len %lld)", from, to,
-                 b->len);
-        beans_panic(m, line, col);
-    }
-    if (!crc_ready) {
-        for (unsigned int i = 0; i < 256; i++) {
-            unsigned int c = i;
-            for (int k = 0; k < 8; k++) c = (c & 1) ? 0xEDB88320u ^ (c >> 1) : c >> 1;
-            crc_table[i] = c;
-        }
-        crc_ready = 1;
-    }
-    unsigned int c = 0xFFFFFFFFu;
-    for (long long i = from; i < to; i++) {
-        c = crc_table[(c ^ ((unsigned char*)b->data)[i]) & 0xFF] ^ (c >> 8);
-    }
-    return (long long)(c ^ 0xFFFFFFFFu);
-}
-static void bytes_grow(BList* b, long long need) {
-    if (need <= b->cap) return;
-    long long cap = b->cap;
-    while (cap < need) cap *= 2;
-    b->data = realloc(b->data, (size_t)cap);
-    b->cap = cap;
-}
-void beans_bytes_resize(BList* b, long long n, long long line, long long col) {
-    if (n < 0) {
-        char m[48];
-        snprintf(m, sizeof m, "negative size %lld", n);
-        beans_panic(m, line, col);
-    }
-    bytes_grow(b, n);
-    // regrown range reads as zero, like the interpreter's vector resize
-    if (n > b->len) memset((char*)b->data + b->len, 0, (size_t)(n - b->len));
-    b->len = n;
-}
-void beans_bytes_reserve(BList* b, long long n, long long line, long long col) {
-    if (n < 0) {
-        char m[64];
-        snprintf(m, sizeof m, "negative reserve capacity %lld", n);
-        beans_panic(m, line, col);
-    }
-    if (n > (1LL << 58)) beans_panic("reserve capacity too large", line, col);
-    bytes_grow(b, n);
-}
-void beans_bytes_fill(BList* b, long long v) {
-    memset(b->data, (int)(v & 255), (size_t)b->len);
-}
-static void bytes_oob(long long i, long long len, long long line, long long col) {
-    char m[80];
-    snprintf(m, sizeof m, "byte index %lld out of range (len %lld)", i, len);
-    beans_panic(m, line, col);
-}
-long long beans_bytes_get(BList* b, long long i, long long line, long long col) {
-    if (i < 0 || i >= b->len) bytes_oob(i, b->len, line, col);
-    return (long long)((unsigned char*)b->data)[i];
-}
-void beans_bytes_set(BList* b, long long i, long long v, long long line, long long col) {
-    if (i < 0 || i >= b->len) bytes_oob(i, b->len, line, col);
-    ((unsigned char*)b->data)[i] = (unsigned char)(v & 255);
-}
-static void bytes_woob(const char* what, const char* op, long long pos, long long len,
-                       long long line, long long col) {
-    char m[96];
-    snprintf(m, sizeof m, "%s %s at %lld out of range (len %lld)", what, op, pos, len);
-    beans_panic(m, line, col);
-}
-static long long bytes_getw(BList* b, long long pos, long long w, const char* what,
-                            long long line, long long col) {
-    // pos > len - w, never pos + w > len: signed overflow on huge pos slips the
-    // wrapped sum past the guard and the memcpy goes wild
-    if (pos < 0 || w > b->len || pos > b->len - w) bytes_woob(what, "read", pos, b->len, line, col);
-    unsigned long long v = 0;
-    memcpy(&v, (char*)b->data + pos, (size_t)w); // little-endian hosts, documented
-    return (long long)v;
-}
-static void bytes_putw(BList* b, long long pos, long long w, long long val,
-                       const char* what, long long line, long long col) {
-    if (pos < 0 || w > b->len || pos > b->len - w) bytes_woob(what, "write", pos, b->len, line, col);
-    unsigned long long v = (unsigned long long)val;
-    memcpy((char*)b->data + pos, &v, (size_t)w);
-}
-long long beans_bytes_get_u8(BList* b, long long p, long long l, long long c) { return bytes_getw(b, p, 1, "u8", l, c); }
-long long beans_bytes_get_u16(BList* b, long long p, long long l, long long c) { return bytes_getw(b, p, 2, "u16", l, c); }
-long long beans_bytes_get_u32(BList* b, long long p, long long l, long long c) { return bytes_getw(b, p, 4, "u32", l, c); }
-long long beans_bytes_get_u64(BList* b, long long p, long long l, long long c) { return bytes_getw(b, p, 8, "u64", l, c); }
-long long beans_bytes_get_i64(BList* b, long long p, long long l, long long c) { return bytes_getw(b, p, 8, "i64", l, c); }
-void beans_bytes_put_u8(BList* b, long long p, long long v, long long l, long long c) { bytes_putw(b, p, 1, v, "u8", l, c); }
-void beans_bytes_put_u16(BList* b, long long p, long long v, long long l, long long c) { bytes_putw(b, p, 2, v, "u16", l, c); }
-void beans_bytes_put_u32(BList* b, long long p, long long v, long long l, long long c) { bytes_putw(b, p, 4, v, "u32", l, c); }
-void beans_bytes_put_u64(BList* b, long long p, long long v, long long l, long long c) { bytes_putw(b, p, 8, v, "u64", l, c); }
-void beans_bytes_put_i64(BList* b, long long p, long long v, long long l, long long c) { bytes_putw(b, p, 8, v, "i64", l, c); }
-BList* beans_bytes_slice(BList* b, long long from, long long to, long long line,
-                         long long col) {
-    if (from < 0 || to < from || to > b->len) {
-        char m[96];
-        snprintf(m, sizeof m, "slice %lld..%lld out of range (len %lld)", from, to,
-                 b->len);
-        beans_panic(m, line, col);
-    }
-    BList* r = bytes_mk(to - from);
-    memcpy(r->data, (char*)b->data + from, (size_t)(to - from));
-    return r;
-}
-void beans_bytes_copy_from(BList* b, BList* src, long long at, long long line,
-                           long long col) {
-    if (at < 0 || src->len > b->len || at > b->len - src->len) {
-        char m[96];
-        snprintf(m, sizeof m, "copy of %lld bytes at %lld out of range (len %lld)",
-                 src->len, at, b->len);
-        beans_panic(m, line, col);
-    }
-    memcpy((char*)b->data + at, src->data, (size_t)src->len);
-}
-void beans_bytes_append(BList* b, BList* o) {
-    bytes_grow(b, b->len + o->len);
-    memcpy((char*)b->data + b->len, o->data, (size_t)o->len);
-    b->len += o->len;
-}
-void beans_bytes_append_str(BList* b, char* s) {
-    long long n = beans_slen(s);
-    bytes_grow(b, b->len + n);
-    memcpy((char*)b->data + b->len, s, (size_t)n);
-    b->len += n;
-}
-void beans_bytes_append_i64(BList* b, long long value) {
-    bytes_grow(b, b->len + 8);
-    unsigned long long bits = (unsigned long long)value;
-    for (int shift = 0; shift < 64; shift += 8)
-        ((unsigned char*)b->data)[b->len++] = (unsigned char)(bits >> shift);
-}
-void beans_bytes_append_range(BList* b, BList* source, long long from, long long to,
-                              long long line, long long col) {
-    if (from < 0 || to < from || to > source->len) {
-        char m[96];
-        snprintf(m, sizeof m, "slice %lld..%lld out of range (len %lld)", from, to,
-                 source->len);
-        beans_panic(m, line, col);
-    }
-    long long count = to - from;
-    long long at = b->len;
-    bytes_grow(b, at + count);
-    memmove((char*)b->data + at, (char*)source->data + from, (size_t)count);
-    b->len += count;
-}
-char* beans_bytes_to_string(BList* b) {
-    long long n = 0;
-    while (n < b->len && ((char*)b->data)[n] != 0) n++; // strings are text
-    return str_make((char*)b->data, n);
-}
-char* beans_bytes_to_string_full(BList* b) {
-    return str_make((char*)b->data, b->len);
-}
-
-// ---- files (kind 6 resources) -----------------------------------------------
-// errno -> Error.kind slug; the interpreter builds the identical pair
-static const char* fs_kind_of(int err) {
-    switch (err) {
-        case ENOENT: return "not_found";
-        case EACCES:
-        case EPERM: return "permission";
-        case EEXIST: return "exists";
-        case ENOTDIR: return "not_dir";
-        case EISDIR: return "is_dir";
-        case ENOTEMPTY: return "not_empty";
-        default: return "io";
-    }
-}
-static void* fs_err_obj(const char* path, int err) {
-    size_t n = strlen(path) + 96;
-    char* b = malloc(n);
-    snprintf(b, n, "%s: %s", path, strerror(err));
-    void* e = mk_error(b, fs_kind_of(err));
-    free(b);
-    return e;
-}
-// for paths that are beans strings: splice by stored length so a path with
-// an embedded NUL reports the same bytes the interpreter does (the plain
-// fs_err_obj above stays for internal C-built paths, which never hold NUL)
-static void* fs_err_obj_rc(char* path, int err) {
-    const char* es = strerror(err);
-    long long lp = beans_slen(path);
-    size_t le = strlen(es);
-    long long total = lp + 2 + (long long)le;
-    char* m = beans_alloc(total + 1, total << 3);
-    memcpy(m, path, (size_t)lp);
-    m[lp] = ':';
-    m[lp + 1] = ' ';
-    memcpy(m + lp + 2, es, le);
-    return mk_error_own(m, fs_kind_of(err));
-}
-static void* op_err_obj(const char* op, int err) {
-    char b[96];
-    snprintf(b, sizeof b, "%s: %s", op, strerror(err));
-    return mk_error(b, fs_kind_of(err));
-}
-static void* closed_err(void) { return mk_error("file is closed", "closed"); }
-
-BRes beans_file_read_at(BFile* f, long long pos, long long n) {
-    if (f->closed) return (BRes){0, closed_err()};
-    if (pos < 0 || n < 0) return (BRes){0, mk_error("negative read", "io")};
-    // clamp to what the file can actually give: a corrupted length field must
-    // not become a giant allocation — the read comes back short anyway
-    struct stat rst;
-    if (fstat((int)f->fd, &rst) == 0 && S_ISREG(rst.st_mode)) {
-        long long rem = rst.st_size > pos ? rst.st_size - pos : 0;
-        if (n > rem) n = rem;
-    }
-    BList* buf = bytes_mk(n);
-    long long got = 0;
-    while (got < n) {
-        ssize_t r = pread((int)f->fd, (char*)buf->data + got, (size_t)(n - got),
-                          (off_t)(pos + got));
-        if (r < 0) {
-            if (errno == EINTR) continue;
-            int e = errno;
-            beans_release(buf); // the error path must not leak the buffer
-            return (BRes){0, op_err_obj("read", e)};
-        }
-        if (r == 0) break; // eof: a short read returns what's there
-        got += r;
-    }
-    buf->len = got;
-    return (BRes){(long long)buf, NULL};
-}
-BRes beans_file_write_at(BFile* f, long long pos, BList* d) {
-    if (f->closed) return (BRes){0, closed_err()};
-    if (pos < 0) return (BRes){0, mk_error("negative write", "io")};
-    long long done = 0;
-    while (done < d->len) {
-        ssize_t r = pwrite((int)f->fd, (char*)d->data + done, (size_t)(d->len - done),
-                           (off_t)(pos + done));
-        if (r < 0) {
-            if (errno == EINTR) continue;
-            return (BRes){0, op_err_obj("write", errno)};
-        }
-        done += r;
-    }
-    return (BRes){done, NULL};
-}
-BRes beans_file_read(BFile* f, long long n) {
-    if (f->closed) return (BRes){0, closed_err()};
-    if (n < 0) return (BRes){0, mk_error("negative read", "io")};
-    struct stat rst;
-    if (fstat((int)f->fd, &rst) == 0 && S_ISREG(rst.st_mode)) {
-        long long at = (long long)lseek((int)f->fd, 0, SEEK_CUR);
-        long long rem = at >= 0 && rst.st_size > at ? rst.st_size - at : 0;
-        if (n > rem) n = rem;
-    }
-    BList* buf = bytes_mk(n);
-    long long got = 0;
-    while (got < n) {
-        ssize_t r = read((int)f->fd, (char*)buf->data + got, (size_t)(n - got));
-        if (r < 0) {
-            if (errno == EINTR) continue;
-            int e = errno;
-            beans_release(buf); // the error path must not leak the buffer
-            return (BRes){0, op_err_obj("read", e)};
-        }
-        if (r == 0) break;
-        got += r;
-    }
-    buf->len = got;
-    return (BRes){(long long)buf, NULL};
-}
-BRes beans_file_write(BFile* f, BList* d) {
-    if (f->closed) return (BRes){0, closed_err()};
-    long long done = 0;
-    while (done < d->len) {
-        ssize_t r = write((int)f->fd, (char*)d->data + done, (size_t)(d->len - done));
-        if (r < 0) {
-            if (errno == EINTR) continue;
-            return (BRes){0, op_err_obj("write", errno)};
-        }
-        done += r;
-    }
-    return (BRes){done, NULL};
-}
-long long beans_file_seek(BFile* f, long long pos, long long line, long long col) {
-    if (f->closed) beans_panic("file is closed", line, col);
-    off_t r = lseek((int)f->fd, (off_t)pos, SEEK_SET);
-    if (r < 0) {
-        char m[96];
-        snprintf(m, sizeof m, "seek to %lld: %s", pos, strerror(errno));
-        beans_panic(m, line, col);
-    }
-    return (long long)r;
-}
-long long beans_file_seek_end(BFile* f, long long off, long long line, long long col) {
-    if (f->closed) beans_panic("file is closed", line, col);
-    off_t r = lseek((int)f->fd, (off_t)off, SEEK_END);
-    if (r < 0) {
-        char m[96];
-        snprintf(m, sizeof m, "seek to %lld: %s", off, strerror(errno));
-        beans_panic(m, line, col);
-    }
-    return (long long)r;
-}
-long long beans_file_tell(BFile* f, long long line, long long col) {
-    if (f->closed) beans_panic("file is closed", line, col);
-    return (long long)lseek((int)f->fd, 0, SEEK_CUR);
-}
-BRes beans_file_size(BFile* f) {
-    if (f->closed) return (BRes){0, closed_err()};
-    struct stat st;
-    if (fstat((int)f->fd, &st) != 0) return (BRes){0, op_err_obj("size", errno)};
-    return (BRes){(long long)st.st_size, NULL};
-}
-BRes beans_file_truncate(BFile* f, long long n) {
-    if (f->closed) return (BRes){0, closed_err()};
-    if (ftruncate((int)f->fd, (off_t)n) != 0) {
-        return (BRes){0, op_err_obj("truncate", errno)};
-    }
-    return (BRes){1, NULL};
-}
-BRes beans_file_sync(BFile* f) {
-    if (f->closed) return (BRes){0, closed_err()};
-    if (fsync((int)f->fd) != 0) return (BRes){0, op_err_obj("sync", errno)};
-    return (BRes){1, NULL};
-}
-BRes beans_file_close(BFile* f) {
-    if (f->closed) return (BRes){0, mk_error("file already closed", "closed")};
-    f->closed = 1;
-    // While worker threads are live, defer the real close(): a racing op on
-    // another thread could still be mid-syscall on this fd, and reusing the
-    // number for a freshly-opened file would silently corrupt it. The fd stays
-    // open (harmless — same file) until the handle's last ref drops in
-    // cc_free_shell, when no thread can hold it. This mirrors the collector's
-    // own "don't touch shared resources while mutators run" gate. Zero cost
-    // single-threaded, where cc_threads is 0 and the fd closes now.
-    if (cc_threads > 0) return (BRes){1, NULL};
-    long long fd = f->fd;
-    f->fd = -1;
-    if (close((int)fd) != 0) return (BRes){0, op_err_obj("close", errno)};
-    return (BRes){1, NULL};
-}
-
-// advisory flock — single-writer databases; try_lock's ok(false) means "held
-// by someone else", every other failure is a real error
-BRes beans_file_lock(BFile* f) {
-    if (f->closed) return (BRes){0, closed_err()};
-    // a blocking lock is the classic EINTR victim — retry rather than fail
-    while (flock((int)f->fd, LOCK_EX) != 0) {
-        if (errno == EINTR) continue;
-        return (BRes){0, op_err_obj("lock", errno)};
-    }
-    return (BRes){1, NULL};
-}
-BRes beans_file_try_lock(BFile* f) {
-    if (f->closed) return (BRes){0, closed_err()};
-    if (flock((int)f->fd, LOCK_EX | LOCK_NB) != 0) {
-        if (errno == EWOULDBLOCK) return (BRes){0, NULL};
-        return (BRes){0, op_err_obj("try_lock", errno)};
-    }
-    return (BRes){1, NULL};
-}
-BRes beans_file_unlock(BFile* f) {
-    if (f->closed) return (BRes){0, closed_err()};
-    if (flock((int)f->fd, LOCK_UN) != 0) return (BRes){0, op_err_obj("unlock", errno)};
-    return (BRes){1, NULL};
-}
-
-// ---- mmap (kind 6, shape bit 0 = 1) ----
-// whole-file shared mapping; the fd is kept open so resize() can ftruncate +
-// remap. get/put/read/write panic on a closed or short map, flush/close
-// report errors as Results like File does.
-static void* mmap_closed_err(void) { return mk_error("mmap is closed", "closed"); }
-BRes beans_mmap_open(char* path, long long writable) {
-    int fd = open(path, writable ? O_RDWR : O_RDONLY);
-    if (fd < 0) return (BRes){0, fs_err_obj_rc(path, errno)};
-    struct stat st;
-    if (fstat(fd, &st) != 0) {
-        int e = errno;
-        close(fd);
-        return (BRes){0, fs_err_obj_rc(path, e)};
-    }
-    char* p = NULL;
-    if (st.st_size > 0) {
-        p = mmap(NULL, (size_t)st.st_size,
-                 writable ? PROT_READ | PROT_WRITE : PROT_READ, MAP_SHARED, fd, 0);
-        if (p == MAP_FAILED) {
-            int e = errno;
-            close(fd);
-            return (BRes){0, fs_err_obj_rc(path, e)};
-        }
-    }
-    BMMap* m = beans_alloc(sizeof(BMMap), 6 | (1 << 3));
-    m->p = p;
-    m->len = (long long)st.st_size;
-    m->fd = fd; // kept: resize() needs it to ftruncate + remap
-    m->writable = writable;
-    return (BRes){(long long)m, NULL};
-}
-long long beans_mmap_len(BMMap* m) { return m->len; }
-static void mmap_guard(BMMap* m, long long line, long long col) {
-    if (m->closed) beans_panic("mmap is closed", line, col);
-}
-static long long mmap_word(BMMap* m, const char* what, long long pos, long long w,
-                           long long line, long long col) {
-    mmap_guard(m, line, col);
-    // pos > len - w, never pos + w > len — the sum overflows for huge pos
-    if (pos < 0 || w > m->len || pos > m->len - w) {
-        char b[96];
-        snprintf(b, sizeof b, "%s read at %lld out of range (len %lld)", what, pos,
-                 m->len);
-        beans_panic(b, line, col);
-    }
-    unsigned long long v = 0;
-    memcpy(&v, m->p + pos, (size_t)w);
-    return (long long)v;
-}
-static void mmap_put_word(BMMap* m, const char* what, long long pos, long long v,
-                          long long w, long long line, long long col) {
-    mmap_guard(m, line, col);
-    if (!m->writable) beans_panic("mmap is read-only", line, col);
-    if (pos < 0 || w > m->len || pos > m->len - w) {
-        char b[96];
-        snprintf(b, sizeof b, "%s write at %lld out of range (len %lld)", what, pos,
-                 m->len);
-        beans_panic(b, line, col);
-    }
-    memcpy(m->p + pos, &v, (size_t)w);
-}
-long long beans_mmap_get_u8(BMMap* m, long long p, long long l, long long c) { return mmap_word(m, "u8", p, 1, l, c); }
-long long beans_mmap_get_u16(BMMap* m, long long p, long long l, long long c) { return mmap_word(m, "u16", p, 2, l, c); }
-long long beans_mmap_get_u32(BMMap* m, long long p, long long l, long long c) { return mmap_word(m, "u32", p, 4, l, c); }
-long long beans_mmap_get_u64(BMMap* m, long long p, long long l, long long c) { return mmap_word(m, "u64", p, 8, l, c); }
-long long beans_mmap_get_i64(BMMap* m, long long p, long long l, long long c) { return mmap_word(m, "i64", p, 8, l, c); }
-void beans_mmap_put_u8(BMMap* m, long long p, long long v, long long l, long long c) { mmap_put_word(m, "u8", p, v, 1, l, c); }
-void beans_mmap_put_u16(BMMap* m, long long p, long long v, long long l, long long c) { mmap_put_word(m, "u16", p, v, 2, l, c); }
-void beans_mmap_put_u32(BMMap* m, long long p, long long v, long long l, long long c) { mmap_put_word(m, "u32", p, v, 4, l, c); }
-void beans_mmap_put_u64(BMMap* m, long long p, long long v, long long l, long long c) { mmap_put_word(m, "u64", p, v, 8, l, c); }
-void beans_mmap_put_i64(BMMap* m, long long p, long long v, long long l, long long c) { mmap_put_word(m, "i64", p, v, 8, l, c); }
-BList* beans_mmap_read(BMMap* m, long long pos, long long n, long long line,
-                       long long col) {
-    mmap_guard(m, line, col);
-    if (pos < 0 || n < 0 || n > m->len || pos > m->len - n) {
-        char b[96];
-        snprintf(b, sizeof b, "read %lld at %lld out of range (len %lld)", n, pos,
-                 m->len);
-        beans_panic(b, line, col);
-    }
-    BList* r = bytes_mk(n);
-    memcpy(r->data, m->p + pos, (size_t)n);
-    return r;
-}
-void beans_mmap_write(BMMap* m, long long pos, BList* d, long long line,
-                      long long col) {
-    mmap_guard(m, line, col);
-    if (!m->writable) beans_panic("mmap is read-only", line, col);
-    if (pos < 0 || d->len > m->len || pos > m->len - d->len) {
-        char b[96];
-        snprintf(b, sizeof b, "write %lld at %lld out of range (len %lld)", d->len,
-                 pos, m->len);
-        beans_panic(b, line, col);
-    }
-    memcpy(m->p + pos, d->data, (size_t)d->len);
-}
-BRes beans_mmap_flush(BMMap* m) {
-    if (m->closed) return (BRes){0, mmap_closed_err()};
-    if (m->len > 0 && msync(m->p, (size_t)m->len, MS_SYNC) != 0) {
-        return (BRes){0, op_err_obj("flush", errno)};
-    }
-    return (BRes){1, NULL};
-}
-BRes beans_mmap_flush_range(BMMap* m, long long pos, long long n) {
-    if (m->closed) return (BRes){0, mmap_closed_err()};
-    if (pos < 0 || n < 0 || n > m->len || pos > m->len - n) {
-        char b[96];
-        snprintf(b, sizeof b, "flush %lld at %lld out of range (len %lld)", n, pos,
-                 m->len);
-        return (BRes){0, mk_error(b, "io")};
-    }
-    if (n > 0) {
-        long long page = (long long)getpagesize();
-        long long start = pos - pos % page; // msync wants a page-aligned base
-        if (msync(m->p + start, (size_t)(pos + n - start), MS_SYNC) != 0) {
-            return (BRes){0, op_err_obj("flush", errno)};
-        }
-    }
-    return (BRes){1, NULL};
-}
-BRes beans_mmap_close(BMMap* m) {
-    if (m->closed) return (BRes){0, mk_error("mmap already closed", "closed")};
-    m->closed = 1;
-    // defer munmap+close while workers run (see beans_file_close): a racing op
-    // reading through the mapping must not have it pulled out from under it
-    if (cc_threads > 0) return (BRes){1, NULL};
-    int bad = m->p && munmap(m->p, (size_t)m->len) != 0;
-    int e = errno;
-    m->p = NULL;
-    if (m->fd >= 0) close((int)m->fd);
-    m->fd = -1;
-    if (bad) return (BRes){0, op_err_obj("close", e)};
-    return (BRes){1, NULL};
-}
-
-// grow or shrink in place: truncate the file, drop the old mapping, map
-// fresh. On a mapping failure the handle stays open but empty (len 0).
-BRes beans_mmap_resize(BMMap* m, long long n) {
-    if (m->closed) return (BRes){0, mmap_closed_err()};
-    if (!m->writable) return (BRes){0, mk_error("mmap is read-only", "permission")};
-    if (n < 0) return (BRes){0, mk_error("negative resize", "io")};
-    if (ftruncate((int)m->fd, (off_t)n) != 0) {
-        return (BRes){0, op_err_obj("resize", errno)};
-    }
-    if (m->p) munmap(m->p, (size_t)m->len);
-    m->p = NULL;
-    m->len = 0;
-    if (n > 0) {
-        char* p = mmap(NULL, (size_t)n, PROT_READ | PROT_WRITE, MAP_SHARED,
-                       (int)m->fd, 0);
-        if (p == MAP_FAILED) return (BRes){0, op_err_obj("resize", errno)};
-        m->p = p;
-        m->len = n;
-    }
-    return (BRes){1, NULL};
-}
-
-// ---- Dir.walk: files and symlinks under root (lstat — never follows a
-// link), paths relative to root, "/"-joined, sorted at the end ----
-typedef struct {
-    char** v;
-    long long len, cap;
-} StrVec;
-static void sv_push(StrVec* s, char* p) {
-    if (s->len == s->cap) {
-        s->cap = s->cap ? s->cap * 2 : 16;
-        s->v = realloc(s->v, (size_t)s->cap * sizeof(char*));
-    }
-    s->v[s->len++] = p;
-}
-static char* path_cat(const char* a, const char* b) {
-    size_t la = strlen(a), lb = strlen(b);
-    char* r = malloc(la + lb + 2);
-    memcpy(r, a, la);
-    r[la] = '/';
-    memcpy(r + la + 1, b, lb);
-    r[la + 1 + lb] = 0;
-    return r;
-}
-static void sv_free(StrVec* s) {
-    for (long long i = 0; i < s->len; i++) free(s->v[i]);
-    free(s->v);
-}
-// Iterative walk: an explicit stack of relative dir paths, one DIR open at a
-// time. Recursion held one fd per depth level and ran out at ~250 deep; this
-// caps open fds at one. Output is sorted afterward, so traversal order is
-// free.
-static int walk_dir(const char* root, StrVec* out, char** epath, int* eno) {
-    StrVec stack = {0, 0, 0};
-    sv_push(&stack, strdup("")); // "" = root itself
-    int ok = 1;
-    while (stack.len > 0) {
-        char* rel = stack.v[--stack.len];
-        char* full = rel[0] ? path_cat(root, rel) : strdup(root);
-        DIR* d = opendir(full);
-        if (!d) {
-            *epath = full;
-            *eno = errno;
-            free(rel);
-            ok = 0;
-            break;
-        }
-        free(full);
-        struct dirent* en;
-        while ((en = readdir(d))) {
-            if (strcmp(en->d_name, ".") == 0 || strcmp(en->d_name, "..") == 0) continue;
-            char* r2 = rel[0] ? path_cat(rel, en->d_name) : strdup(en->d_name);
-            char* abs = path_cat(root, r2);
-            struct stat st;
-            if (lstat(abs, &st) != 0) {
-                *epath = abs;
-                *eno = errno;
-                free(r2);
-                ok = 0;
-                break;
-            }
-            free(abs);
-            if (S_ISDIR(st.st_mode)) sv_push(&stack, r2); // descend later
-            else sv_push(out, r2);
-        }
-        closedir(d);
-        free(rel);
-        if (!ok) break;
-    }
-    for (long long i = 0; i < stack.len; i++) free(stack.v[i]);
-    free(stack.v);
-    return ok;
-}
-static int walk_cmp(const void* a, const void* b) {
-    return strcmp(*(char* const*)a, *(char* const*)b);
-}
-BRes beans_dir_walk(char* path) {
-    StrVec out = {0, 0, 0};
-    char* epath = NULL;
-    int eno = 0;
-    if (!walk_dir(path, &out, &epath, &eno)) {
-        void* e = fs_err_obj(epath, eno);
-        free(epath);
-        for (long long i = 0; i < out.len; i++) free(out.v[i]);
-        free(out.v);
-        return (BRes){0, e};
-    }
-    qsort(out.v, (size_t)out.len, sizeof(char*), walk_cmp);
-    BList* l = beans_list_new(1);
-    for (long long i = 0; i < out.len; i++) {
-        beans_list_push(l, (long long)rc_strdup(out.v[i]));
-        free(out.v[i]);
-    }
-    free(out.v);
-    return (BRes){(long long)l, NULL};
-}
-
-BRes beans_file_open(char* path, char* mode) {
-    int flags;
-    if (strcmp(mode, "r") == 0) flags = O_RDONLY;
-    else if (strcmp(mode, "rw") == 0) flags = O_RDWR;
-    else if (strcmp(mode, "create") == 0) flags = O_RDWR | O_CREAT;
-    else if (strcmp(mode, "append") == 0) flags = O_WRONLY | O_CREAT | O_APPEND;
-    else {
-        // mode is a beans string of any length — heap-build so a long bad
-        // mode reports its full text like the interpreter, not a truncation
-        size_t n = strlen(mode) + 24;
-        char* m = malloc(n);
-        snprintf(m, n, "bad open mode '%s'", mode);
-        void* e = mk_error(m, "io");
-        free(m);
-        return (BRes){0, e};
-    }
-    int fd = open(path, flags, 0644);
-    if (fd < 0) return (BRes){0, fs_err_obj_rc(path, errno)};
-    BFile* f = beans_alloc(sizeof(BFile), 6);
-    f->fd = fd;
-    f->closed = 0;
-    return (BRes){(long long)f, NULL};
-}
-
-long long beans_file_exists(char* path) {
-    struct stat st;
-    return stat(path, &st) == 0 && !S_ISDIR(st.st_mode);
-}
-BRes beans_file_size_p(char* path) {
-    struct stat st;
-    if (stat(path, &st) != 0) return (BRes){0, fs_err_obj_rc(path, errno)};
-    return (BRes){(long long)st.st_size, NULL};
-}
-BRes beans_file_remove(char* path) {
-    struct stat st;
-    // lstat: remove the link itself, and let a dangling symlink be removed
-    if (lstat(path, &st) != 0) return (BRes){0, fs_err_obj_rc(path, errno)};
-    int r = S_ISDIR(st.st_mode) ? rmdir(path) : unlink(path);
-    if (r != 0) return (BRes){0, fs_err_obj_rc(path, errno)};
-    return (BRes){1, NULL};
-}
-BRes beans_file_rename(char* from, char* to) {
-    if (rename(from, to) != 0) return (BRes){0, fs_err_obj_rc(from, errno)};
-    return (BRes){1, NULL};
-}
-BRes beans_dir_make(char* path) {
-    if (mkdir(path, 0755) != 0) return (BRes){0, fs_err_obj_rc(path, errno)};
-    return (BRes){1, NULL};
-}
-BRes beans_dir_make_all(char* path) {
-    long long n = beans_slen(path);
-    char* cur = malloc((size_t)n + 1);
-    long long i = 0;
-    while (i < n) {
-        long long j = i;
-        while (j < n && path[j] != '/') j++;
-        memcpy(cur, path, (size_t)j);
-        cur[j] = 0;
-        i = j + 1;
-        if (cur[0] == 0) continue;
-        if (mkdir(cur, 0755) != 0) {
-            int me = errno;
-            // EEXIST is only ok if the existing entry is a directory
-            struct stat st;
-            if (me != EEXIST || stat(cur, &st) != 0 || !S_ISDIR(st.st_mode)) {
-                BRes r = {0, fs_err_obj(cur, me == EEXIST ? ENOTDIR : me)};
-                free(cur);
-                return r;
-            }
-        }
-    }
-    free(cur);
-    return (BRes){1, NULL};
-}
-static int name_cmp(const void* a, const void* b) {
-    return strcmp(*(const char* const*)a, *(const char* const*)b);
-}
-BRes beans_dir_list(char* path) {
-    DIR* d = opendir(path);
-    if (!d) return (BRes){0, fs_err_obj_rc(path, errno)};
-    char** names = NULL;
-    long long cnt = 0, cap = 0;
-    struct dirent* de;
-    while ((de = readdir(d)) != NULL) {
-        if (strcmp(de->d_name, ".") == 0 || strcmp(de->d_name, "..") == 0) continue;
-        if (cnt == cap) {
-            cap = cap ? cap * 2 : 16;
-            names = realloc(names, (size_t)cap * sizeof(char*));
-        }
-        names[cnt++] = strdup(de->d_name);
-    }
-    closedir(d);
-    qsort(names, (size_t)cnt, sizeof(char*), name_cmp); // deterministic
-    BList* l = beans_list_new(1);
-    for (long long i = 0; i < cnt; i++) {
-        beans_list_push(l, (long long)rc_strdup(names[i]));
-        free(names[i]);
-    }
-    free(names);
-    return (BRes){(long long)l, NULL};
-}
-BRes beans_dir_remove(char* path) {
-    if (rmdir(path) != 0) return (BRes){0, fs_err_obj_rc(path, errno)};
-    return (BRes){1, NULL};
-}
-// Iterative delete: gather the tree pre-order (parent before child) with one
-// DIR open at a time, then remove in reverse (deepest first). Recursion held
-// one fd per level and a fixed 1024-byte path buffer that silently truncated
-// deep paths; this heap-builds every path and caps open fds at one.
-static int rm_tree(const char* p) {
-    struct stat st;
-    if (lstat(p, &st) != 0) return -1;
-    if (!S_ISDIR(st.st_mode)) return unlink(p);
-    StrVec dirs = {0, 0, 0}; // dirs to rmdir, in discovery (pre) order
-    StrVec stack = {0, 0, 0}; // dirs still to scan
-    sv_push(&stack, strdup(p));
-    int ok = 1;
-    while (stack.len > 0) {
-        char* dir = stack.v[--stack.len];
-        DIR* d = opendir(dir);
-        if (!d) {
-            free(dir);
-            ok = 0;
-            break;
-        }
-        struct dirent* de;
-        while ((de = readdir(d)) != NULL) {
-            if (strcmp(de->d_name, ".") == 0 || strcmp(de->d_name, "..") == 0) continue;
-            char* sub = path_cat(dir, de->d_name);
-            struct stat cst;
-            if (lstat(sub, &cst) != 0) {
-                free(sub);
-                ok = 0;
-                break;
-            }
-            if (S_ISDIR(cst.st_mode)) sv_push(&stack, sub); // scan later
-            else {
-                if (unlink(sub) != 0) ok = 0;
-                free(sub);
-                if (!ok) break;
-            }
-        }
-        closedir(d);
-        sv_push(&dirs, dir); // remove this dir after its children
-        if (!ok) break;
-    }
-    for (long long i = 0; i < stack.len; i++) free(stack.v[i]);
-    free(stack.v);
-    // deepest first: dirs were collected parent-before-child, so reverse
-    for (long long i = dirs.len; ok && i-- > 0;) {
-        if (rmdir(dirs.v[i]) != 0) ok = 0;
-    }
-    sv_free(&dirs);
-    return ok ? 0 : -1;
-}
-BRes beans_dir_remove_all(char* path) {
-    struct stat st;
-    if (lstat(path, &st) != 0) return (BRes){0, fs_err_obj_rc(path, errno)};
-    if (rm_tree(path) != 0) return (BRes){0, fs_err_obj_rc(path, errno)};
-    return (BRes){1, NULL};
-}
-long long beans_dir_exists(char* path) {
-    struct stat st;
-    return stat(path, &st) == 0 && S_ISDIR(st.st_mode);
-}
-char* beans_dir_temp(void) {
-    const char* t = getenv("TMPDIR");
-    const char* src = t && *t ? t : "/tmp";
-    long long n = (long long)strlen(src);
-    while (n > 1 && src[n - 1] == '/') n--; // trim trailing slashes
-    return str_make(src, n);
-}
-BRes beans_dir_sync(char* path) {
-    // the database commit pattern: fsync the directory after a rename
-    int fd = open(path, O_RDONLY);
-    if (fd < 0) return (BRes){0, fs_err_obj_rc(path, errno)};
-    if (fsync(fd) != 0) {
-        int e = errno;
-        close(fd);
-        return (BRes){0, fs_err_obj_rc(path, e)};
-    }
-    close(fd);
-    return (BRes){1, NULL};
-}
-
-// ---- std.os / std.io --------------------------------------------------------
-static int os_argc;
-static char** os_argv;
-__attribute__((constructor)) static void os_capture(int argc, char** argv) {
-    os_argc = argc;
-    os_argv = argv;
-}
-BList* beans_os_args(void) {
-    BList* l = beans_list_new(1);
-    for (int i = 1; i < os_argc; i++) {
-        beans_list_push(l, (long long)rc_strdup(os_argv[i]));
-    }
-    return l;
-}
-BOpt beans_os_env(char* name) {
-    const char* v = getenv(name);
-    if (!v) return (BOpt){0, 0};
-    return (BOpt){(long long)rc_strdup(v), 1};
-}
-void beans_os_exit(long long code) { exit((int)code); }
-long long beans_os_now_ms(void) {
-    struct timespec ts;
-    clock_gettime(CLOCK_REALTIME, &ts);
-    return (long long)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
-}
-long long beans_os_ticks_ms(void) {
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (long long)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
-}
-void beans_os_sleep_ms(long long ms) {
-    if (ms > 0) {
-        struct timespec ts;
-        ts.tv_sec = ms / 1000;
-        ts.tv_nsec = (ms % 1000) * 1000000;
-        nanosleep(&ts, NULL);
-    }
-}
-BOpt beans_io_read_line(void) {
-    char* out = NULL;
-    long long len = 0, cap = 0;
-    int c;
-    int any = 0;
-    while ((c = fgetc(stdin)) != EOF) {
-        any = 1;
-        if (c == '\n') break;
-        if (len == cap) {
-            cap = cap ? cap * 2 : 128;
-            out = realloc(out, (size_t)cap);
-        }
-        out[len++] = (char)c;
-    }
-    if (!any) {
-        free(out);
-        return (BOpt){0, 0};
-    }
-    char* s = str_make(out ? out : "", len);
-    free(out);
-    return (BOpt){(long long)s, 1};
-}
-char* beans_io_read_all(void) {
-    char* out = NULL;
-    long long len = 0, cap = 0;
-    char chunk[65536];
-    size_t r;
-    while ((r = fread(chunk, 1, sizeof chunk, stdin)) > 0) {
-        if (len + (long long)r > cap) {
-            cap = cap ? cap * 2 : 65536;
-            while (cap < len + (long long)r) cap *= 2;
-            out = realloc(out, (size_t)cap);
-        }
-        memcpy(out + len, chunk, r);
-        len += r;
-    }
-    char* s = str_make(out ? out : "", len);
-    free(out);
-    return s;
-}
-void beans_eprintln(char* s) {
-    fwrite(s, 1, (size_t)beans_slen(s), stderr);
-    fputc('\n', stderr);
-}
-void beans_eprint(char* s) { fwrite(s, 1, (size_t)beans_slen(s), stderr); }
-
-// ---- threads ----
-typedef struct {
-    pthread_t th;
-    long long result;
-    long long (*thunk)(void*);
-    void* env;
-    int joined;
-} BThread;
-void beans_thread_release_env(void* env);
-static void* thread_main(void* arg) {
-    BThread* t = arg;
-    t->result = t->thunk(t->env);
-    beans_release(t->env);
-    beans_release(t); // the running thread's own ref on the handle
-    // last heap touch is done — the cycle collector may run again
-    cc_threads -= 1;
-    return NULL;
-}
-BThread* beans_thread_spawn(void* thunk, void* env) {
-    BThread* t = beans_alloc(sizeof(BThread), 0);
-    t->thunk = (long long (*)(void*))thunk;
-    t->env = env; // ownership of the closure box moves to the thread
-    cc_enable_mt(); // from here every count op is atomic, in every thread
-    beans_retain(t); // one ref for the handle, one for the running thread
-    cc_threads += 1;
-    pthread_create(&t->th, NULL, thread_main, t);
-    return t;
-}
-long long beans_thread_join(BThread* t) {
-    if (t->joined) beans_panic("thread already joined", 0, 0);
-    t->joined = 1;
-    pthread_join(t->th, NULL);
-    return t->result;
-}
-
-BMutex* beans_mutex_new(long long inner, long long inner_ptr) {
-    BMutex* mu = beans_alloc(sizeof(BMutex), 5 | (inner_ptr << 3));
-    pthread_mutex_init(&mu->m, NULL);
-    mu->inner = inner;
-    return mu;
-}
-long long beans_mutex_lock(BMutex* mu) {
-    pthread_mutex_lock(&mu->m);
-    return mu->inner;
-}
-void beans_mutex_unlock(BMutex* mu) { pthread_mutex_unlock(&mu->m); }
-
-BChan* beans_chan_new(long long cap, long long elem_ptr) {
-    BChan* c = beans_alloc(sizeof(BChan), 4 | (elem_ptr << 3));
-    c->cap = cap > 0 ? cap : 1;
-    c->q = calloc((size_t)c->cap, 8);
-    pthread_mutex_init(&c->m, NULL);
-    pthread_cond_init(&c->can_send, NULL);
-    pthread_cond_init(&c->can_recv, NULL);
-    return c;
-}
-long long beans_chan_send(BChan* c, long long v) {
-    pthread_mutex_lock(&c->m);
-    while (c->count == c->cap && !c->closed) pthread_cond_wait(&c->can_send, &c->m);
-    if (c->closed) {
-        pthread_mutex_unlock(&c->m);
-        return 0; // caller panics; caller also still owns v
-    }
-    c->q[(c->head + c->count) % c->cap] = v;
-    c->count += 1;
-    pthread_cond_signal(&c->can_recv);
-    pthread_mutex_unlock(&c->m);
-    return 1;
-}
-long long beans_chan_recv(BChan* c, long long* ok) {
-    pthread_mutex_lock(&c->m);
-    while (c->count == 0 && !c->closed) pthread_cond_wait(&c->can_recv, &c->m);
-    if (c->count == 0) {
-        *ok = 0;
-        pthread_mutex_unlock(&c->m);
-        return 0;
-    }
-    long long v = c->q[c->head];
-    c->head = (c->head + 1) % c->cap;
-    c->count -= 1;
-    *ok = 1;
-    pthread_cond_signal(&c->can_send);
-    pthread_mutex_unlock(&c->m);
-    return v;
-}
-void beans_chan_close(BChan* c) {
-    pthread_mutex_lock(&c->m);
-    c->closed = 1;
-    pthread_cond_broadcast(&c->can_send);
-    pthread_cond_broadcast(&c->can_recv);
-    pthread_mutex_unlock(&c->m);
-}
-
-typedef struct { _Atomic long long v; } BAtomic;
-BAtomic* beans_atomic_new(long long init) {
-    BAtomic* a = beans_alloc(sizeof(BAtomic), 0);
-    a->v = init;
-    return a;
-}
-long long beans_atomic_add(BAtomic* a, long long d) { return (a->v += d); }
-long long beans_atomic_get(BAtomic* a) { return a->v; }
-void beans_atomic_set(BAtomic* a, long long v) { a->v = v; }
-
-// ---- decimal: 128-bit coefficient + base-10 scale (same math as the interpreter) ----
-typedef struct BDec {
-    __int128 c;
-    long long s;
-} BDec;
-typedef unsigned __int128 BDecV;
-#define BDEC_COEFF_BITS 112
-static BDecV decv_coeff_mask(void) {
-    return (((BDecV)1) << BDEC_COEFF_BITS) - 1;
-}
-static __int128 decv_coeff(BDecV v) {
-    BDecV mask = decv_coeff_mask();
-    BDecV raw = v & mask;
-    if (raw & (((BDecV)1) << (BDEC_COEFF_BITS - 1))) raw |= ~mask;
-    return (__int128)raw;
-}
-static long long decv_scale(BDecV v) {
-    return (long long)(v >> BDEC_COEFF_BITS);
-}
-static BDecV decv_mk(__int128 c, long long s) {
-    const __int128 limit = ((__int128)1) << (BDEC_COEFF_BITS - 1);
-    if (s < 0 || s > 65535 || c < -limit || c >= limit)
-        beans_panic("decimal overflow", 0, 0);
-    return (((BDecV)(unsigned long long)s) << BDEC_COEFF_BITS) |
-           ((BDecV)c & decv_coeff_mask());
-}
-static BDec* dec_mk(__int128 c, long long s) {
-    BDec* d = beans_alloc(sizeof(BDec), 0);
-    d->c = c;
-    d->s = s;
-    return d;
-}
-static __int128 pow10i(long long n) {
-    __int128 p = 1;
-    for (long long i = 0; i < n; i++) p *= 10;
-    return p;
-}
-BDec* beans_dec_new(__int128 c, long long s) { return dec_mk(c, s); }
-BDec* beans_dec_from_int(long long v) { return dec_mk((__int128)v, 0); }
-BDec* beans_decv_box(BDecV v) { return dec_mk(decv_coeff(v), decv_scale(v)); }
-BDecV beans_decv_unbox(BDec* v) { return decv_mk(v->c, v->s); }
-BDecV beans_decv_from_int(long long v) { return decv_mk((__int128)v, 0); }
-static void dec_align(BDec* a, BDec* b, __int128* ca, __int128* cb, long long* s) {
-    *s = a->s > b->s ? a->s : b->s;
-    *ca = a->c * pow10i(*s - a->s);
-    *cb = b->c * pow10i(*s - b->s);
-}
-static void decv_align(BDecV a, BDecV b, __int128* ca, __int128* cb,
-                       long long* s) {
-    long long as = decv_scale(a), bs = decv_scale(b);
-    *s = as > bs ? as : bs;
-    *ca = decv_coeff(a) * pow10i(*s - as);
-    *cb = decv_coeff(b) * pow10i(*s - bs);
-}
-__attribute__((always_inline)) BDecV beans_decv_add(BDecV a, BDecV b) {
-    if (decv_scale(a) == decv_scale(b))
-        return decv_mk(decv_coeff(a) + decv_coeff(b), decv_scale(a));
-    __int128 ca, cb;
-    long long s;
-    decv_align(a, b, &ca, &cb, &s);
-    return decv_mk(ca + cb, s);
-}
-__attribute__((always_inline)) BDecV beans_decv_sub(BDecV a, BDecV b) {
-    if (decv_scale(a) == decv_scale(b))
-        return decv_mk(decv_coeff(a) - decv_coeff(b), decv_scale(a));
-    __int128 ca, cb;
-    long long s;
-    decv_align(a, b, &ca, &cb, &s);
-    return decv_mk(ca - cb, s);
-}
-BDecV beans_decv_mul(BDecV a, BDecV b) {
-    return decv_mk(decv_coeff(a) * decv_coeff(b),
-                   decv_scale(a) + decv_scale(b));
-}
-BDecV beans_decv_div(BDecV a, BDecV b, long long ln, long long cl) {
-    __int128 bc = decv_coeff(b);
-    if (bc == 0) beans_panic("divide by zero", ln, cl);
-    long long extra = 20;
-    __int128 q = decv_coeff(a) * pow10i(extra + decv_scale(b)) / bc;
-    long long s = decv_scale(a) + extra;
-    while (s > 0 && q % 10 == 0) {
-        q /= 10;
-        s -= 1;
-    }
-    return decv_mk(q, s);
-}
-BDecV beans_decv_neg(BDecV a) {
-    return decv_mk(-decv_coeff(a), decv_scale(a));
-}
-BDecV beans_decv_abs(BDecV a) {
-    __int128 c = decv_coeff(a);
-    return decv_mk(c < 0 ? -c : c, decv_scale(a));
-}
-BDecV beans_decv_round(BDecV a, long long places) {
-    __int128 c = decv_coeff(a);
-    long long s = decv_scale(a);
-    if (places >= s) return a;
-    __int128 f = pow10i(s - places);
-    __int128 q = c / f, rem = c % f;
-    if (rem < 0) rem = -rem;
-    if (rem * 2 >= f) q += c >= 0 ? 1 : -1;
-    if (places < 0) return decv_mk(q * pow10i(-places), 0);
-    return decv_mk(q, places);
-}
-int beans_decv_cmp(BDecV a, BDecV b) {
-    __int128 ca, cb;
-    long long s;
-    decv_align(a, b, &ca, &cb, &s);
-    return ca < cb ? -1 : ca > cb ? 1 : 0;
-}
-BDec* beans_dec_add(BDec* a, BDec* b) {
-    __int128 ca, cb;
-    long long s;
-    dec_align(a, b, &ca, &cb, &s);
-    return dec_mk(ca + cb, s);
-}
-BDec* beans_dec_sub(BDec* a, BDec* b) {
-    __int128 ca, cb;
-    long long s;
-    dec_align(a, b, &ca, &cb, &s);
-    return dec_mk(ca - cb, s);
-}
-BDec* beans_dec_mul(BDec* a, BDec* b) { return dec_mk(a->c * b->c, a->s + b->s); }
-BDec* beans_dec_div(BDec* a, BDec* b, long long ln, long long cl) {
-    if (b->c == 0) beans_panic("divide by zero", ln, cl);
-    long long extra = 20;
-    __int128 num = a->c * pow10i(extra + b->s);
-    __int128 q = num / b->c;
-    long long s = a->s + extra;
-    while (s > 0 && q % 10 == 0) {
-        q /= 10;
-        s -= 1;
-    }
-    return dec_mk(q, s);
-}
-BDec* beans_dec_neg(BDec* a) { return dec_mk(-a->c, a->s); }
-BDec* beans_dec_abs(BDec* a) { return dec_mk(a->c < 0 ? -a->c : a->c, a->s); }
-BDec* beans_dec_round(BDec* a, long long places) {
-    if (places >= a->s) return dec_mk(a->c, a->s);
-    __int128 f = pow10i(a->s - places);
-    __int128 q = a->c / f, rem = a->c % f;
-    if (rem < 0) rem = -rem;
-    if (rem * 2 >= f) q += a->c >= 0 ? 1 : -1;
-    // negative places round to a power of ten: scale the whole-number result
-    // back up and keep scale 0 (matches Decimal::round_to)
-    if (places < 0) return dec_mk(q * pow10i(-places), 0);
-    return dec_mk(q, places);
-}
-int beans_dec_cmp(BDec* a, BDec* b) {
-    __int128 ca, cb;
-    long long s;
-    dec_align(a, b, &ca, &cb, &s);
-    return ca < cb ? -1 : ca > cb ? 1 : 0;
-}
-// dec_cmp aligns scales, so 2.50 == 2.5 — hash the canonical trailing-zero-free
-// form so equal decimals land in the same map index slot
-long long beans_dec_hash(BDec* d) {
-    __int128 c = d->c;
-    long long s = d->s;
-    while (s > 0 && c % 10 == 0) {
-        c /= 10;
-        s -= 1;
-    }
-    unsigned long long lo = (unsigned long long)(unsigned __int128)c;
-    unsigned long long hi = (unsigned long long)((unsigned __int128)c >> 64);
-    return (long long)beans_mix64(lo ^ beans_mix64(hi ^ (unsigned long long)s));
-}
-// same acceptance rule as the interpreter's dec_valid: [+-]? digits with '_',
-// one optional '.', one optional e/E exponent with its own sign and a digit
-static int dec_valid_c(const char* s) {
-    size_t i = 0;
-    if (s[i] == '+' || s[i] == '-') i++;
-    int digits = 0, dot = 0;
-    for (; s[i]; i++) {
-        char c = s[i];
-        if (c >= '0' && c <= '9') { digits++; continue; }
-        if (c == '_') continue;
-        if (c == '.' && !dot) { dot = 1; continue; }
-        if ((c == 'e' || c == 'E') && digits) {
-            i++;
-            if (s[i] == '+' || s[i] == '-') i++;
-            if (!(s[i] >= '0' && s[i] <= '9')) return 0;
-            // capped at 4096 exactly like the interpreter's dec_valid
-            long long ev = 0;
-            while (s[i] >= '0' && s[i] <= '9') {
-                ev = ev * 10 + (s[i] - '0');
-                if (ev > 4096) return 0;
-                i++;
-            }
-            return s[i] == '\0';
-        }
-        return 0;
-    }
-    return digits > 0;
-}
-// mirror of Decimal::parse — the two must compute identically
-BRes beans_str_to_decimal(char* s) {
-    if (!dec_valid_c(s)) return parse_fail(s, "decimal");
-    __int128 coeff = 0;
-    long long scale = 0, exp = 0;
-    int neg = 0, after_dot = 0;
-    size_t i = 0;
-    if (s[i] == '-' || s[i] == '+') {
-        neg = s[i] == '-';
-        i++;
-    }
-    for (; s[i]; i++) {
-        char c = s[i];
-        if (c == '_') continue;
-        if (c == '.') { after_dot = 1; continue; }
-        if (c == 'e' || c == 'E') {
-            exp = strtol(s + i + 1, NULL, 10);
-            break;
-        }
-        coeff = coeff * 10 + (c - '0');
-        if (after_dot) scale += 1;
-    }
-    scale -= exp;
-    if (scale < 0) {
-        coeff *= pow10i(-scale);
-        scale = 0;
-    }
-    if (neg) coeff = -coeff;
-    return (BRes){(long long)dec_mk(coeff, scale), NULL};
-}
-long long beans_dec_to_int(BDec* a) { return (long long)(a->c / pow10i(a->s)); }
-double beans_dec_to_f64(BDec* a) { return (double)a->c / (double)pow10i(a->s); }
-long long beans_decv_to_int(BDecV a) {
-    return (long long)(decv_coeff(a) / pow10i(decv_scale(a)));
-}
-double beans_decv_to_f64(BDecV a) {
-    return (double)decv_coeff(a) / (double)pow10i(decv_scale(a));
-}
-BDec* beans_dec_from_f64(double v) {
-    char buf[64];
-    snprintf(buf, sizeof buf, "%.17g", v);
-    __int128 c = 0;
-    long long s = 0;
-    int neg = 0, after = 0;
-    long long ex = 0;
-    for (const char* p = buf; *p; p++) {
-        if (*p == '-') { neg = 1; continue; }
-        if (*p == '+') continue;
-        if (*p == '.') { after = 1; continue; }
-        if (*p == 'e' || *p == 'E') {
-            ex = strtoll(p + 1, NULL, 10);
-            break;
-        }
-        c = c * 10 + (*p - '0');
-        if (after) s += 1;
-    }
-    s -= ex;
-    if (s < 0) {
-        c *= pow10i(-s);
-        s = 0;
-    }
-    if (neg) c = -c;
-    return dec_mk(c, s);
-}
-BDecV beans_decv_from_f64(double v) {
-    char buf[64];
-    snprintf(buf, sizeof buf, "%.17g", v);
-    __int128 c = 0;
-    long long s = 0;
-    int neg = 0, after = 0;
-    long long ex = 0;
-    for (const char* p = buf; *p; p++) {
-        if (*p == '-') { neg = 1; continue; }
-        if (*p == '+') continue;
-        if (*p == '.') { after = 1; continue; }
-        if (*p == 'e' || *p == 'E') {
-            ex = strtoll(p + 1, NULL, 10);
-            break;
-        }
-        c = c * 10 + (*p - '0');
-        if (after) s += 1;
-    }
-    s -= ex;
-    if (s < 0) {
-        c *= pow10i(-s);
-        s = 0;
-    }
-    if (neg) c = -c;
-    return decv_mk(c, s);
-}
-char* beans_dec_str(BDec* a) {
-    __int128 c = a->c;
-    int neg = c < 0;
-    if (neg) c = -c;
-    // scratch sized from the scale: an __int128 holds at most 39 digits, but
-    // the zero-fill below runs to scale+1 — "1e-100".to_decimal() legitimately
-    // carries scale 100, and the old fixed 64/80-byte stack buffers smashed
-    // the stack. Small values keep the stack fast path.
-    long long cap = (a->s > 38 ? a->s : 38) + 2;
-    char dsmall[64], osmall[80];
-    char* digits = cap <= 63 ? dsmall : malloc((size_t)cap + 1);
-    char* out = cap + 2 <= 79 ? osmall : malloc((size_t)cap + 3);
-    if (!digits || !out) beans_panic("decimal too large to print", 0, 0);
-    long long n = 0;
-    if (c == 0) digits[n++] = '0';
-    while (c > 0) {
-        digits[n++] = (char)('0' + (int)(c % 10));
-        c /= 10;
-    }
-    while (n <= a->s) digits[n++] = '0';
-    long long o = 0;
-    if (neg) out[o++] = '-';
-    for (long long i = n - 1; i >= 0; i--) {
-        out[o++] = digits[i];
-        if (i == a->s && i != 0) out[o++] = '.';
-    }
-    out[o] = '\0';
-    char* r = rc_strdup(out);
-    if (digits != dsmall) free(digits);
-    if (out != osmall) free(out);
-    return r;
-}
-char* beans_decv_str(BDecV v) {
-    BDec d = {decv_coeff(v), decv_scale(v)};
-    return beans_dec_str(&d);
-}
-
-// ---- std.fmt (mirrors builtins.cpp byte for byte) ----
-// same 1e6 width ceiling the interpolation spec enforces at compile time — a
-// pad is a fill, not an allocation primitive; past the cap it is a panic on
-// both backends, not a 1TB alloc the OOM killer reaps
-#define FMT_PAD_MAX 1000000
-char* beans_fmt_pad_left(char* s, long long w, long long line, long long col) {
-    if (w > FMT_PAD_MAX) beans_panic("pad width too large", line, col);
-    long long n = beans_slen(s);
-    if (w <= n) return str_make(s, n);
-    char* out = beans_alloc(w + 1, w << 3);
-    memset(out, ' ', (size_t)(w - n));
-    memcpy(out + (w - n), s, (size_t)n);
-    return out;
-}
-char* beans_fmt_pad_right(char* s, long long w, long long line, long long col) {
-    if (w > FMT_PAD_MAX) beans_panic("pad width too large", line, col);
-    long long n = beans_slen(s);
-    if (w <= n) return str_make(s, n);
-    char* out = beans_alloc(w + 1, w << 3);
-    memcpy(out, s, (size_t)n);
-    memset(out + n, ' ', (size_t)(w - n));
-    return out;
-}
-char* beans_fmt_float(double x, long long p) {
-    if (p < 0) p = 0;
-    if (p > 100) p = 100;
-    char buf[512];
-    snprintf(buf, sizeof buf, "%.*f", (int)p, x);
-    return rc_strdup(buf);
-}
-char* beans_fmt_dec(BDec* d, long long p) {
-    if (p < 0) p = 0;
-    if (p > 60) p = 60;
-    BDec t = *d;
-    if (p < t.s) { // beans_dec_round, on the stack
-        __int128 f = pow10i(t.s - p);
-        __int128 q = t.c / f, rem = t.c % f;
-        if (rem < 0) rem = -rem;
-        if (rem * 2 >= f) q += t.c >= 0 ? 1 : -1;
-        t.c = q;
-        t.s = p;
-    }
-    char* base = beans_dec_str(&t);
-    long long frac = t.s;
-    if (p <= frac) return base;
-    long long bn = beans_slen(base);
-    long long extra = (frac == 0 ? 1 : 0) + (p - frac);
-    char* out = beans_alloc(bn + extra + 1, (bn + extra) << 3);
-    memcpy(out, base, (size_t)bn);
-    long long o = bn;
-    if (frac == 0) out[o++] = '.';
-    for (long long i = 0; i < p - frac; i++) out[o++] = '0';
-    beans_release(base);
-    return out;
-}
-char* beans_decv_fmt(BDecV v, long long p) {
-    BDec d = {decv_coeff(v), decv_scale(v)};
-    return beans_fmt_dec(&d, p);
-}
-)RT";
-}
 
 } // namespace beans

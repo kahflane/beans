@@ -4,8 +4,15 @@ CXXFLAGS := -std=c++20 -Wall -Wextra -O2 -pthread
 SRC := src/token.cpp src/lexer.cpp src/parser.cpp src/ast_print.cpp src/loader.cpp src/mir.cpp src/c_abi.cpp src/checker.cpp src/builtins.cpp src/codegen.cpp src/interp.cpp src/main.cpp
 HDR := src/token.h src/lexer.h src/ast.h src/parser.h src/types.h src/target.h src/mir.h src/hir.h src/c_abi.h src/loader.h src/checker.h src/value.h src/builtins.h src/interp.h src/codegen.h
 BIN := build/beansc
+RUNTIME_SRC := runtime/beans_rt.c
+RUNTIME_COPY := build/beans_rt.c
+.DEFAULT_GOAL := $(BIN)
 
-$(BIN): $(SRC) $(HDR)
+$(RUNTIME_COPY): $(RUNTIME_SRC)
+	@mkdir -p build
+	cp $(RUNTIME_SRC) $(RUNTIME_COPY)
+
+$(BIN): $(SRC) $(HDR) $(RUNTIME_COPY)
 	@mkdir -p build
 	$(CXX) $(CXXFLAGS) $(SRC) -o $(BIN)
 
@@ -26,11 +33,18 @@ test: $(BIN)
 	./test/c_layout_unions.sh
 	./test/c_layout_c_abi.sh
 	./test/c_callbacks.sh
+	bash ./test/closure_captures.sh
 	./test/stdlib_source.sh
 	./test/fs_source.sh
 	./test/reader_source.sh
 	./test/inline_options.sh
 	./test/inline_results.sh
+	bash ./test/wide_lists.sh
+	bash ./test/wide_maps.sh
+	bash ./test/wide_enums.sh
+	bash ./test/wide_owners.sh
+	bash ./test/wide_sync.sh
+	bash ./test/wide_concurrency.sh
 
 test-sanitize: $(BIN)
 	bash ./test/sanitize.sh
