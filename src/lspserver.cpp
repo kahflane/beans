@@ -256,6 +256,8 @@ private:
         if (method == "textDocument/references") { on_references(id, p); return; }
         if (method == "textDocument/documentSymbol") { on_document_symbol(id, p); return; }
         if (method == "textDocument/semanticTokens/full") { on_semantic_tokens(id, p); return; }
+        if (method == "textDocument/prepareRename") { on_prepare_rename(id, p); return; }
+        if (method == "textDocument/rename") { on_rename(id, p); return; }
 
         // unknown request -> method-not-found; unknown notification -> ignore
         if (id) reply_error(*id, -32601, "method not found: " + method);
@@ -288,6 +290,9 @@ private:
         semcap.set("legend", std::move(legend));
         semcap.set("full", Json::boolean(true));
         caps.set("semanticTokensProvider", std::move(semcap));
+        Json rename = Json::object();
+        rename.set("prepareProvider", Json::boolean(true));
+        caps.set("renameProvider", std::move(rename));
 
         Json result = Json::object();
         result.set("capabilities", std::move(caps));
@@ -611,6 +616,61 @@ private:
         }
         Json result = Json::object();
         result.set("data", std::move(data));
+        reply(*id, std::move(result));
+    }
+
+    // ---- rename -----------------------------------------------------------
+    void on_prepare_rename(const Json* id, const Json& p) {
+        if (!id) return;
+        const Json* td = p.find("textDocument");
+        const Json* pos = p.find("position");
+        auto it = td ? docs_.find(td->get_str("uri")) : docs_.end();
+        if (!td || !pos || it == docs_.end()) { reply(*id, Json::null()); return; }
+        const std::string& text = it->second.text;
+        uint32_t line = 0, col = 0;
+        from_lsp(text,
+                 {static_cast<uint32_t>(pos->get_num("line")),
+                  static_cast<uint32_t>(pos->get_num("character"))},
+                 line, col);
+        size_t off = byte_offset(text, line, col);
+        if (off >= text.size() || !is_ident_char(text[off])) { reply(*id, Json::null()); return; }
+        uint32_t sc = 0, ec = 0;
+        word_cols(text, line, col, sc, ec);
+        reply(*id, range_json(text, line, sc, line, ec));
+    }
+
+    void on_rename(const Json* id, const Json& p) {
+        if (!id) return;
+        std::string path;
+        uint32_t line = 0, col = 0;
+        Loader loader;
+        std::map<std::string, std::string> overlay;
+        if (!locate(p, path, line, col, loader, overlay)) { reply(*id, Json::null()); return; }
+        const Json* nn = p.find("newName");
+        std::string new_name = nn && nn->is_string() ? nn->str : "";
+        if (new_name.empty()) { set_loader_overlay(nullptr); reply(*id, Json::null()); return; }
+
+        std::vector<RefLoc> refs = references_at(loader.program(), path, line, col);
+
+        // group edits by file uri, preserving order
+        std::vector<std::string> order;
+        std::map<std::string, Json> edits;
+        for (const RefLoc& r : refs) {
+            const std::string* t = program_file_text(loader.program(), r.file);
+            if (!t) continue;
+            std::string uri = path_to_uri(r.file);
+            if (edits.find(uri) == edits.end()) { edits[uri] = Json::array(); order.push_back(uri); }
+            Json edit = Json::object();
+            edit.set("range", range_json(*t, r.line, r.col, r.end_line, r.end_col));
+            edit.set("newText", Json::string(new_name));
+            edits[uri].push(std::move(edit));
+        }
+        set_loader_overlay(nullptr);
+
+        Json changes = Json::object();
+        for (const std::string& uri : order) changes.set(uri, std::move(edits[uri]));
+        Json result = Json::object();
+        result.set("changes", std::move(changes));
         reply(*id, std::move(result));
     }
 

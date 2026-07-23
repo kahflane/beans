@@ -87,9 +87,17 @@ rc2, objs2 = run([
            "params":{"textDocument":{"uri":curi}}}),
     frame({"jsonrpc":"2.0","id":11,"method":"textDocument/semanticTokens/full",
            "params":{"textDocument":{"uri":curi}}}),
+    # rename `add` (definition at line 0, char 3) -> both its sites change
+    frame({"jsonrpc":"2.0","id":12,"method":"textDocument/rename",
+           "params":{"textDocument":{"uri":curi},"position":{"line":0,"character":3},"newName":"sum"}}),
     frame({"jsonrpc":"2.0","id":2,"method":"shutdown"}),
     frame({"jsonrpc":"2.0","method":"exit"}),
 ])
+ren = next((o for o in objs2 if o.get("id") == 12), None)
+changes = ren.get("result", {}).get("changes") if ren else None
+edits = list(changes.values())[0] if changes else []
+if len(edits) != 2 or any(e["newText"] != "sum" for e in edits):
+    fail(f"rename of `add` should produce 2 edits to `sum`, got: {edits}")
 tok = next((o for o in objs2 if o.get("id") == 11), None)
 data = tok.get("result", {}).get("data") if tok else None
 if not data or len(data) % 5 != 0 or len(data) == 0:
@@ -134,6 +142,6 @@ labels = [i["label"] for i in cres.get("items", [])] if cres else []
 if "norm2" not in labels or "x" not in labels:
     fail(f"member completion after p. should include x and norm2, got: {labels}")
 
-print("ok lsp server: init, overlay, diagnostics, hover, signature, "
-      "completion, definition, symbols, semantic tokens")
+print("ok lsp server: init, overlay, diagnostics, hover, signature, completion, "
+      "definition, symbols, semantic tokens, rename")
 PY
