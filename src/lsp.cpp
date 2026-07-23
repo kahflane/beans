@@ -14,6 +14,7 @@
 
 #include "lsp.h"
 
+#include <algorithm>
 #include <cstddef>
 #include <set>
 #include <string_view>
@@ -1597,6 +1598,182 @@ std::vector<DocSymbol> document_symbols(const Program& prog, const std::string& 
             out.push_back(std::move(s));
         }
     }
+    return out;
+}
+
+// ---- semantic tokens ------------------------------------------------------
+
+namespace {
+
+enum SemType {
+    ST_type = 0, ST_function, ST_method, ST_parameter,
+    ST_variable, ST_property, ST_enum, ST_enumMember,
+};
+
+void push_tok(std::vector<SemTok>& out, uint32_t line, uint32_t col, size_t len,
+              uint32_t type) {
+    if (line && len) out.push_back({line, col, static_cast<uint32_t>(len), type});
+}
+
+void sem_type(const TypeRef* t, std::vector<SemTok>& out) {
+    if (!t) return;
+    if (t->kind == TypeRef::Kind::named && !t->name.empty())
+        push_tok(out, t->line, t->col, t->name.size(), ST_type);
+    for (const auto& a : t->args) sem_type(a.get(), out);
+    for (const auto& a : t->fn_params) sem_type(a.get(), out);
+    sem_type(t->fn_ret.get(), out);
+    sem_type(t->array_elem.get(), out);
+}
+
+uint32_t classify_ident(const Program& prog, const FnDecl* fn,
+                        const ClassDecl* cls, const std::string& n) {
+    if (fn) {
+        for (const Param& p : fn->params)
+            if (p.name == n) return ST_parameter;
+        if (!local_type_head_in(fn->body, n).empty()) return ST_variable;
+    }
+    if (cls)
+        for (const FieldDecl& f : cls->fields)
+            if (f.name == n) return ST_property;
+    if (find_fn(prog, n)) return ST_function;
+    if (find_class(prog, n)) return ST_type;
+    if (find_enum(prog, n)) return ST_enum;
+    return ST_variable;
+}
+
+void sem_expr(const Program& prog, const Expr* e, const FnDecl* fn,
+              const ClassDecl* cls, std::vector<SemTok>& out);
+
+void sem_stmt(const Program& prog, const Stmt* s, const FnDecl* fn,
+              const ClassDecl* cls, std::vector<SemTok>& out) {
+    if (!s) return;
+    if (s->kind == Stmt::Kind::let_ && !s->name.empty())
+        push_tok(out, s->line, s->col, s->name.size(), ST_variable);
+    if (s->kind == Stmt::Kind::for_in && !s->loop_var.empty())
+        push_tok(out, s->line, s->col, s->loop_var.size(), ST_variable);
+    sem_type(s->type.get(), out);
+    sem_type(s->loop_type.get(), out);
+    sem_expr(prog, s->init.get(), fn, cls, out);
+    sem_expr(prog, s->target.get(), fn, cls, out);
+    sem_expr(prog, s->value.get(), fn, cls, out);
+    sem_expr(prog, s->expr.get(), fn, cls, out);
+    sem_expr(prog, s->cond.get(), fn, cls, out);
+    sem_expr(prog, s->iterable.get(), fn, cls, out);
+    for (const auto& b : s->body) sem_stmt(prog, b.get(), fn, cls, out);
+    for (const auto& b : s->else_body) sem_stmt(prog, b.get(), fn, cls, out);
+}
+
+void sem_member_tok(const Expr* field, uint32_t kind, std::vector<SemTok>& out) {
+    if (field->end_col >= field->name.size())
+        push_tok(out, field->end_line,
+                 field->end_col - static_cast<uint32_t>(field->name.size()),
+                 field->name.size(), kind);
+}
+
+void sem_expr(const Program& prog, const Expr* e, const FnDecl* fn,
+              const ClassDecl* cls, std::vector<SemTok>& out) {
+    if (!e) return;
+    switch (e->kind) {
+        case Expr::Kind::ident:
+            push_tok(out, e->line, e->col, e->text.size(),
+                     classify_ident(prog, fn, cls, std::string(e->text)));
+            return;
+        case Expr::Kind::call:
+            if (e->callee && e->callee->kind == Expr::Kind::field) {
+                // a method call: colour the member as a method
+                sem_member_tok(e->callee.get(), ST_method, out);
+                sem_expr(prog, e->callee->object.get(), fn, cls, out);
+            } else {
+                sem_expr(prog, e->callee.get(), fn, cls, out);
+            }
+            for (const auto& a : e->args) sem_expr(prog, a.get(), fn, cls, out);
+            return;
+        case Expr::Kind::field:
+            sem_member_tok(e, ST_property, out);
+            sem_expr(prog, e->object.get(), fn, cls, out);
+            return;
+        case Expr::Kind::new_:
+        case Expr::Kind::init:
+            if (!e->name.empty())
+                push_tok(out, e->line, e->col, e->name.size(),
+                         find_enum(prog, e->name) ? ST_enum : ST_type);
+            for (const auto& t : e->type_args) sem_type(t.get(), out);
+            for (const auto& a : e->args) sem_expr(prog, a.get(), fn, cls, out);
+            for (const auto& en : e->entries) {
+                sem_expr(prog, en.key.get(), fn, cls, out);
+                sem_expr(prog, en.value.get(), fn, cls, out);
+            }
+            return;
+        default:
+            break;
+    }
+    sem_expr(prog, e->lhs.get(), fn, cls, out);
+    sem_expr(prog, e->rhs.get(), fn, cls, out);
+    sem_expr(prog, e->object.get(), fn, cls, out);
+    sem_expr(prog, e->index_expr.get(), fn, cls, out);
+    sem_type(e->type.get(), out);
+    for (const auto& t : e->type_args) sem_type(t.get(), out);
+    for (const auto& b : e->body) sem_stmt(prog, b.get(), fn, cls, out);
+    sem_expr(prog, e->cond.get(), fn, cls, out);
+    sem_expr(prog, e->then_e.get(), fn, cls, out);
+    sem_expr(prog, e->else_e.get(), fn, cls, out);
+    sem_expr(prog, e->subject.get(), fn, cls, out);
+    for (const auto& arm : e->arms) {
+        sem_expr(prog, arm.value.get(), fn, cls, out);
+        for (const auto& b : arm.body) sem_stmt(prog, b.get(), fn, cls, out);
+    }
+}
+
+void sem_fn(const Program& prog, const FnDecl& f, const ClassDecl* cls,
+            bool method, std::vector<SemTok>& out) {
+    push_tok(out, f.name_line, f.name_col, f.name.size(),
+             method ? ST_method : ST_function);
+    for (const Param& p : f.params) {
+        push_tok(out, p.line, p.col, p.name.size(), ST_parameter);
+        sem_type(p.type.get(), out);
+    }
+    sem_type(f.ret.get(), out);
+    for (const auto& s : f.body) sem_stmt(prog, s.get(), &f, cls, out);
+}
+
+} // namespace
+
+const std::vector<std::string>& semantic_token_types() {
+    static const std::vector<std::string> t = {
+        "type", "function", "method", "parameter",
+        "variable", "property", "enum", "enumMember",
+    };
+    return t;
+}
+
+std::vector<SemTok> semantic_tokens(const Program& prog, const std::string& file) {
+    std::vector<SemTok> out;
+    const PFile* cur = find_pfile(prog, file);
+    if (!cur) return out;
+    const Module& mod = cur->mod;
+
+    for (const FnDecl& f : mod.fns) sem_fn(prog, f, nullptr, false, out);
+    for (const ClassDecl& c : mod.classes) {
+        push_tok(out, c.name_line, c.name_col, c.name.size(), ST_type);
+        for (const FieldDecl& f : c.fields) {
+            push_tok(out, f.name_line, f.name_col, f.name.size(), ST_property);
+            sem_type(f.type.get(), out);
+        }
+        for (const FnDecl& m : c.methods) sem_fn(prog, m, &c, true, out);
+    }
+    for (const EnumDecl& e : mod.enums) {
+        push_tok(out, e.name_line, e.name_col, e.name.size(), ST_enum);
+        for (const EnumVariant& v : e.variants) {
+            push_tok(out, v.line, v.col, v.name.size(), ST_enumMember);
+            for (const Param& p : v.payload) sem_type(p.type.get(), out);
+        }
+        for (const FnDecl& m : e.methods) sem_fn(prog, m, nullptr, true, out);
+    }
+
+    // stable source order: sort by (line, col)
+    std::sort(out.begin(), out.end(), [](const SemTok& a, const SemTok& b) {
+        return a.line != b.line ? a.line < b.line : a.col < b.col;
+    });
     return out;
 }
 

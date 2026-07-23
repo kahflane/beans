@@ -255,6 +255,7 @@ private:
         if (method == "textDocument/definition") { on_definition(id, p); return; }
         if (method == "textDocument/references") { on_references(id, p); return; }
         if (method == "textDocument/documentSymbol") { on_document_symbol(id, p); return; }
+        if (method == "textDocument/semanticTokens/full") { on_semantic_tokens(id, p); return; }
 
         // unknown request -> method-not-found; unknown notification -> ignore
         if (id) reply_error(*id, -32601, "method not found: " + method);
@@ -278,6 +279,15 @@ private:
         caps.set("definitionProvider", Json::boolean(true));
         caps.set("referencesProvider", Json::boolean(true));
         caps.set("documentSymbolProvider", Json::boolean(true));
+        Json legend = Json::object();
+        Json types = Json::array();
+        for (const std::string& t : semantic_token_types()) types.push(Json::string(t));
+        legend.set("tokenTypes", std::move(types));
+        legend.set("tokenModifiers", Json::array());
+        Json semcap = Json::object();
+        semcap.set("legend", std::move(legend));
+        semcap.set("full", Json::boolean(true));
+        caps.set("semanticTokensProvider", std::move(semcap));
 
         Json result = Json::object();
         result.set("capabilities", std::move(caps));
@@ -564,6 +574,44 @@ private:
         Json arr = Json::array();
         for (const DocSymbol& s : syms) arr.push(docsym_json(s, text));
         reply(*id, std::move(arr));
+    }
+
+    // ---- semantic tokens --------------------------------------------------
+    void on_semantic_tokens(const Json* id, const Json& p) {
+        if (!id) return;
+        const Json* td = p.find("textDocument");
+        auto it = td ? docs_.find(td->get_str("uri")) : docs_.end();
+        if (!td || it == docs_.end()) { reply(*id, Json::null()); return; }
+        std::string path = uri_to_path(td->get_str("uri"));
+        const std::string& text = it->second.text;
+
+        std::map<std::string, std::string> overlay = overlay_map();
+        set_loader_overlay(&overlay);
+        Loader loader;
+        loader.load(path);
+        std::vector<SemTok> toks = semantic_tokens(loader.program(), path);
+        set_loader_overlay(nullptr);
+
+        // LSP delta encoding: 5 ints per token relative to the previous one
+        Json data = Json::array();
+        uint32_t prev_line = 0, prev_char = 0;
+        for (const SemTok& t : toks) {
+            LspPos s = to_lsp(text, t.line, t.col);
+            LspPos e = to_lsp(text, t.line, t.col + t.length);
+            uint32_t len = e.character >= s.character ? e.character - s.character : t.length;
+            uint32_t dl = s.line - prev_line;
+            uint32_t dc = dl == 0 ? s.character - prev_char : s.character;
+            data.push(Json::number(dl));
+            data.push(Json::number(dc));
+            data.push(Json::number(len));
+            data.push(Json::number(t.type));
+            data.push(Json::number(0)); // no modifiers
+            prev_line = s.line;
+            prev_char = s.character;
+        }
+        Json result = Json::object();
+        result.set("data", std::move(data));
+        reply(*id, std::move(result));
     }
 
     struct DocState {

@@ -85,9 +85,18 @@ rc2, objs2 = run([
            "params":{"textDocument":{"uri":curi},"position":{"line":4,"character":17}}}),
     frame({"jsonrpc":"2.0","id":10,"method":"textDocument/documentSymbol",
            "params":{"textDocument":{"uri":curi}}}),
+    frame({"jsonrpc":"2.0","id":11,"method":"textDocument/semanticTokens/full",
+           "params":{"textDocument":{"uri":curi}}}),
     frame({"jsonrpc":"2.0","id":2,"method":"shutdown"}),
     frame({"jsonrpc":"2.0","method":"exit"}),
 ])
+tok = next((o for o in objs2 if o.get("id") == 11), None)
+data = tok.get("result", {}).get("data") if tok else None
+if not data or len(data) % 5 != 0 or len(data) == 0:
+    fail(f"semantic tokens should return a non-empty multiple-of-5 array, got: {data!r}")
+# first token is `add` on line 0 -> tokenType 1 (function) in the legend
+if data[3] != 1:
+    fail(f"first semantic token should be a function (type 1), got type {data[3]}")
 dfn = next((o for o in objs2 if o.get("id") == 8), None)
 dres = dfn and dfn.get("result")
 if not dres or dres.get("range", {}).get("start", {}).get("line") != 0:
@@ -126,5 +135,5 @@ if "norm2" not in labels or "x" not in labels:
     fail(f"member completion after p. should include x and norm2, got: {labels}")
 
 print("ok lsp server: init, overlay, diagnostics, hover, signature, "
-      "completion, definition, references/symbols")
+      "completion, definition, symbols, semantic tokens")
 PY

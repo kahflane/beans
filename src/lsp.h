@@ -112,4 +112,16 @@ struct DocSymbol {
 };
 std::vector<DocSymbol> document_symbols(const Program& prog, const std::string& file);
 
+// ---- semantic tokens (checker-driven highlighting) -----------------------
+
+// One classified name occurrence. `type` indexes semantic_token_types().
+struct SemTok {
+    uint32_t line = 0, col = 0, length = 0; // 1-based line, 1-based byte col
+    uint32_t type = 0;
+};
+// The legend the server must advertise (index == SemTok::type).
+const std::vector<std::string>& semantic_token_types();
+// Every classified name in the file, in source order.
+std::vector<SemTok> semantic_tokens(const Program& prog, const std::string& file);
+
 } // namespace beans
