@@ -11,6 +11,7 @@
 #include <fstream>
 #include <sstream>
 #include <string>
+#include <vector>
 
 #include "checker.h"
 #include "codegen.h"
@@ -134,11 +135,50 @@ int cmd_run(const char* path) {
     print_check_errors(path, checker);
     if (!checker.errors().empty()) return 1;
 
-    beans::Interp interp(loader.program());
+    beans::Interp interp(checker.hir());
     return interp.run();
 }
 
-int cmd_build(const char* path, const char* out_path) {
+struct BuildOptions {
+    bool release = false;
+    bool lto = false;
+    std::string cpu = "generic";
+};
+
+std::string shell_quote(const std::string& value) {
+    std::string quoted = "'";
+    for (char c : value) {
+        if (c == '\'') quoted += "'\\''";
+        else quoted += c;
+    }
+    quoted += '\'';
+    return quoted;
+}
+
+bool write_if_changed(const std::string& path, const std::string& contents) {
+    std::string old;
+    if (read_file(path.c_str(), old) && old == contents) return false;
+    std::ofstream file(path, std::ios::binary);
+    file << contents;
+    return true;
+}
+
+unsigned long long content_hash(const std::string& contents) {
+    unsigned long long hash = 14695981039346656037ULL;
+    for (unsigned char byte : contents) {
+        hash ^= byte;
+        hash *= 1099511628211ULL;
+    }
+    return hash;
+}
+
+int run_build_command(const std::string& command, const char* what) {
+    int rc = std::system(command.c_str());
+    if (rc != 0) std::fprintf(stderr, "error: %s failed\n", what);
+    return rc;
+}
+
+int cmd_build(const char* path, const char* out_path, const BuildOptions& options) {
     beans::Loader loader;
     if (!load_program(path, loader)) return 1;
 
@@ -147,7 +187,7 @@ int cmd_build(const char* path, const char* out_path) {
     print_check_errors(path, checker);
     if (!checker.errors().empty()) return 1;
 
-    beans::CodeGen cg(loader.program());
+    beans::CodeGen cg(checker.hir());
     std::string ir = cg.generate();
     for (const beans::CGError& e : cg.errors()) {
         std::fprintf(stderr, "%s:%u:%u: error: %s\n", path, e.line, e.col, e.msg.c_str());
@@ -164,23 +204,43 @@ int cmd_build(const char* path, const char* out_path) {
     std::system("mkdir -p build");
     std::string ll_path = "build/" + stem + ".ll";
     std::string rt_path = "build/beans_rt.c";
+    std::string ffi_path = "build/" + stem + "_ffi.c";
     std::string bin = out_path ? out_path : "build/" + stem;
 
     {
         std::ofstream f(ll_path, std::ios::binary);
         f << ir;
     }
-    {
-        std::ofstream f(rt_path, std::ios::binary);
-        f << beans::CodeGen::runtime_c();
+    const std::string runtime_source = beans::CodeGen::runtime_c();
+    write_if_changed(rt_path, runtime_source);
+    if (!cg.ffi_c().empty()) write_if_changed(ffi_path, cg.ffi_c());
+    const std::string optimize = options.release ? "-O3 -DNDEBUG" : "-O2";
+    const std::string cpu = options.cpu == "native" ? " -march=native" : "";
+    const std::string lto = options.lto ? " -flto" : "";
+    const std::string flavor = std::string(options.release ? ".release" : ".dev") +
+                               (options.lto ? ".lto" : "") +
+                               (options.cpu == "native" ? ".native" : "");
+    const std::string runtime_artifact =
+        "build/beans_rt" + flavor + "." + std::to_string(content_hash(runtime_source)) +
+        (options.lto ? ".bc" : ".o");
+
+    std::ifstream cached(runtime_artifact, std::ios::binary);
+    if (!cached.good()) {
+        std::string runtime_cmd = "clang " + optimize + lto + cpu + " -pthread";
+        if (options.lto) runtime_cmd += " -emit-llvm";
+        runtime_cmd += " -c " + shell_quote(rt_path) + " -o " +
+                       shell_quote(runtime_artifact);
+        if (run_build_command(runtime_cmd, "clang runtime compile") != 0) return 1;
     }
 
-    std::string cmd = "clang -O2 -Wno-override-module " + ll_path + " " + rt_path +
-                      " -o " + bin;
-    int rc = std::system(cmd.c_str());
+    std::string cmd = "clang " + optimize + lto + cpu + " -pthread" +
+                      " -Wno-override-module " + shell_quote(ll_path) + " " +
+                      shell_quote(runtime_artifact);
+    if (!cg.ffi_c().empty()) cmd += " " + shell_quote(ffi_path);
+    cmd += " -lm -o " + shell_quote(bin);
+    int rc = run_build_command(cmd, "clang link");
     if (rc != 0) {
-        std::fprintf(stderr, "error: clang failed on the generated IR (%s)\n",
-                     ll_path.c_str());
+        std::fprintf(stderr, "error: generated IR is in %s\n", ll_path.c_str());
         return 1;
     }
     std::printf("built %s\n", bin.c_str());
@@ -193,7 +253,8 @@ int main(int argc, char** argv) {
     if (argc < 3) {
         std::fprintf(stderr,
                      "usage: %s <lex|parse|check|run> <file.b>...\n"
-                     "       %s build <file.b> [-o out]\n",
+                     "       %s build [--release] [--lto] [--cpu generic|native] "
+                     "<file.b> [-o out]\n",
                      argv[0], argv[0]);
         return 2;
     }
@@ -201,9 +262,26 @@ int main(int argc, char** argv) {
     if (std::strcmp(cmd, "build") == 0) {
         const char* out = nullptr;
         const char* file = nullptr;
+        BuildOptions options;
         for (int i = 2; i < argc; i++) {
             if (std::strcmp(argv[i], "-o") == 0 && i + 1 < argc) {
                 out = argv[++i];
+            } else if (std::strcmp(argv[i], "--release") == 0) {
+                options.release = true;
+            } else if (std::strcmp(argv[i], "--lto") == 0) {
+                options.lto = true;
+            } else if (std::strcmp(argv[i], "--cpu") == 0 && i + 1 < argc) {
+                options.cpu = argv[++i];
+                if (options.cpu != "generic" && options.cpu != "native") {
+                    std::fprintf(stderr, "error: --cpu must be generic or native\n");
+                    return 2;
+                }
+            } else if (argv[i][0] == '-') {
+                std::fprintf(stderr, "error: unknown build option: %s\n", argv[i]);
+                return 2;
+            } else if (file) {
+                std::fprintf(stderr, "error: build accepts one entry file\n");
+                return 2;
             } else {
                 file = argv[i];
             }
@@ -212,7 +290,7 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "usage: %s build <file.b> [-o out]\n", argv[0]);
             return 2;
         }
-        return cmd_build(file, out);
+        return cmd_build(file, out, options);
     }
 
     // `run f.b -- a b` hands everything after -- to the program (os.args)

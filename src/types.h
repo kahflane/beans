@@ -20,10 +20,12 @@ struct Type {
         unit,     // "no return value"
         poison,   // an error was already reported — stops cascades
         class_,   // user class/interface or builtin container: name + args
+        struct_,  // inline user value type: name (no generic args yet)
         enum_,    // user enum, or Option/Result: name + args
         type_param,
         fn,
         range,    // args[0] = element type
+        fixed_array, // args[0] = element type, name = decimal length
         package,  // imported package name
     };
 
@@ -71,6 +73,13 @@ public:
     TypeId range_of(TypeId elem) {
         Type t;
         t.k = Type::K::range;
+        t.args = {elem};
+        return intern(t);
+    }
+    TypeId fixed_array_of(TypeId elem, uint32_t length) {
+        Type t;
+        t.k = Type::K::fixed_array;
+        t.name = std::to_string(length);
         t.args = {elem};
         return intern(t);
     }

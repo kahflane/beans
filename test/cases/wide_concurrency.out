@@ -1,0 +1,10 @@
+channel from worker 41
+thread array 7 8
+channel closed true
+channel int 12
+channel decimal 3.75
+channel result channel error
+thread event thread event 9
+thread decimal 3.75
+thread option 5 6
+thread string owned string

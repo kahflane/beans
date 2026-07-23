@@ -1,5 +1,6 @@
 #pragma once
 
+#include <exception>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -8,6 +9,7 @@
 
 #include "ast.h"
 #include "builtins.h"
+#include "hir.h"
 #include "lexer.h"
 #include "value.h"
 
@@ -41,16 +43,33 @@ bool beans_threads_live();
 // segments, which are parsed here and never saw the checker).
 class Interp {
 public:
-    explicit Interp(const Program& prog);
+    explicit Interp(const HirProgram& hir);
 
     // find fn main and run it. returns the process exit code.
     int run();
 
 private:
+    const HirProgram& hir_;
+
     // control-flow signals
     struct ReturnSignal { Value v; };
     struct BreakSignal {};
     struct ContinueSignal {};
+
+    // A generated C trampoline keeps one of these on the calling thread while
+    // an extern function invokes a borrowed Beans callback. Exceptions must
+    // stop at this boundary: the trampoline returns to C first, then the
+    // original Beans panic is rethrown on the C++ side.
+    struct FfiCallbackContext {
+        Interp* owner = nullptr;
+        Value callable;
+        std::vector<RawPtrVal> parameters;
+        RawPtrVal result;
+        bool returns_value = false;
+        std::exception_ptr error;
+    };
+    static void ffi_callback_dispatch(void* raw_context, void* result,
+                                      void** arguments);
 
     // number-literal hint so decimal literals parse exactly from source text
     enum class NumHint { none, dec, flt };
@@ -69,6 +88,9 @@ private:
     // execution; pkg = package prefix the function's body lives in
     Value call_fn(const FnDecl* fn, Value* self, std::vector<Value> args,
                   const std::string& pkg);
+    Value call_extern(const FnDecl* fn, const std::vector<Value>& args);
+    Value call_extern_aggregate(const FnDecl* fn, const std::vector<Value>& args,
+                                void* symbol);
     Value call_closure(const ClosureVal& c, std::vector<Value> args);
     void exec_block(const std::vector<StmtPtr>& body, std::shared_ptr<Env> env);
     void exec_stmt(const Stmt* s, std::shared_ptr<Env>& env);
@@ -87,6 +109,12 @@ private:
                                         const Value& recv, const std::string& name);
     static Hint hint_of_bt(BT p);
     static Hint map_key_hint(const MapVal& m);
+    RawPtrVal raw_value_spec(TypeId type) const;
+    RawPtrVal raw_value_spec(const TypeRef* type) const;
+    RawPtrVal raw_spec(TypeId pointer_type) const;
+    RawPtrVal raw_spec(const TypeRef* pointer_type) const;
+    Value raw_read(const RawPtrVal& pointer) const;
+    void raw_write(const RawPtrVal& pointer, const Value& value) const;
 
     // ---- init / deinit ----
     // ClassName(args): fresh object (defaults in, the rest unassigned), then init
@@ -129,6 +157,12 @@ private:
     std::string binding_path(const std::string& binding) const;
 
     Value coerce_arg(Value v, const TypeRef* want);
+    Value typed_integer(int64_t bits, TypeId type, const TypeRef* fallback = nullptr) const;
+    Value typed_float(double value, TypeId type, const TypeRef* fallback = nullptr) const;
+    static uint64_t unsigned_integer(const Value& value);
+    static int64_t signed_integer(uint64_t bits);
+    static void normalize_integer(Value& value);
+    static void normalize_float(Value& value);
     static bool value_eq(const Value& a, const Value& b);
     // map index plumbing — hashing must agree with value_eq exactly
     static uint64_t value_hash(const Value& v);
@@ -137,7 +171,7 @@ private:
     static void map_append(MapVal& m, uint64_t h, Value key, Value val);
     static void map_set(MapVal& m, Value key, Value val);
     static bool map_remove_key(MapVal& m, const Value& key);
-    static void map_reindex(MapVal& m);
+    static void map_reindex(MapVal& m, size_t reserve = 0);
     static std::string display(const Value& v);
     [[noreturn]] void panic(const Expr* e, std::string msg);
 

@@ -1,0 +1,5 @@
+struct copy 40 99 next 41 eq false
+struct layout 16 4 raw 7 41 1.5 true
+struct pointer 16 8 12 77
+struct nested 32 8 513 5 2000 77 88 eq true
+pointer pointer 8 8 88

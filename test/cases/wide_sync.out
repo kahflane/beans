@@ -1,0 +1,8 @@
+shared worker 42
+shared values 7 8 20.00
+weak live short false
+weak dead true true
+mutex locked 9
+mutex decimal 2.75
+mutex result guarded error
+thread 43

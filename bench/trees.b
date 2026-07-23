@@ -3,23 +3,25 @@
 // allocator, so this measures the release cascade and the freelists, not
 // just loop speed — the one dimension churn.b only touches shallowly.
 import std.io
+import std.os
 
 class Node {
     left: Option<Node> = none
     right: Option<Node> = none
+    value: int = 0
 }
 
-fn build(depth: int) -> Node {
-    var n: Node = Node {}
+fn build(depth: int, seed: int) -> Node {
+    var n: Node = Node { value: depth + seed }
     if depth > 0 {
-        n.left = some(build(depth - 1))
-        n.right = some(build(depth - 1))
+        n.left = some(build(depth - 1, seed))
+        n.right = some(build(depth - 1, seed))
     }
     return n
 }
 
 fn count(n: Node) -> int {
-    var total: int = 1
+    var total: int = 1 + n.value
     match n.left {
         some(l) => { total += count(l) }
         none => { }
@@ -32,8 +34,10 @@ fn count(n: Node) -> int {
 }
 
 fn main() {
-    let max_depth: int = 14
-    let long_lived: Node = build(max_depth) // stays alive to the very end
+    let args: List<string> = os.args()
+    let max_depth: int = if args.len() > 0 { args[0].to_int().or(16) } else { 16 }
+    let seed: int = if args.len() > 1 { args[1].to_int().or(1) } else { 1 }
+    let long_lived: Node = build(max_depth, seed) // stays alive to the very end
     var total: int = 0
 
     var d: int = 4
@@ -47,7 +51,7 @@ fn main() {
         }
         var i: int = 0
         for i < iters {
-            total += count(build(d))
+            total += count(build(d, seed))
             i += 1
         }
         d += 2

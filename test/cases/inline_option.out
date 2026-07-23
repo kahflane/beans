@@ -1,0 +1,8 @@
+inline option true true true true
+option values 20 3 11 true 20
+option match 10 20
+option array 7
+option nested 20
+option capture 10
+option simd 10
+option slice 32

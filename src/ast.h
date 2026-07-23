@@ -23,7 +23,7 @@ using PatPtr = std::unique_ptr<Pattern>;
 // ---- types ----------------------------------------------------------------
 
 struct TypeRef {
-    enum class Kind { named, fn };
+    enum class Kind { named, fn, fixed_array };
     Kind kind = Kind::named;
     uint32_t line = 0, col = 0;
 
@@ -38,9 +38,15 @@ struct TypeRef {
     // fn(params) -> ret
     std::vector<TypePtr> fn_params;
     TypePtr fn_ret; // null = no return value
+
+    // [T; N]
+    TypePtr array_elem;
+    uint32_t array_len = 0;
 };
 
 struct Param {
+    enum class Passing { borrow, take, inout };
+    Passing passing = Passing::borrow;
     std::string name;
     TypePtr type; // may be null for untyped match bindings
     uint32_t line = 0, col = 0;
@@ -196,6 +202,8 @@ struct FnDecl {
     bool is_override = false;
     bool has_self = false;
     bool has_body = true; // false = interface signature
+    bool is_extern_c = false;
+    std::string extern_name; // unmangled linker symbol
     std::string name;
     std::string qualname; // package-qualified ("util.hello"); loader stamps it,
                           // root package and single files keep the plain name
@@ -217,6 +225,10 @@ struct FieldDecl {
 struct ClassDecl { // also interfaces (is_interface)
     bool is_pub = false;
     bool is_interface = false;
+    bool is_struct = false;   // inline value, never an ARC object
+    bool is_union = false;    // inline overlapping value, unsafe field access
+    bool is_c_layout = false; // target C field order/alignment is part of its ABI
+    bool is_move_only = false;
     std::string name;
     std::string qualname;
     std::vector<GenericParam> generics;

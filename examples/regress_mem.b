@@ -19,6 +19,27 @@ fn uaf_check() {
     io.println(clobber(m, m["k"]))
 }
 
+// A match field can skip its safety pin only when no arm can name the field's
+// owner. This arm replaces `n.next`, so the old Option must keep its child
+// alive until the arm is finished reading it.
+class PinNode {
+    value: int = 0
+    next: Option<PinNode> = none
+}
+
+fn match_pin_check() {
+    let n: PinNode = PinNode { next: some(PinNode { value: 42 }) }
+    var got: int = -1
+    match n.next {
+        some(child) => {
+            n.next = none
+            got = child.value
+        }
+        none => { }
+    }
+    io.println("pin {got}")
+}
+
 // C2: bounds checks used to be `pos + width > len` in signed 64-bit, so a huge
 // position wrapped negative and sailed past the guard into a wild read/write.
 // A legitimate out-of-range access still panics; the overflow one must too.
@@ -31,6 +52,7 @@ fn bounds_check() {
 
 fn main() {
     uaf_check()
+    match_pin_check()
     bounds_check()
     io.println("unreachable")
 }

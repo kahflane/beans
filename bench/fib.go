@@ -1,6 +1,21 @@
 package main
 
-import "fmt"
+import (
+	"fmt"
+	"os"
+	"strconv"
+)
+
+func arg(at, fallback int) int {
+	if len(os.Args) <= at+1 {
+		return fallback
+	}
+	n, err := strconv.Atoi(os.Args[at+1])
+	if err != nil {
+		return fallback
+	}
+	return n
+}
 
 func fib(n int) int {
 	if n < 2 {
@@ -10,5 +25,6 @@ func fib(n int) int {
 }
 
 func main() {
-	fmt.Println(fib(40))
+	n, seed := arg(0, 40), arg(1, 1)
+	fmt.Println(fib(n) + seed - seed)
 }

@@ -1,5 +1,6 @@
 #include "parser.h"
 
+#include <cstdlib>
 #include <utility>
 
 namespace beans {
@@ -103,11 +104,15 @@ void Parser::sync_decl() {
     while (!at_eof()) {
         switch (cur().kind) {
             case TokenKind::kw_class:
+            case TokenKind::kw_struct:
+            case TokenKind::kw_union:
             case TokenKind::kw_interface:
             case TokenKind::kw_enum:
             case TokenKind::kw_fn:
+            case TokenKind::kw_extern:
             case TokenKind::kw_import:
             case TokenKind::kw_pub:
+            case TokenKind::at:
                 return;
             default:
                 advance();
@@ -189,36 +194,102 @@ ImportDecl Parser::parse_import() {
 }
 
 void Parser::parse_decl(Module& m) {
+    bool is_move_only = false;
+    bool is_c_layout = false;
+    auto attributes = [&]() {
+        while (accept(TokenKind::at)) {
+            if (!check(TokenKind::ident)) {
+                error_at(cur(), "expected attribute name after '@'");
+                return;
+            }
+            std::string name(cur().text);
+            advance();
+            if (name == "move_only") {
+                if (is_move_only) error_at(cur(), "@move_only written twice");
+                is_move_only = true;
+            } else if (name == "c_layout") {
+                if (is_c_layout) error_at(cur(), "@c_layout written twice");
+                is_c_layout = true;
+            } else {
+                error_at(cur(), "unknown attribute '@" + name + "'");
+            }
+            skip_newlines();
+        }
+    };
+    attributes();
     bool is_pub = accept(TokenKind::kw_pub);
+    attributes();
     switch (cur().kind) {
         case TokenKind::kw_class:
-            m.classes.push_back(parse_class(is_pub, false));
+            if (is_c_layout) error_at(cur(), "@c_layout applies to structs/unions, not classes");
+            m.classes.push_back(parse_class(is_pub, false, is_move_only));
+            m.order.push_back({Module::DeclKind::class_, m.classes.size() - 1});
+            break;
+        case TokenKind::kw_struct:
+            m.classes.push_back(parse_class(is_pub, false, is_move_only, true, is_c_layout));
+            m.order.push_back({Module::DeclKind::class_, m.classes.size() - 1});
+            break;
+        case TokenKind::kw_union:
+            if (!is_c_layout) error_at(cur(), "union requires @c_layout");
+            m.classes.push_back(parse_class(is_pub, false, is_move_only, false, true, true));
             m.order.push_back({Module::DeclKind::class_, m.classes.size() - 1});
             break;
         case TokenKind::kw_interface:
-            m.classes.push_back(parse_class(is_pub, true));
+            if (is_move_only) error_at(cur(), "@move_only applies to classes, not interfaces");
+            if (is_c_layout) error_at(cur(), "@c_layout applies to structs/unions, not interfaces");
+            m.classes.push_back(parse_class(is_pub, true, false));
             m.order.push_back({Module::DeclKind::class_, m.classes.size() - 1});
             break;
         case TokenKind::kw_enum:
+            if (is_move_only) error_at(cur(), "@move_only applies to classes, not enums");
+            if (is_c_layout) error_at(cur(), "@c_layout applies to structs/unions, not enums");
             m.enums.push_back(parse_enum(is_pub));
             m.order.push_back({Module::DeclKind::enum_, m.enums.size() - 1});
             break;
         case TokenKind::kw_fn:
+            if (is_move_only) error_at(cur(), "@move_only applies to classes, not functions");
+            if (is_c_layout) error_at(cur(), "@c_layout applies to structs/unions, not functions");
             m.fns.push_back(parse_fn(is_pub, false, false));
             m.order.push_back({Module::DeclKind::fn, m.fns.size() - 1});
             break;
+        case TokenKind::kw_extern: {
+            if (is_move_only) error_at(cur(), "@move_only does not apply to extern functions");
+            if (is_c_layout) error_at(cur(), "@c_layout does not apply to extern functions");
+            advance();
+            if (!check(TokenKind::string_lit) || cur().text != "\"C\"") {
+                error_at(cur(), "expected \"C\" after extern");
+            } else {
+                advance();
+            }
+            if (!check(TokenKind::kw_fn)) {
+                error_at(cur(), "expected fn after extern \"C\"");
+                break;
+            }
+            FnDecl f = parse_fn(is_pub, false, true);
+            f.is_extern_c = true;
+            f.extern_name = f.name;
+            if (f.has_body) error_at(cur(), "extern function is a declaration and has no body");
+            m.fns.push_back(std::move(f));
+            m.order.push_back({Module::DeclKind::fn, m.fns.size() - 1});
+            break;
+        }
         default:
-            error_at(cur(), "expected class, interface, enum, or fn");
+            error_at(cur(), "expected class, struct, union, interface, enum, fn, or extern declaration");
             advance();
             break;
     }
 }
 
-ClassDecl Parser::parse_class(bool is_pub, bool is_interface) {
+ClassDecl Parser::parse_class(bool is_pub, bool is_interface, bool is_move_only,
+                              bool is_struct, bool is_c_layout, bool is_union) {
     ClassDecl c;
     c.is_pub = is_pub;
     c.is_interface = is_interface;
-    const Token& kw = advance(); // class / interface
+    c.is_struct = is_struct;
+    c.is_union = is_union;
+    c.is_c_layout = is_c_layout;
+    c.is_move_only = is_move_only;
+    const Token& kw = advance(); // class / struct / union / interface
     c.line = kw.line;
     c.col = kw.col;
 
@@ -226,7 +297,10 @@ ClassDecl Parser::parse_class(bool is_pub, bool is_interface) {
         c.name = std::string(cur().text);
         advance();
     } else {
-        error_at(cur(), is_interface ? "expected interface name" : "expected class name");
+        error_at(cur(), is_interface ? "expected interface name"
+                                     : is_union ? "expected union name"
+                                     : is_struct ? "expected struct name"
+                                                 : "expected class name");
     }
     c.qualname = c.name;
     if (check(TokenKind::lt)) c.generics = parse_generics();
@@ -392,6 +466,14 @@ std::vector<GenericParam> Parser::parse_generics() {
             if (check(TokenKind::ident)) {
                 g.bound = std::string(cur().text);
                 advance();
+                while (accept(TokenKind::plus)) {
+                    if (!check(TokenKind::ident)) {
+                        error_at(cur(), "expected trait after '+'");
+                        break;
+                    }
+                    g.bound += "+" + std::string(cur().text);
+                    advance();
+                }
             } else {
                 error_at(cur(), "expected bound after ':'");
             }
@@ -417,6 +499,8 @@ std::vector<Param> Parser::parse_params(bool* has_self) {
     do {
         skip_newlines();
         Param p;
+        if (accept(TokenKind::kw_take)) p.passing = Param::Passing::take;
+        else if (accept(TokenKind::kw_inout)) p.passing = Param::Passing::inout;
         if (check(TokenKind::ident)) {
             p.line = cur().line;
             p.col = cur().col;
@@ -440,6 +524,27 @@ TypePtr Parser::parse_type() {
     auto t = std::make_unique<TypeRef>();
     t->line = cur().line;
     t->col = cur().col;
+
+    if (accept(TokenKind::lbracket)) {
+        t->kind = TypeRef::Kind::fixed_array;
+        t->array_elem = parse_type();
+        expect(TokenKind::semicolon, "';' in fixed array type");
+        if (!check(TokenKind::int_lit)) {
+            error_at(cur(), "expected fixed array length");
+        } else {
+            std::string digits;
+            for (char c : cur().text) if (c != '_') digits.push_back(c);
+            unsigned long long length = std::strtoull(digits.c_str(), nullptr, 10);
+            if (length > UINT32_MAX) {
+                error_at(cur(), "fixed array length is too large");
+            } else {
+                t->array_len = static_cast<uint32_t>(length);
+            }
+            advance();
+        }
+        expect(TokenKind::rbracket, "']' in fixed array type");
+        return t;
+    }
 
     if (accept(TokenKind::kw_fn)) {
         t->kind = TypeRef::Kind::fn;
@@ -687,7 +792,8 @@ ExprPtr Parser::parse_cast() {
 }
 
 ExprPtr Parser::parse_unary() {
-    if (check(TokenKind::minus) || check(TokenKind::bang) || check(TokenKind::tilde)) {
+    if (check(TokenKind::minus) || check(TokenKind::bang) || check(TokenKind::tilde) ||
+        check(TokenKind::kw_take) || check(TokenKind::kw_inout)) {
         auto e = new_expr(Expr::Kind::unary, cur());
         e->op = cur().kind;
         advance();

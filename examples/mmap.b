@@ -2,10 +2,11 @@
 // word access. put/get/read/write panic out of range, flush/close report
 // Results, and dropping a map without close() unmaps it (kind-6 resource).
 import std.io
+import std.fs
 
 fn main() {
     let p: string = "{Dir.temp()}/beans_mmap_example.dat"
-    File.write_bytes(p, Bytes.new(64)).expect("seed")
+    fs.write_bytes(p, Bytes.new(64)).expect("seed")
 
     let m: MMap = MMap.open(p, true).expect("open rw")
     io.println("{m.len()}")
@@ -40,7 +41,7 @@ fn main() {
 
     // resize: grow in place, patch the new tail, shrink back — the handle
     // keeps its fd exactly for this
-    File.write_bytes(p, Bytes.new(8)).expect("seed resize")
+    fs.write_bytes(p, Bytes.new(8)).expect("seed resize")
     let g: MMap = MMap.open(p, true).expect("open grow")
     g.resize(32).expect("grow")
     g.put_u64(24, 777)
@@ -50,7 +51,7 @@ fn main() {
     g.close().expect("close grow")
 
     // an empty file maps to len 0; every access is out of range, flush is a no-op
-    File.write(p, "").expect("truncate to empty")
+    fs.write(p, "").expect("truncate to empty")
     let z: MMap = MMap.open(p, true).expect("open empty")
     io.println("{z.len()}")
     z.flush().expect("flush empty")
@@ -58,7 +59,7 @@ fn main() {
 
     // POSIX: the mapping outlives the file — remove the path, keep reading,
     // and the temp dir is already clean when the final panic fires
-    File.write_bytes(p, Bytes.new(8).put_u32(0, 77)).expect("reseed")
+    fs.write_bytes(p, Bytes.new(8).put_u32(0, 77)).expect("reseed")
     let last: MMap = MMap.open(p, false).expect("open last")
     File.remove(p).expect("rm")
     io.println("{last.get_u32(0)} {File.exists(p)}")

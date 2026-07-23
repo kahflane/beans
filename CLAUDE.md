@@ -14,6 +14,12 @@ changing language behaviour.
 ```
 make                      # build build/beansc (clang++, -std=c++20 -O2)
 make run                  # smoke test: parse examples/hello.b + examples/tour.b
+make test                 # every example: interpreter/native output + exit parity
+make test-sanitize        # ASan, TSan, and macOS no-pool leaks
+make bench-quick          # 2 warmups + 5 measured runs for 8 groups
+make bench-verify         # one checksum/output-parity pass over the full manifest
+make bench-full           # 3 warmups, >=10 runs and >=10 measured seconds/target
+make bench-profile NAME=trees # platform profile + separate ARC counters
 make clean                # rm -rf build/
 
 ./build/beansc lex   f.b [f2.b ...]   # token dump
@@ -21,16 +27,19 @@ make clean                # rm -rf build/
 ./build/beansc check f.b [f2.b ...]   # type check, prints "ok"
 ./build/beansc run   f.b [f2.b ...]   # check + tree-walking interpreter
 ./build/beansc build f.b [-o out]     # LLVM IR + native binary (whole module if beans.mod exists)
+./build/beansc build --release --lto --cpu native f.b [-o out]
 ```
 
-`build` needs `clang` on PATH. It writes `build/<stem>.ll` and `build/beans_rt.c`, then shells out to
-`clang -O2 -Wno-override-module <ll> build/beans_rt.c -o <bin>`. Read the `.ll` when debugging codegen —
-LLVM's verifier catches ownership mistakes, and its complaints point at real bugs.
+`build` needs `clang` on PATH. It writes `build/<stem>.ll` and `build/beans_rt.c`; the C runtime is
+compiled once into a content-keyed cached object (or bitcode for LTO), then linked with the program.
+Read the `.ll` when debugging codegen — LLVM's verifier catches ownership mistakes, and its
+complaints point at real bugs.
 
 ### The test loop
 
-There is no test suite and no test runner. Correctness is verified by **differential testing**: the
-interpreter and the native binary must produce byte-identical output, panics and exit codes included.
+Correctness is verified by **differential testing**: the interpreter and the native binary must
+produce byte-identical output, panics and exit codes included. `make test` runs this across every
+example and the multi-package program.
 
 ```
 ./build/beansc build examples/tour.b -o build/tour_native
@@ -39,8 +48,8 @@ diff <(./build/beansc run examples/tour.b 2>&1) <(./build/tour_native 2>&1)
 
 Run this on `examples/*.b` after any change to the checker, interpreter, or codegen. `examples/tour.b`
 exercises most of the language; `examples/threads.b` covers concurrency; `examples/shop/main.b` covers
-multi-package programs (packages, `pub`, cross-package inheritance, block arms). `bench/*.b` have
-matching `bench/*.go` for speed comparisons.
+multi-package programs (packages, `pub`, cross-package inheritance, block arms). Scored benchmarks
+have tuned and matched C++20 implementations in `bench/cpp/`; Go and Bun stay as report context.
 
 Memory is verified with Apple's `leaks` (`leaks --atExit -- ./build/<bin>`); the target is 0 leaked
 bytes on every program. Small objects normally live inside pooled 64KB slabs, which hides individual
@@ -54,18 +63,18 @@ catch those: `clang -O1 -g -fsanitize=address -Wno-override-module build/<stem>.
 and `leaks` both miss (e.g. a `defer` running on a freed local). Run it, plus `-fsanitize=thread` on
 `examples/threads.b`, after any change to `FnEmit`, the RC discipline, or the C runtime.
 
-Only `examples/` and `bench/` are tracked — `build/` is gitignored, so scratch `.b` test programs
-written there do not survive.
+`examples/`, `bench/`, `test/`, and compiler-shipped `lib/std/` sources are tracked. `build/` is
+gitignored, so scratch `.b` test programs written there do not survive.
 
 ## Architecture
 
-Five stages, each a file pair in `src/`, all under `namespace beans`. `src/main.cpp` is the driver and
+The stages live under `namespace beans`. `src/main.cpp` is the driver and
 wires them together; every stage collects errors and keeps going rather than bailing on the first one,
 so one run reports many errors as `file:line:col: error: msg`.
 
 ```
-loader.cpp → lexer.cpp → parser.cpp → checker.cpp →  ┬→ interp.cpp   (reference semantics)
- packages     tokens       AST           types         └→ codegen.cpp  (LLVM IR → native)
+loader → lexer → parser → checker/HIR → MIR →  ┬→ interpreter (reference semantics)
+                                                └→ LLVM text → native
 ```
 
 The loader turns the entry file into a whole `Program` (ast.h): it finds `beans.mod`, gathers one
@@ -81,7 +90,14 @@ go through it; `lex`/`parse` stay per-file.
   `Name {` as an initializer vs. the body of an `if`/`for`/`match` header.
 - **checker** (`types.h`) — two passes: register all declarations and signatures, then check bodies.
   Types are interned in a `TypePool`, so `TypeId` equality *is* pointer equality. `poison` is the
-  error type and stops cascading messages. Generics are checked by `unify`/`subst`.
+  error type and stops cascading messages. Generics are checked by `unify`/`subst`. The resulting
+  `HirProgram` owns checked expression types and the target layout shared by both backends.
+- **MIR** (`mir.h/.cpp`) — control-flow blocks plus explicit borrow, move, retain, release,
+  edge-drop, and allocation operations. Lowering is still being expanded; native match pinning and
+  ownership folds already consume it.
+- **C ABI** (`c_abi.h/.cpp`) — recreates checked `@c_layout` extern signatures as C source so
+  Clang, not Beans, classifies by-value aggregates for each target ABI. Native links a small wrapper;
+  the interpreter compiles and caches the same shape as a trampoline.
 - **interp** (`value.h`) — the **reference implementation**. When the two backends disagree, the
   interpreter is right unless there is a reason to think otherwise. Assumes the module already type
   checked and does not re-validate. Real `std::thread`, real mutexes, blocking channels. Runtime
@@ -108,8 +124,9 @@ Monomorphic builtins (string methods, the growing stdlib) live in the registry
 interpreter body. The checker types from the row, codegen auto-declares the symbol and emits the
 call — fallible rows return the 16-byte `BRes {val, msg}` ABI (msg null = ok; both sides return it
 in registers, which is why it must stay ≤ 16 bytes) and get boxed into `Result` generically. Adding
-one builtin = one row + one C function in `runtime_c()` + the row's `run` fn. Generic containers
-(List/Map/Option/...) stay hand-written in all three stages.
+one low-level builtin = one row + one C function in `runtime_c()` + the row's `run` fn. High-level
+library code belongs in compiler-shipped `lib/std/` packages; `std.collections` and `std.math` are
+the first Beans-written packages. Generic container storage remains native for now.
 
 ### Inside codegen.cpp
 
@@ -143,6 +160,14 @@ mid-statement temporaries (`temps`) hold refs. When editing `FnEmit`:
 
 - Temporaries created while emitting a statement go on `temps` via `own()`, are removed by `consume()`
   when ownership transfers, and are released by `flush_temps(mark)` at the statement end.
+- `take local` clears the local's live flag and transfers its reference. Plain assignment
+  reinitializes that flag. Cleanup must test it on merged control-flow paths.
+- A direct `return local` moves the frame-owned reference by excluding that slot from final cleanup.
+- `Option<T>` uses null as `none` when `T` is a non-enum RC pointer; `some` is the pointer itself.
+  Wide values use an inline `{i1, T}` aggregate, recursively for nested Options.
+- A `Result<T, E>` with a wide branch is `{i1, T, E}`. Inactive fields are zero, and `FnEmit`
+  recursively retains/releases ARC values inside inline Option/Result aggregates.
+  The checker still exposes no null value, and scalar/user enums stay boxed.
 - **Release branch-local temporaries inside their own branch.** LLVM's verifier rejects the IR
   otherwise, and it is right — the value is not live on the other path.
 - **A captured parameter needs a retain going into its heap cell**, or it is over-released.

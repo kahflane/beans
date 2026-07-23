@@ -2,16 +2,28 @@ package main
 
 import (
 	"fmt"
+	"os"
 	"strconv"
 	"strings"
 )
 
+func arg(at, fallback int) int {
+	if len(os.Args) <= at+1 {
+		return fallback
+	}
+	n, err := strconv.Atoi(os.Args[at+1])
+	if err != nil {
+		return fallback
+	}
+	return n
+}
+
 func main() {
-	n := 800000
+	n, seed := arg(0, 2000000), arg(1, 1)
 
 	parts := make([]string, 0, n)
 	for i := 0; i < n; i++ {
-		parts = append(parts, "item"+strconv.Itoa(i))
+		parts = append(parts, "item"+strconv.Itoa(seed)+"_"+strconv.Itoa(i))
 	}
 
 	joined := strings.Join(parts, ",")

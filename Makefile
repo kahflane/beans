@@ -1,17 +1,52 @@
 CXX      := clang++
-CXXFLAGS := -std=c++20 -Wall -Wextra -O2
+CXXFLAGS := -std=c++20 -Wall -Wextra -O2 -pthread
 
-SRC := src/token.cpp src/lexer.cpp src/parser.cpp src/ast_print.cpp src/loader.cpp src/checker.cpp src/builtins.cpp src/codegen.cpp src/interp.cpp src/main.cpp
-HDR := src/token.h src/lexer.h src/ast.h src/parser.h src/types.h src/loader.h src/checker.h src/value.h src/builtins.h src/interp.h src/codegen.h
+SRC := src/token.cpp src/lexer.cpp src/parser.cpp src/ast_print.cpp src/loader.cpp src/mir.cpp src/c_abi.cpp src/checker.cpp src/builtins.cpp src/codegen.cpp src/interp.cpp src/main.cpp
+HDR := src/token.h src/lexer.h src/ast.h src/parser.h src/types.h src/target.h src/mir.h src/hir.h src/c_abi.h src/loader.h src/checker.h src/value.h src/builtins.h src/interp.h src/codegen.h
 BIN := build/beansc
 
 $(BIN): $(SRC) $(HDR)
 	@mkdir -p build
 	$(CXX) $(CXXFLAGS) $(SRC) -o $(BIN)
 
-.PHONY: run clean
+.PHONY: run clean test test-sanitize bench-quick bench-full bench-verify bench-profile
 run: $(BIN)
 	./$(BIN) parse examples/hello.b examples/tour.b
+
+test: $(BIN)
+	./test/differential.sh
+	./test/numerics.sh
+	./test/moves.sh
+	./test/maps.sh
+	./test/traits.sh
+	bash ./test/unsafe.sh
+	./test/fixed_arrays.sh
+	./test/raw_slices.sh
+	./test/c_layout_structs.sh
+	./test/c_layout_unions.sh
+	./test/c_layout_c_abi.sh
+	./test/c_callbacks.sh
+	./test/stdlib_source.sh
+	./test/fs_source.sh
+	./test/reader_source.sh
+	./test/inline_options.sh
+	./test/inline_results.sh
+
+test-sanitize: $(BIN)
+	bash ./test/sanitize.sh
+
+bench-quick: $(BIN)
+	./bench/run.sh quick
+
+bench-full: $(BIN)
+	./bench/run.sh full
+
+bench-verify: $(BIN)
+	./bench/run.sh verify
+
+bench-profile: $(BIN)
+	@test -n "$(NAME)" || { echo "usage: make bench-profile NAME=trees"; exit 2; }
+	./bench/profile.sh "$(NAME)"
 
 clean:
 	rm -rf build

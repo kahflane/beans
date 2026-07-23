@@ -54,7 +54,7 @@ class Child : Parent {
 }
 
 // generic class with both hooks
-class Box<T> {
+class OwnedBox<T> {
     item: T
     fn init(self, item: T) { self.item = item }
     fn deinit(self) { io.println("box down") }
@@ -104,7 +104,7 @@ fn inheritance() {
 
 fn generics() {
     io.println("-- generics --")
-    let b: Box<Res> = Box(Res("boxed"))
+    let b: OwnedBox<Res> = OwnedBox(Res("boxed"))
     io.println("box built")           // box down, then close boxed
 }
 

@@ -89,6 +89,8 @@ fn main() {
     // chars() slices by UTF-8 character; len stays bytes forever
     io.println("héllo→🌍".chars())
     io.println("{"héllo→🌍".len()} bytes, {"héllo→🌍".chars().len()} chars")
+    io.println("{"héllo→🌍".count_chars(0, "héllo→🌍".len())} chars without a list")
+    io.println("{"héllo→🌍".count_chars(0, 3)} chars in three bytes")
 
     // out of range slices panic with the range in the message
     io.println(t.slice(5, 99))

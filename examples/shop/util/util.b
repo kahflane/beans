@@ -18,7 +18,7 @@ pub class Logger {
     }
 }
 
-pub fn largest<T>(xs: List<T>) -> Option<T> {
+pub fn largest<T: Order>(xs: List<T>) -> Option<T> {
     return xs.max()
 }
 

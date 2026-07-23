@@ -1,0 +1,6 @@
+box first 10 second 20
+box values 7 8 12.50
+arena 0 1 2 one two
+arena clear 0 missing
+arena decimal 1.25 2.50
+result arena error

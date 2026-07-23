@@ -1,0 +1,10 @@
+C struct 16 4 0 4 8 12 9 123 2.5 true
+C struct value 9 130 3 true
+C union 4 4 0 0 1077936128 3
+C union value 1086324736 6
+C pointer 16 8 0 8 55 77
+C pair 6 2 0 2
+C aligned union 16 8 0 0
+C nested 32 8 0 8 16 Beans 32 8 513 5 2000 72623859790382856
+C nested value 514 2003 72623859790382860
+C mixed float 11.5

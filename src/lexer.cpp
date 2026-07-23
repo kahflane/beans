@@ -69,6 +69,8 @@ bool Lexer::ends_statement(TokenKind k) {
         case TokenKind::rbracket:
         case TokenKind::rbrace:
         case TokenKind::question:
+        case TokenKind::gt:
+        case TokenKind::shr:
             return true;
         default:
             return false;
@@ -282,8 +284,10 @@ std::vector<Token> Lexer::scan_all() {
             case '[': out.push_back(make(TokenKind::lbracket)); break;
             case ']': out.push_back(make(TokenKind::rbracket)); break;
             case ',': out.push_back(make(TokenKind::comma)); break;
+            case ';': out.push_back(make(TokenKind::semicolon)); break;
             case ':': out.push_back(make(TokenKind::colon)); break;
             case '?': out.push_back(make(TokenKind::question)); break;
+            case '@': out.push_back(make(TokenKind::at)); break;
             case '^': out.push_back(make(TokenKind::caret)); break;
             case '~': out.push_back(make(TokenKind::tilde)); break;
             case '.':

@@ -2,11 +2,15 @@
 // sqrt in the stdlib and none is needed — the escape test squares instead.
 // Pure IEEE doubles, so every language must land on the same count.
 import std.io
+import std.os
 
 fn main() {
-    let w: int = 1800
-    let h: int = 1800
-    let max_iter: int = 100
+    let args: List<string> = os.args()
+    let size: int = if args.len() > 0 { args[0].to_int().or(1800) } else { 1800 }
+    let seed: int = if args.len() > 1 { args[1].to_int().or(1) } else { 1 }
+    let w: int = size
+    let h: int = size
+    let max_iter: int = 80 + seed % 41
     var inside: int = 0
 
     var y: int = 0

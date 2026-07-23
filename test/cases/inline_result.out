@@ -1,0 +1,7 @@
+inline result true false true
+result values 20 11 20
+result stdlib 25
+result error no pair
+result nested 10
+result capture no pair
+result assign 40

@@ -6,6 +6,7 @@ import std.io
 
 fn main() {
     var xs: List<int> = [5, 1, 4, 1, 3]
+    xs.reserve(32)
     io.println("{xs.first().or(-1)} {xs.last().or(-1)} {xs.min().or(-1)} {xs.max().or(-1)}")
     io.println("{xs.index_of(4).or(-1)} {xs.index_of(9).or(-1)}")
     xs.insert(0, 9)
@@ -40,6 +41,12 @@ fn main() {
     io.println(names.join(" "))
     names.sort_by(fn(a: string, b: string) -> bool { return a.len() < b.len() })
     io.println(names.join(" "))
+
+    // sort_by_key evaluates the key once per element and remains stable.
+    var keyed: List<string> = ["bbb", "a", "ccc", "d", "ee"]
+    keyed.sort_by_key(fn(value: string) -> int { return value.len() })
+    io.println(keyed.join(" "))
+
     names.insert(1, "plum")
     let popped: string = names.remove(4)
     io.println("{popped} | {names} | {names.slice(1, 3)}")
@@ -50,6 +57,7 @@ fn main() {
     io.println(ds)
 
     var m: Map<string, int> = {}
+    m.reserve(16)
     m["one"] = 1
     m["two"] = 2
     m["three"] = 3

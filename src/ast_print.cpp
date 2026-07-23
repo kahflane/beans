@@ -12,6 +12,10 @@ std::string ind(int n) { return std::string(static_cast<size_t>(n) * 2, ' '); }
 
 std::string type_str(const TypeRef* t) {
     if (!t) return "?";
+    if (t->kind == TypeRef::Kind::fixed_array) {
+        return "[" + type_str(t->array_elem.get()) + "; " +
+               std::to_string(t->array_len) + "]";
+    }
     if (t->kind == TypeRef::Kind::fn) {
         std::string s = "fn(";
         for (size_t i = 0; i < t->fn_params.size(); i++) {
@@ -44,6 +48,8 @@ std::string params_str(const std::vector<Param>& ps, bool self_first) {
     for (const Param& p : ps) {
         if (!first) s += ", ";
         first = false;
+        if (p.passing == Param::Passing::take) s += "take ";
+        if (p.passing == Param::Passing::inout) s += "inout ";
         s += p.name;
         if (p.type) s += ": " + type_str(p.type.get());
     }
@@ -261,6 +267,7 @@ void fn_str(std::string& out, const FnDecl& f, int depth) {
     out += ind(depth);
     if (f.is_pub) out += "pub ";
     if (f.is_override) out += "override ";
+    if (f.is_extern_c) out += "extern \"C\" ";
     out += "fn " + f.name + generics_str(f.generics) +
            params_str(f.params, f.has_self);
     if (f.ret) out += " -> " + type_str(f.ret.get());
@@ -284,8 +291,13 @@ std::string dump(const Module& m) {
         switch (kind) {
             case Module::DeclKind::class_: {
                 const ClassDecl& c = m.classes[idx];
+                if (c.is_move_only) out += "@move_only ";
+                if (c.is_c_layout) out += "@c_layout ";
                 if (c.is_pub) out += "pub ";
-                out += c.is_interface ? "interface " : "class ";
+                out += c.is_interface ? "interface "
+                       : c.is_union    ? "union "
+                       : c.is_struct   ? "struct "
+                                       : "class ";
                 out += c.name + generics_str(c.generics);
                 if (!c.supers.empty()) {
                     out += " : ";

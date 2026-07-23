@@ -1,97 +1,68 @@
-#!/bin/bash
-# bench/run.sh — run every bench in beans, Go, and JS (bun), write bench/report.md
-#
-# Method: compile ahead of time where the language compiles (beans native, go),
-# then time ONLY execution, best of 3 runs. bun times include its startup
-# (~10ms) because that is how JS ships. Compile times are reported separately.
-set -u
+#!/usr/bin/env bash
+# Build every target first, then hand timing to the C++ runner.
+set -euo pipefail
 
 cd "$(dirname "$0")/.."
-ROOT=$PWD
-OUT=build/bench
-mkdir -p "$OUT"
+root=$PWD
+mode=${1:-quick}
+case "$mode" in
+    quick|full|verify) ;;
+    *) echo "usage: bench/run.sh <quick|full|verify>" >&2; exit 2 ;;
+esac
 
-BENCHES="fib loops shapes churn trees maps mandel strings"
-RUNS=3
+out=build/bench
+mkdir -p "$out"
+manifest=bench/suite.tsv
+compile_times="$out/compile-times.tsv"
+cxx=${CXX:-clang++}
+cxx_flags=(-std=c++20 -O3 -DNDEBUG -flto -march=native -ffp-contract=off -pthread)
+beans_flags=(--release --lto --cpu native)
+runner_flags=(-std=c++20 -O2 -Wall -Wextra)
 
-# time one command, print seconds (best of $RUNS)
-best_time() {
-    local best=""
-    for _ in $(seq $RUNS); do
-        /usr/bin/time -p "$@" >/dev/null 2>"$OUT/t"
-        local r
-        r=$(awk '/^real/ {print $2}' "$OUT/t")
-        if [ -z "$best" ] || awk "BEGIN{exit !($r < $best)}"; then best=$r; fi
-    done
-    echo "$best"
+elapsed() {
+    local start end
+    start=$(perl -MTime::HiRes=time -e 'printf "%.9f", time')
+    if ! "${@:2}" >&2; then
+        return 1
+    fi
+    end=$(perl -MTime::HiRes=time -e 'printf "%.9f", time')
+    perl -e 'printf "%.6f", $ARGV[1] - $ARGV[0]' "$start" "$end"
 }
 
-# wall-clock of a compile step, printed as seconds
-compile_time() {
-    local t0 t1
-    t0=$(perl -MTime::HiRes=time -e 'printf "%.3f", time')
-    "$@" >/dev/null 2>&1 || { echo "fail"; return; }
-    t1=$(perl -MTime::HiRes=time -e 'printf "%.3f", time')
-    awk "BEGIN{printf \"%.2f\", $t1 - $t0}"
+make -s build/beansc
+"$cxx" "${runner_flags[@]}" bench/runner.cpp -o "$out/runner"
+# Compile the cached runtime bitcode before per-workload compile timing.
+./build/beansc build "${beans_flags[@]}" bench/fib.b -o "$out/runtime-prime" >/dev/null
+printf '# workload\ttarget\tseconds\n' >"$compile_times"
+
+mapfile_compat() {
+    while IFS=$'\t' read -r name group quick size seed expected scored; do
+        [[ -z "$name" || "${name:0:1}" == "#" ]] && continue
+        [[ "$mode" == "quick" && "$quick" != "1" ]] && continue
+        printf '%s\n' "$name"
+    done <"$manifest"
 }
 
-[ -x build/beansc ] || make >/dev/null
+while IFS= read -r name; do
+    printf 'building %s\n' "$name"
+    # A failed build must stop before the runner can see an older binary with
+    # the same name. `elapsed` returns the compiler status on purpose.
+    seconds=$(elapsed beans ./build/beansc build "${beans_flags[@]}" "bench/$name.b" -o "$out/${name}_beans")
+    printf '%s\tbeans\t%s\n' "$name" "$seconds" >>"$compile_times"
 
-HAVE_GO=$(command -v go >/dev/null && echo yes || echo no)
-HAVE_BUN=$(command -v bun >/dev/null && echo yes || echo no)
+    seconds=$(elapsed cpp_tuned "$cxx" "${cxx_flags[@]}" "bench/cpp/$name.cpp" -o "$out/${name}_cpp_tuned")
+    printf '%s\tcpp_tuned\t%s\n' "$name" "$seconds" >>"$compile_times"
 
-REPORT=bench/report.md
-{
-    echo "# beans bench report"
-    echo
-    echo "- date: $(date '+%Y-%m-%d %H:%M')"
-    echo "- machine: $(uname -m), $(sysctl -n machdep.cpu.brand_string 2>/dev/null || echo unknown)"
-    echo "- beansc: $(git rev-parse --short HEAD 2>/dev/null || echo untracked)"
-    [ "$HAVE_GO" = yes ] && echo "- go: $(go version | awk '{print $3}')"
-    [ "$HAVE_BUN" = yes ] && echo "- bun: $(bun --version)"
-    echo
-    echo "Execution time in seconds, best of $RUNS runs of a prebuilt binary"
-    echo "(bun runs the .js directly, so its time includes runtime startup)."
-    echo
-    echo "| bench | beans | go | bun (js) |"
-    echo "|---|---|---|---|"
-} >"$REPORT"
+    seconds=$(elapsed cpp_matched "$cxx" "${cxx_flags[@]}" -DBEANS_MATCHED=1 "bench/cpp/$name.cpp" -o "$out/${name}_cpp_matched")
+    printf '%s\tcpp_matched\t%s\n' "$name" "$seconds" >>"$compile_times"
 
-BEANS_COMPILE=""
-GO_COMPILE=""
-
-for b in $BENCHES; do
-    bt="n/a"; gt="n/a"; jt="n/a"
-
-    c=$(compile_time ./build/beansc build "bench/$b.b" -o "$OUT/${b}_beans")
-    if [ "$c" != "fail" ]; then
-        BEANS_COMPILE="$BEANS_COMPILE $b:${c}s"
-        bt=$(best_time "$OUT/${b}_beans")
+    if command -v go >/dev/null 2>&1 && [[ -f "bench/$name.go" ]]; then
+        seconds=$(elapsed go go build -o "$out/${name}_go" "bench/$name.go")
+        printf '%s\tgo\t%s\n' "$name" "$seconds" >>"$compile_times"
     fi
+done < <(mapfile_compat)
 
-    if [ "$HAVE_GO" = yes ]; then
-        c=$(compile_time go build -o "$OUT/${b}_go" "bench/$b.go")
-        if [ "$c" != "fail" ]; then
-            GO_COMPILE="$GO_COMPILE $b:${c}s"
-            gt=$(best_time "$OUT/${b}_go")
-        fi
-    fi
-
-    if [ "$HAVE_BUN" = yes ]; then
-        jt=$(best_time bun "bench/$b.js")
-    fi
-
-    echo "| $b | $bt | $gt | $jt |" >>"$REPORT"
-    echo "$b: beans=$bt go=$gt bun=$jt"
-done
-
-{
-    echo
-    echo "Compile times (not in the table): beans —${BEANS_COMPILE:-n/a}; go —${GO_COMPILE:-n/a}."
-    echo
-    echo "Outputs are checked against each other by the languages' own runs;"
-    echo "all three print the same result per bench."
-} >>"$REPORT"
-
-echo
-echo "report written to $REPORT"
+export BENCH_CXX_FLAGS="${cxx_flags[*]}"
+export BENCH_BEANS_FLAGS="beansc build ${beans_flags[*]}"
+"$out/runner" "$mode" "$manifest" "$out" "$compile_times" \
+    "$out/results-$mode.json" bench/report.md "$root"

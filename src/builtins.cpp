@@ -371,6 +371,40 @@ Value str_chars(uint32_t, uint32_t, Value& recv, std::vector<Value>&) {
     return str_list(std::move(out));
 }
 
+Value str_count_chars(uint32_t line, uint32_t col, Value& recv,
+                      std::vector<Value>& args) {
+    const std::string& s = *recv.s;
+    int64_t from = args[0].i, to = args[1].i;
+    if (from < 0 || to < from || to > static_cast<int64_t>(s.size())) {
+        bpanic(line, col, "character range " + std::to_string(from) + ".." +
+                              std::to_string(to) + " out of range (len " +
+                              std::to_string(s.size()) + ")");
+    }
+    int64_t count = 0;
+    size_t i = static_cast<size_t>(from), end = static_cast<size_t>(to);
+    while (i < end) {
+        unsigned char c = static_cast<unsigned char>(s[i]);
+        size_t n = c < 0x80            ? 1
+                   : (c >> 5) == 0x6   ? 2
+                   : (c >> 4) == 0xE   ? 3
+                   : (c >> 3) == 0x1E  ? 4
+                                       : 1;
+        if (i + n > end) {
+            n = 1;
+        } else {
+            for (size_t k = 1; k < n; k++) {
+                if ((static_cast<unsigned char>(s[i + k]) >> 6) != 0x2) {
+                    n = 1;
+                    break;
+                }
+            }
+        }
+        i += n;
+        count += 1;
+    }
+    return Value::of_int(count);
+}
+
 Value str_to_decimal(uint32_t, uint32_t, Value& recv, std::vector<Value>&) {
     const std::string& s = *recv.s;
     if (!dec_valid(s.c_str())) {
@@ -394,6 +428,14 @@ Value bytes_resize(uint32_t line, uint32_t col, Value& recv, std::vector<Value>&
     int64_t n = args[0].i;
     if (n < 0) bpanic(line, col, "negative size " + std::to_string(n));
     recv.bytes->data.resize(static_cast<size_t>(n), 0);
+    return recv;
+}
+
+Value bytes_reserve(uint32_t line, uint32_t col, Value& recv, std::vector<Value>& args) {
+    int64_t n = args[0].i;
+    if (n < 0) bpanic(line, col, "negative reserve capacity " + std::to_string(n));
+    if (n > (1LL << 58)) bpanic(line, col, "reserve capacity too large");
+    recv.bytes->data.reserve(static_cast<size_t>(n));
     return recv;
 }
 
@@ -498,11 +540,45 @@ Value bytes_append_str(uint32_t, uint32_t, Value& recv, std::vector<Value>& args
     return recv;
 }
 
+Value bytes_append_i64(uint32_t, uint32_t, Value& recv, std::vector<Value>& args) {
+    uint64_t bits = static_cast<uint64_t>(args[0].i);
+    auto& data = recv.bytes->data;
+    for (unsigned shift = 0; shift < 64; shift += 8)
+        data.push_back(static_cast<uint8_t>(bits >> shift));
+    return recv;
+}
+
+Value bytes_append_range(uint32_t line, uint32_t col, Value& recv,
+                         std::vector<Value>& args) {
+    auto& source = args[0].bytes->data;
+    int64_t from = args[1].i, to = args[2].i;
+    if (from < 0 || to < from || to > static_cast<int64_t>(source.size())) {
+        bpanic(line, col, "slice " + std::to_string(from) + ".." +
+                              std::to_string(to) + " out of range (len " +
+                              std::to_string(source.size()) + ")");
+    }
+    std::vector<uint8_t> copy;
+    const uint8_t* first = source.data() + from;
+    const uint8_t* last = source.data() + to;
+    if (&source == &recv.bytes->data) {
+        copy.assign(first, last);
+        recv.bytes->data.insert(recv.bytes->data.end(), copy.begin(), copy.end());
+    } else {
+        recv.bytes->data.insert(recv.bytes->data.end(), first, last);
+    }
+    return recv;
+}
+
 Value bytes_to_string(uint32_t, uint32_t, Value& recv, std::vector<Value>&) {
     auto& d = recv.bytes->data;
     size_t n = 0;
     while (n < d.size() && d[n] != 0) n++; // strings are text: stop at NUL
     return Value::of_str(std::string(reinterpret_cast<const char*>(d.data()), n));
+}
+
+Value bytes_to_string_full(uint32_t, uint32_t, Value& recv, std::vector<Value>&) {
+    auto& d = recv.bytes->data;
+    return Value::of_str(std::string(reinterpret_cast<const char*>(d.data()), d.size()));
 }
 
 // ---- File / Dir -------------------------------------------------------------
@@ -702,48 +778,6 @@ Value file_unlock(uint32_t, uint32_t, Value& recv, std::vector<Value>&) {
         return res_err(std::string("unlock: ") + strerror(errno), fs_kind_of(errno));
     }
     return res_ok(Value::of_bool(true));
-}
-
-// ---- BufReader --------------------------------------------------------------
-
-Value bufr_on_s(uint32_t, uint32_t, std::vector<Value>& args) {
-    Value v;
-    v.k = Value::K::bufr;
-    v.br = std::make_shared<BufReaderVal>();
-    v.br->file = args[0];
-    return v;
-}
-
-// a line without its '\n'; a partial line at EOF comes through, then none
-Value bufr_read_line(uint32_t, uint32_t, Value& recv, std::vector<Value>&) {
-    BufReaderVal& r = *recv.br;
-    FileVal& f = *r.file.file;
-    std::string line;
-    while (true) {
-        while (r.bpos < r.blim) {
-            uint8_t c = r.buf[r.bpos++];
-            if (c == '\n') return res_ok(opt_some(Value::of_str(std::move(line))));
-            line.push_back(static_cast<char>(c));
-        }
-        if (r.eof) break;
-        if (f.closed) return closed_err();
-        if (r.buf.empty()) r.buf.resize(8192);
-        ssize_t got = pread(f.fd, r.buf.data(), r.buf.size(),
-                            static_cast<off_t>(r.off));
-        if (got < 0) {
-            return res_err(std::string("read: ") + strerror(errno),
-                           fs_kind_of(errno));
-        }
-        if (got == 0) {
-            r.eof = true;
-            break;
-        }
-        r.off += got;
-        r.bpos = 0;
-        r.blim = static_cast<size_t>(got);
-    }
-    if (line.empty()) return res_ok(opt_none());
-    return res_ok(opt_some(Value::of_str(std::move(line))));
 }
 
 // ---- varint / crc32 ---------------------------------------------------------
@@ -998,70 +1032,6 @@ Value bytes_from(uint32_t, uint32_t, std::vector<Value>& args) {
     return v;
 }
 
-Value fs_read_all_fd(const std::string& path, bool as_bytes) {
-    int fd = open(path.c_str(), O_RDONLY);
-    if (fd < 0) return fs_err(path, errno);
-    std::vector<uint8_t> buf;
-    uint8_t chunk[65536];
-    while (true) {
-        ssize_t r = read(fd, chunk, sizeof chunk);
-        if (r < 0) {
-            int e = errno;
-            close(fd);
-            return fs_err(path, e);
-        }
-        if (r == 0) break;
-        buf.insert(buf.end(), chunk, chunk + r);
-    }
-    close(fd);
-    if (as_bytes) return res_ok(bytes_val(std::move(buf)));
-    return res_ok(Value::of_str(std::string(buf.begin(), buf.end())));
-}
-
-Value file_read_s(uint32_t, uint32_t, std::vector<Value>& args) {
-    return fs_read_all_fd(*args[0].s, false);
-}
-Value file_read_bytes_s(uint32_t, uint32_t, std::vector<Value>& args) {
-    return fs_read_all_fd(*args[0].s, true);
-}
-
-Value fs_write_all(const std::string& path, const uint8_t* p, size_t n, bool append) {
-    int flags = O_WRONLY | O_CREAT | (append ? O_APPEND : O_TRUNC);
-    int fd = open(path.c_str(), flags, 0644);
-    if (fd < 0) return fs_err(path, errno);
-    size_t done = 0;
-    while (done < n) {
-        ssize_t r = write(fd, p + done, n - done);
-        if (r < 0) {
-            int e = errno;
-            close(fd);
-            return fs_err(path, e);
-        }
-        done += static_cast<size_t>(r);
-    }
-    close(fd);
-    return res_ok(Value::of_int(static_cast<int64_t>(done)));
-}
-
-Value file_write_s(uint32_t, uint32_t, std::vector<Value>& args) {
-    const std::string& s = *args[1].s;
-    return fs_write_all(*args[0].s, reinterpret_cast<const uint8_t*>(s.data()), s.size(),
-                        false);
-}
-Value file_append_s(uint32_t, uint32_t, std::vector<Value>& args) {
-    const std::string& s = *args[1].s;
-    return fs_write_all(*args[0].s, reinterpret_cast<const uint8_t*>(s.data()), s.size(),
-                        true);
-}
-Value file_write_bytes_s(uint32_t, uint32_t, std::vector<Value>& args) {
-    auto& d = args[1].bytes->data;
-    return fs_write_all(*args[0].s, d.data(), d.size(), false);
-}
-Value file_append_bytes_s(uint32_t, uint32_t, std::vector<Value>& args) {
-    auto& d = args[1].bytes->data;
-    return fs_write_all(*args[0].s, d.data(), d.size(), true);
-}
-
 Value file_exists_s(uint32_t, uint32_t, std::vector<Value>& args) {
     struct stat st;
     return Value::of_bool(stat(args[0].s->c_str(), &st) == 0 && !S_ISDIR(st.st_mode));
@@ -1089,46 +1059,6 @@ Value file_rename_s(uint32_t, uint32_t, std::vector<Value>& args) {
         return fs_err(*args[0].s, errno);
     }
     return res_ok(Value::of_bool(true));
-}
-
-Value file_copy_s(uint32_t, uint32_t, std::vector<Value>& args) {
-    const std::string& from = *args[0].s;
-    const std::string& to = *args[1].s;
-    int src = open(from.c_str(), O_RDONLY);
-    if (src < 0) return fs_err(from, errno);
-    int dst = open(to.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
-    if (dst < 0) {
-        int e = errno;
-        close(src);
-        return fs_err(to, e);
-    }
-    uint8_t chunk[65536];
-    int64_t total = 0;
-    while (true) {
-        ssize_t r = read(src, chunk, sizeof chunk);
-        if (r < 0) {
-            int e = errno;
-            close(src);
-            close(dst);
-            return fs_err(from, e);
-        }
-        if (r == 0) break;
-        ssize_t done = 0;
-        while (done < r) {
-            ssize_t w = write(dst, chunk + done, static_cast<size_t>(r - done));
-            if (w < 0) {
-                int e = errno;
-                close(src);
-                close(dst);
-                return fs_err(to, e);
-            }
-            done += w;
-        }
-        total += r;
-    }
-    close(src);
-    close(dst);
-    return res_ok(Value::of_int(total));
 }
 
 Value file_open_s(uint32_t, uint32_t, std::vector<Value>& args) {
@@ -1311,59 +1241,6 @@ Value dir_walk_s(uint32_t, uint32_t, std::vector<Value>& args) {
     return res_ok(str_list(std::move(out)));
 }
 
-// ---- Path (pure string math, no fs access) ----------------------------------
-
-std::string path_base_of(const std::string& p) {
-    if (p.empty()) return "";
-    size_t end = p.size();
-    while (end > 0 && p[end - 1] == '/') end--;
-    if (end == 0) return "/";
-    size_t slash = p.rfind('/', end - 1);
-    size_t start = slash == std::string::npos ? 0 : slash + 1;
-    return p.substr(start, end - start);
-}
-
-Value path_join_s(uint32_t, uint32_t, std::vector<Value>& args) {
-    const std::string& a = *args[0].s;
-    const std::string& b = *args[1].s;
-    if (!b.empty() && b[0] == '/') return args[1]; // absolute b wins
-    if (a.empty()) return args[1];
-    if (b.empty()) return args[0];
-    size_t end = a.size();
-    while (end > 0 && a[end - 1] == '/') end--;
-    return Value::of_str(a.substr(0, end) + "/" + b);
-}
-
-Value path_parent_s(uint32_t, uint32_t, std::vector<Value>& args) {
-    const std::string& p = *args[0].s;
-    size_t end = p.size();
-    while (end > 0 && p[end - 1] == '/') end--;
-    if (end == 0) return Value::of_str(p.empty() ? "" : "/");
-    size_t slash = p.rfind('/', end - 1);
-    if (slash == std::string::npos) return Value::of_str("");
-    if (slash == 0) return Value::of_str("/");
-    return Value::of_str(p.substr(0, slash));
-}
-
-Value path_base_s(uint32_t, uint32_t, std::vector<Value>& args) {
-    return Value::of_str(path_base_of(*args[0].s));
-}
-
-// a leading dot is a dotfile, not an extension: ext(".bashrc") is ""
-Value path_ext_s(uint32_t, uint32_t, std::vector<Value>& args) {
-    std::string b = path_base_of(*args[0].s);
-    size_t dot = b.rfind('.');
-    if (dot == std::string::npos || dot == 0) return Value::of_str("");
-    return Value::of_str(b.substr(dot));
-}
-
-Value path_stem_s(uint32_t, uint32_t, std::vector<Value>& args) {
-    std::string b = path_base_of(*args[0].s);
-    size_t dot = b.rfind('.');
-    if (dot == std::string::npos || dot == 0) return Value::of_str(b);
-    return Value::of_str(b.substr(0, dot));
-}
-
 Value mmap_open_s(uint32_t, uint32_t, std::vector<Value>& args) {
     const std::string& path = *args[0].s;
     bool writable = args[1].b;
@@ -1477,42 +1354,6 @@ Value fmt_dec(uint32_t, uint32_t, std::vector<Value>& args) {
     return Value::of_str(fmt_dec_text(args[0].dec, args[1].i));
 }
 
-Value fmt_hex(uint32_t, uint32_t, std::vector<Value>& args) {
-    char buf[24];
-    std::snprintf(buf, sizeof buf, "%llx", static_cast<unsigned long long>(args[0].i));
-    return Value::of_str(buf);
-}
-
-Value fmt_bin(uint32_t, uint32_t, std::vector<Value>& args) {
-    unsigned long long u = static_cast<unsigned long long>(args[0].i);
-    if (u == 0) return Value::of_str("0");
-    char buf[65];
-    int n = 0;
-    bool seen = false;
-    for (int i = 63; i >= 0; i--) {
-        bool bit = (u >> i) & 1;
-        if (bit) seen = true;
-        if (seen) buf[n++] = bit ? '1' : '0';
-    }
-    return Value::of_str(std::string(buf, static_cast<size_t>(n)));
-}
-
-Value fmt_group(uint32_t, uint32_t, std::vector<Value>& args) {
-    int64_t v = args[0].i;
-    const std::string& sep = *args[1].s;
-    unsigned long long m = v < 0 ? 0ULL - static_cast<unsigned long long>(v)
-                                 : static_cast<unsigned long long>(v);
-    std::string digits = std::to_string(m);
-    std::string out;
-    if (v < 0) out += '-';
-    size_t n = digits.size();
-    for (size_t i = 0; i < n; i++) {
-        if (i && (n - i) % 3 == 0) out += sep;
-        out += digits[i];
-    }
-    return Value::of_str(std::move(out));
-}
-
 } // namespace
 
 std::string fmt_pad_text(std::string s, int64_t width, bool left) {
@@ -1575,8 +1416,10 @@ const std::vector<BuiltinMethod>& builtin_methods() {
         {BT::str, "to_float", {}, BT::res_f64, "beans_str_to_float", false, str_to_float},
         {BT::str, "to_decimal", {}, BT::res_dec, "beans_str_to_decimal", false, str_to_decimal},
         {BT::str, "chars", {}, BT::list_str, "beans_str_chars", false, str_chars},
+        {BT::str, "count_chars", {BT::i64, BT::i64}, BT::i64, "beans_str_count_chars", true, str_count_chars},
         // Bytes
         {BT::bytes, "len", {}, BT::i64, "beans_bytes_len", false, bytes_len},
+        {BT::bytes, "reserve", {BT::i64}, BT::self_recv, "beans_bytes_reserve", true, bytes_reserve},
         {BT::bytes, "resize", {BT::i64}, BT::self_recv, "beans_bytes_resize", true, bytes_resize},
         {BT::bytes, "fill", {BT::i64}, BT::self_recv, "beans_bytes_fill", false, bytes_fill},
         {BT::bytes, "get", {BT::i64}, BT::i64, "beans_bytes_get", true, bytes_get},
@@ -1595,7 +1438,10 @@ const std::vector<BuiltinMethod>& builtin_methods() {
         {BT::bytes, "copy_from", {BT::bytes, BT::i64}, BT::self_recv, "beans_bytes_copy_from", true, bytes_copy_from},
         {BT::bytes, "append", {BT::bytes}, BT::self_recv, "beans_bytes_append", false, bytes_append},
         {BT::bytes, "append_str", {BT::str}, BT::self_recv, "beans_bytes_append_str", false, bytes_append_str},
+        {BT::bytes, "append_i64", {BT::i64}, BT::self_recv, "beans_bytes_append_i64", false, bytes_append_i64},
+        {BT::bytes, "append_range", {BT::bytes, BT::i64, BT::i64}, BT::self_recv, "beans_bytes_append_range", true, bytes_append_range},
         {BT::bytes, "to_string", {}, BT::str, "beans_bytes_to_string", false, bytes_to_string},
+        {BT::bytes, "to_string_full", {}, BT::str, "beans_bytes_to_string_full", false, bytes_to_string_full},
         {BT::bytes, "append_varint", {BT::i64}, BT::self_recv, "beans_bytes_append_varint", false, bytes_append_varint},
         {BT::bytes, "get_varint", {BT::i64}, BT::i64, "beans_bytes_get_varint", true, bytes_get_varint},
         {BT::bytes, "crc32", {BT::i64, BT::i64}, BT::i64, "beans_bytes_crc32", true, bytes_crc32},
@@ -1632,8 +1478,6 @@ const std::vector<BuiltinMethod>& builtin_methods() {
         {BT::mmap, "flush_range", {BT::i64, BT::i64}, BT::res_bool, "beans_mmap_flush_range", false, mmap_flush_range},
         {BT::mmap, "resize", {BT::i64}, BT::res_bool, "beans_mmap_resize", false, mmap_resize},
         {BT::mmap, "close", {}, BT::res_bool, "beans_mmap_close", false, mmap_close},
-        // BufReader — buffered lines over a File, at its own offset
-        {BT::bufr, "read_line", {}, BT::res_opt_str, "beans_bufr_read_line", false, bufr_read_line},
     };
     return table;
 }
@@ -1643,17 +1487,10 @@ const std::vector<BuiltinStatic>& builtin_statics() {
         {"Bytes", "new", {BT::i64}, BT::bytes, "beans_bytes_new", true, bytes_new},
         {"Bytes", "from", {BT::str}, BT::bytes, "beans_bytes_from", false, bytes_from},
         {"Bytes", "varint_size", {BT::i64}, BT::i64, "beans_bytes_varint_size", false, bytes_varint_size_s},
-        {"File", "read", {BT::str}, BT::res_str, "beans_file_read_all", false, file_read_s},
-        {"File", "read_bytes", {BT::str}, BT::res_bytes, "beans_file_read_all_b", false, file_read_bytes_s},
-        {"File", "write", {BT::str, BT::str}, BT::res_i64, "beans_file_write_all", false, file_write_s},
-        {"File", "append", {BT::str, BT::str}, BT::res_i64, "beans_file_append_all", false, file_append_s},
-        {"File", "write_bytes", {BT::str, BT::bytes}, BT::res_i64, "beans_file_write_all_b", false, file_write_bytes_s},
-        {"File", "append_bytes", {BT::str, BT::bytes}, BT::res_i64, "beans_file_append_all_b", false, file_append_bytes_s},
         {"File", "exists", {BT::str}, BT::boolean, "beans_file_exists", false, file_exists_s},
         {"File", "size", {BT::str}, BT::res_i64, "beans_file_size_p", false, file_size_s},
         {"File", "remove", {BT::str}, BT::res_bool, "beans_file_remove", false, file_remove_s},
         {"File", "rename", {BT::str, BT::str}, BT::res_bool, "beans_file_rename", false, file_rename_s},
-        {"File", "copy", {BT::str, BT::str}, BT::res_i64, "beans_file_copy", false, file_copy_s},
         {"File", "open", {BT::str, BT::str}, BT::res_file, "beans_file_open", false, file_open_s},
         {"Dir", "make", {BT::str}, BT::res_bool, "beans_dir_make", false, dir_make_s},
         {"Dir", "make_all", {BT::str}, BT::res_bool, "beans_dir_make_all", false, dir_make_all_s},
@@ -1665,12 +1502,6 @@ const std::vector<BuiltinStatic>& builtin_statics() {
         {"Dir", "sync", {BT::str}, BT::res_bool, "beans_dir_sync", false, dir_sync_s},
         {"Dir", "walk", {BT::str}, BT::res_list_str, "beans_dir_walk", false, dir_walk_s},
         {"MMap", "open", {BT::str, BT::boolean}, BT::res_mmap, "beans_mmap_open", false, mmap_open_s},
-        {"Path", "join", {BT::str, BT::str}, BT::str, "beans_path_join", false, path_join_s},
-        {"Path", "parent", {BT::str}, BT::str, "beans_path_parent", false, path_parent_s},
-        {"Path", "base", {BT::str}, BT::str, "beans_path_base", false, path_base_s},
-        {"Path", "ext", {BT::str}, BT::str, "beans_path_ext", false, path_ext_s},
-        {"Path", "stem", {BT::str}, BT::str, "beans_path_stem", false, path_stem_s},
-        {"BufReader", "on", {BT::file}, BT::bufr, "beans_bufr_on", false, bufr_on_s},
     };
     return table;
 }
@@ -1688,10 +1519,7 @@ const std::vector<BuiltinFn>& builtin_fns() {
         {"std.fmt", "pad_left", {BT::str, BT::i64}, BT::str, "beans_fmt_pad_left", true, fmt_pad_left},
         {"std.fmt", "pad_right", {BT::str, BT::i64}, BT::str, "beans_fmt_pad_right", true, fmt_pad_right},
         {"std.fmt", "float", {BT::f64, BT::i64}, BT::str, "beans_fmt_float", false, fmt_float},
-        {"std.fmt", "dec", {BT::dec, BT::i64}, BT::str, "beans_fmt_dec", false, fmt_dec},
-        {"std.fmt", "hex", {BT::i64}, BT::str, "beans_fmt_hex", false, fmt_hex},
-        {"std.fmt", "bin", {BT::i64}, BT::str, "beans_fmt_bin", false, fmt_bin},
-        {"std.fmt", "group", {BT::i64, BT::str}, BT::str, "beans_fmt_group", false, fmt_group},
+        {"std.fmt", "dec", {BT::dec, BT::i64}, BT::str, "beans_decv_fmt", false, fmt_dec},
     };
     return table;
 }

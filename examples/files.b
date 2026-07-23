@@ -2,7 +2,9 @@
 // Everything happens inside a scratch dir under Dir.temp(); output is
 // deterministic, so run vs build must be byte-identical.
 import std.io
+import std.fs
 import std.os
+import std.path
 
 fn main() {
     let base: string = "{Dir.temp()}/beans_files_example"
@@ -11,34 +13,34 @@ fn main() {
     io.println("{Dir.exists(base)} {Dir.exists("{base}/nope")}")
 
     let f1: string = "{base}/hello.txt"
-    io.println("{File.write(f1, "hello\nworld\n").expect("write")}")
-    io.print(File.read(f1).expect("read"))
-    io.println("{File.append(f1, "again\n").expect("append")}")
+    io.println("{fs.write(f1, "hello\nworld\n").expect("write")}")
+    io.print(fs.read(f1).expect("read"))
+    io.println("{fs.append(f1, "again\n").expect("append")}")
     io.println("{File.size(f1).expect("size")}")
     io.println("{File.exists(f1)} {File.exists("{base}/nope.txt")}")
 
     // binary round-trip
     let page: Bytes = Bytes.new(32)
     page.put_u32(0, 7).put_u64(4, 123456789).append_str("tail")
-    File.write_bytes("{base}/page.bin", page).expect("write_bytes")
-    let back: Bytes = File.read_bytes("{base}/page.bin").expect("read_bytes")
+    fs.write_bytes("{base}/page.bin", page).expect("write_bytes")
+    let back: Bytes = fs.read_bytes("{base}/page.bin").expect("read_bytes")
     io.println("{back.len()} {back.get_u32(0)} {back.get_u64(4)}")
 
     // listing is sorted, so it diffs clean
-    File.write("{base}/sub/a.txt", "a").expect("a")
-    File.write("{base}/sub/b.txt", "b").expect("b")
+    fs.write("{base}/sub/a.txt", "a").expect("a")
+    fs.write("{base}/sub/b.txt", "b").expect("b")
     io.println(Dir.list("{base}/sub").expect("list").join(","))
 
     // walk is recursive: relative paths, sorted, files only
     io.println(Dir.walk(base).expect("walk"))
 
     // Path is pure string math — join/parent/base/ext/stem
-    let deep: string = Path.join(Path.join(base, "sub"), "a.txt")
-    io.println("{Path.base(deep)} {Path.ext(deep)} {Path.stem(deep)}")
-    io.println("{Path.parent("/a/b/c")} {Path.join("a/", "/abs")} {Path.ext(".bashrc")}")
+    let deep: string = path.join(path.join(base, "sub"), "a.txt")
+    io.println("{path.base(deep)} {path.ext(deep)} {path.stem(deep)}")
+    io.println("{path.parent("/a/b/c")} {path.join("a/", "/abs")} {path.ext(".bashrc")}")
 
     // copy / rename / remove
-    io.println("{File.copy(f1, "{base}/copy.txt").expect("copy")}")
+    io.println("{fs.copy(f1, "{base}/copy.txt").expect("copy")}")
     File.rename("{base}/copy.txt", "{base}/moved.txt").expect("rename")
     io.println("{File.exists("{base}/moved.txt")}")
     File.remove("{base}/moved.txt").expect("remove")
@@ -65,7 +67,7 @@ fn main() {
     }
 
     // error kinds ride on Error.kind
-    match File.read("{base}/missing.txt") {
+    match fs.read("{base}/missing.txt") {
         ok(s) => io.println("read? {s.len()}"),
         err(e) => io.println("kind {e.kind}"),
     }

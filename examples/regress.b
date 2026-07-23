@@ -6,13 +6,13 @@ import std.fmt
 
 // C4: structural equality for enums, Bytes, decimals, floats — native used to
 // compare these by pointer identity (contains/index_of/map-key/==)
-enum Box { of(v: int), empty }
+enum ValueBox { of(v: int), empty }
 
 fn eq_checks() {
-    let boxes: List<Box> = [Box.of(1), Box.of(2), Box.empty]
-    io.println("{boxes.contains(Box.of(2))} {boxes.contains(Box.empty)} {boxes.contains(Box.of(9))}")
-    io.println("{boxes.index_of(Box.of(1)).or(0 - 1)}")
-    io.println("{Box.of(1) == Box.of(1)} {Box.of(1) == Box.of(2)}")
+    let boxes: List<ValueBox> = [ValueBox.of(1), ValueBox.of(2), ValueBox.empty]
+    io.println("{boxes.contains(ValueBox.of(2))} {boxes.contains(ValueBox.empty)} {boxes.contains(ValueBox.of(9))}")
+    io.println("{boxes.index_of(ValueBox.of(1)).or(0 - 1)}")
+    io.println("{ValueBox.of(1) == ValueBox.of(1)} {ValueBox.of(1) == ValueBox.of(2)}")
 
     let bs: List<Bytes> = [Bytes.from("ab"), Bytes.from("cd")]
     io.println("{bs.contains(Bytes.from("ab"))} {bs.contains(Bytes.from("zz"))}")

@@ -1,5 +1,6 @@
 #include "codegen.h"
 
+#include <algorithm>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -9,6 +10,7 @@
 #include <utility>
 
 #include "builtins.h"
+#include "c_abi.h"
 #include "lexer.h"
 #include "parser.h"
 #include "value.h" // for Decimal::parse at compile time
@@ -17,17 +19,28 @@ namespace beans {
 
 namespace {
 
-std::string i128_str(__int128 v) {
-    bool neg = v < 0;
-    unsigned __int128 u = neg ? static_cast<unsigned __int128>(-v)
-                              : static_cast<unsigned __int128>(v);
+std::string u128_str(unsigned __int128 v) {
     std::string s;
-    if (u == 0) s = "0";
-    while (u > 0) {
-        s.insert(s.begin(), static_cast<char>('0' + static_cast<int>(u % 10)));
-        u /= 10;
+    if (v == 0) s = "0";
+    while (v > 0) {
+        s.insert(s.begin(), static_cast<char>('0' + static_cast<int>(v % 10)));
+        v /= 10;
     }
-    return neg ? "-" + s : s;
+    return s;
+}
+
+// Native decimals are one LLVM i128 in locals, fields, parameters and returns.
+// The low 112 bits hold a signed coefficient; the high 16 bits hold the scale.
+// That keeps more precision than the promised ~28 digits while also preserving
+// high-scale values such as 1e-40 without a heap object.
+std::string packed_decimal(Decimal d) {
+    constexpr int coeff_bits = 112;
+    const unsigned __int128 coeff_mask =
+        (static_cast<unsigned __int128>(1) << coeff_bits) - 1;
+    unsigned __int128 bits = static_cast<unsigned __int128>(d.coeff) & coeff_mask;
+    bits |= static_cast<unsigned __int128>(static_cast<uint16_t>(d.scale)) <<
+            coeff_bits;
+    return u128_str(bits);
 }
 
 int64_t parse_int_text(std::string_view text) {
@@ -39,7 +52,7 @@ int64_t parse_int_text(std::string_view text) {
         return static_cast<int64_t>(std::strtoull(clean.c_str() + 2, nullptr, 16));
     if (clean.size() > 2 && clean[0] == '0' && (clean[1] == 'b' || clean[1] == 'B'))
         return static_cast<int64_t>(std::strtoull(clean.c_str() + 2, nullptr, 2));
-    return static_cast<int64_t>(std::strtoll(clean.c_str(), nullptr, 10));
+    return static_cast<int64_t>(std::strtoull(clean.c_str(), nullptr, 10));
 }
 
 double parse_float_text(std::string_view text) {
@@ -148,13 +161,26 @@ struct Ty {
         thread_,  // args = {ret}
         mutex_,   // args = {inner}
         chan_,    // args = {elem}
+        box_,     // args = {inner}; move-only in checked source
+        arena_,   // args = {inner}; append-only slots, bulk clear/drop
+        shared_,  // args = {inner}; explicit atomic shared control block
+        weak_,    // args = {inner}; does not keep Shared's value alive
+        rawptr_,  // args = {inner}; unmanaged, only usable in unsafe blocks
+        simd4f32_, // inline four-lane f32 vector
+        struct_,   // inline named user struct
+        fixed_array_, // args = {element}; inline LLVM array
+        slice_,    // args = {element}; inline {pointer, length} view
         atomic_,
         bytes_,
         file_,
         mmap_,
-        bufr_,
     };
     K k = K::bad_;
+    uint8_t bits = 0;          // semantic width; slots are widened for now
+    bool is_unsigned = false;  // integer compare/divide/print mode
+    uint32_t array_len = 0;
+    uint32_t layout_size = 0;
+    uint32_t layout_align = 1;
     std::string name;          // obj: impl/iface name, enum_: enum name
     std::vector<Ty*> args;     // enum_ args; list_ elem in args[0]
     const ClassDecl* iface = nullptr; // obj typed as an interface
@@ -164,11 +190,66 @@ struct Ty {
 };
 
 namespace {
-const char* ll(const Ty* t) {
+bool is_inline_option(const Ty* t);
+bool is_inline_result(const Ty* t);
+
+bool is_wide_inline_value(const Ty* t) {
+    if (!t) return false;
     switch (t->k) {
-        case Ty::i64_: return "i64";
-        case Ty::f64_: return "double";
+        case Ty::simd4f32_:
+        case Ty::struct_:
+        case Ty::fixed_array_:
+        case Ty::slice_:
+            return true;
+        case Ty::enum_:
+            return is_inline_option(t) || is_inline_result(t);
+        default:
+            return false;
+    }
+}
+
+bool is_inline_option(const Ty* t) {
+    return t && t->k == Ty::enum_ && t->name == "Option" && t->args.size() == 1 &&
+           is_wide_inline_value(t->args[0]);
+}
+
+bool is_inline_result(const Ty* t) {
+    return t && t->k == Ty::enum_ && t->name == "Result" && t->args.size() == 2 &&
+           (is_wide_inline_value(t->args[0]) || is_wide_inline_value(t->args[1]));
+}
+
+const char* ll(const Ty* t) {
+    static thread_local std::string exact;
+    switch (t->k) {
+        case Ty::i64_:
+            exact = "i" + std::to_string(t->bits ? t->bits : 64);
+            return exact.c_str();
+        case Ty::f64_: return t->bits == 32 ? "float" : "double";
         case Ty::i1_: return "i1";
+        case Ty::dec_: return "i128";
+        case Ty::simd4f32_: return "<4 x float>";
+        case Ty::struct_:
+            exact = "%bs." + t->name;
+            return exact.c_str();
+        case Ty::fixed_array_: {
+            std::string element = ll(t->args[0]);
+            exact = "[" + std::to_string(t->array_len) + " x " + element + "]";
+            return exact.c_str();
+        }
+        case Ty::slice_: return "{ptr, i64}";
+        case Ty::enum_:
+            if (is_inline_option(t)) {
+                std::string payload = ll(t->args[0]);
+                exact = "{i1, " + payload + "}";
+                return exact.c_str();
+            }
+            if (is_inline_result(t)) {
+                std::string ok = ll(t->args[0]);
+                std::string error = ll(t->args[1]);
+                exact = "{i1, " + ok + ", " + error + "}";
+                return exact.c_str();
+            }
+            return "ptr";
         case Ty::unit_: return "void";
         default: return "ptr";
     }
@@ -176,14 +257,42 @@ const char* ll(const Ty* t) {
 // does this type live on the RC'd heap?
 bool is_rc(const Ty* t) {
     switch (t->k) {
-        case Ty::str_: case Ty::dec_: case Ty::obj_: case Ty::enum_:
+        case Ty::str_: case Ty::obj_:
         case Ty::list_: case Ty::map_: case Ty::fn_: case Ty::thread_:
-        case Ty::mutex_: case Ty::chan_: case Ty::atomic_: case Ty::bytes_:
-        case Ty::file_: case Ty::mmap_: case Ty::bufr_:
+        case Ty::mutex_: case Ty::chan_: case Ty::box_: case Ty::arena_:
+        case Ty::shared_: case Ty::weak_:
+        case Ty::atomic_: case Ty::bytes_:
+        case Ty::file_: case Ty::mmap_:
             return true;
+        case Ty::enum_:
+            return !is_inline_option(t) && !is_inline_result(t);
         default:
             return false;
     }
+}
+// Inline aggregates can own ARC pointers even though the aggregate itself is
+// not an ARC allocation. Result is the first such type: its inactive field is
+// always zero, so walking both payloads is safe and needs no tag branch.
+bool has_owned_refs(const Ty* t) {
+    if (!t) return false;
+    if (is_rc(t)) return true;
+    if (is_inline_option(t)) return has_owned_refs(t->args[0]);
+    if (is_inline_result(t))
+        return has_owned_refs(t->args[0]) || has_owned_refs(t->args[1]);
+    return false;
+}
+// Generic runtime containers still use one i64 slot. Wider inline values are
+// boxed only at that boundary, so their slot is a pointer even though the
+// value itself is not reference counted in normal code.
+bool is_slot_rc(const Ty* t) {
+    return is_rc(t) || (t && t->k == Ty::dec_);
+}
+// Pointer values cannot be null in safe Beans code. Option can therefore use
+// null for `none` and the value pointer itself for `some`, with no enum box.
+// Keep nested/user enums boxed: they need their own tag space.
+bool is_niche_option(const Ty* t) {
+    return t && t->k == Ty::enum_ && t->name == "Option" && t->args.size() == 1 &&
+           t->args[0]->k != Ty::enum_ && is_rc(t->args[0]);
 }
 } // namespace
 
@@ -194,6 +303,8 @@ struct CImpl {
     std::string mangled;
     int id = 0;
     CImpl* parent = nullptr;
+    int size = 8; // payload bytes, starting with one static type descriptor
+    int align = 8;
     struct FieldInfo {
         std::string name;
         Ty* ty;
@@ -207,10 +318,12 @@ struct CImpl {
 
 struct CG2 {
     std::vector<CGError>& errors;
+    const HirProgram& hir;
 
     std::vector<std::unique_ptr<Ty>> ty_pool;
     std::map<std::string, Ty*> ty_map;
     std::vector<std::unique_ptr<CImpl>> impls;
+    std::vector<std::unique_ptr<CImpl>> struct_impls;
     std::map<std::string, CImpl*> impl_by_name;
     std::vector<CImpl*> impl_queue;
 
@@ -227,10 +340,17 @@ struct CG2 {
 
     std::map<std::string, int> selectors;
     std::string globals;
+    std::string type_defs;
     std::string fn_text;
+    std::string ffi_c;
+    std::map<const FnDecl*, std::string> extern_symbols;
+    std::map<Ty*, std::string> callback_dispatches;
+    std::map<const FnDecl*, std::string> fn_ref_adapters;
     int next_str = 0;
 
-    explicit CG2(const Program& prog, std::vector<CGError>& errs) : errors(errs) {
+    explicit CG2(const HirProgram& hir, std::vector<CGError>& errs)
+        : errors(errs), hir(hir) {
+        const Program& prog = hir.ast();
         for (const auto& pkg : prog.packages) {
             prefix_by_path[pkg->import_path] = pkg->prefix;
             auto& bindings = pkg_imports[pkg->prefix];
@@ -274,7 +394,10 @@ struct CG2 {
 
     // ---- type interning ----
     Ty* intern(Ty t) {
-        std::string key = std::to_string(t.k) + ":" + t.name;
+        std::string key = std::to_string(t.k) + ":" + t.name + ":" +
+                          std::to_string(t.bits) + ":" +
+                          std::to_string(t.is_unsigned) + ":" +
+                          std::to_string(t.array_len);
         for (Ty* a : t.args) key += "," + std::to_string(reinterpret_cast<uintptr_t>(a));
         auto it = ty_map.find(key);
         if (it != ty_map.end()) return it->second;
@@ -283,8 +406,21 @@ struct CG2 {
         return ty_pool.back().get();
     }
     Ty* prim(Ty::K k) { Ty t; t.k = k; return intern(std::move(t)); }
-    Ty* t_i64() { return prim(Ty::i64_); }
-    Ty* t_f64() { return prim(Ty::f64_); }
+    Ty* t_int(uint8_t bits, bool is_unsigned) {
+        Ty t;
+        t.k = Ty::i64_;
+        t.bits = bits;
+        t.is_unsigned = is_unsigned;
+        return intern(std::move(t));
+    }
+    Ty* t_float(uint8_t bits) {
+        Ty t;
+        t.k = Ty::f64_;
+        t.bits = bits;
+        return intern(std::move(t));
+    }
+    Ty* t_i64() { return t_int(64, false); }
+    Ty* t_f64() { return t_float(64); }
     Ty* t_bool() { return prim(Ty::i1_); }
     Ty* t_str() { return prim(Ty::str_); }
     Ty* t_unit() { return prim(Ty::unit_); }
@@ -302,8 +438,36 @@ struct CG2 {
         Ty t; t.k = Ty::obj_; t.name = std::move(n); t.iface = iface;
         return intern(std::move(t));
     }
+    Ty* t_struct(std::string n, uint32_t size, uint32_t align) {
+        Ty t;
+        t.k = Ty::struct_;
+        t.name = std::move(n);
+        t.layout_size = size;
+        t.layout_align = align;
+        return intern(std::move(t));
+    }
     Ty* t_kind1(Ty::K k, Ty* a) { Ty t; t.k = k; t.args = {a}; return intern(std::move(t)); }
-    Ty* t_map(Ty* k, Ty* v) { Ty t; t.k = Ty::map_; t.args = {k, v}; return intern(std::move(t)); }
+    Ty* t_map(Ty* k, Ty* v, bool ordered = false) {
+        Ty t;
+        t.k = Ty::map_;
+        t.name = ordered ? "OrderedMap" : "Map";
+        t.args = {k, v};
+        return intern(std::move(t));
+    }
+    Ty* t_box(Ty* inner) { return t_kind1(Ty::box_, inner); }
+    Ty* t_arena(Ty* inner) { return t_kind1(Ty::arena_, inner); }
+    Ty* t_shared(Ty* inner) { return t_kind1(Ty::shared_, inner); }
+    Ty* t_weak(Ty* inner) { return t_kind1(Ty::weak_, inner); }
+    Ty* t_rawptr(Ty* inner) { return t_kind1(Ty::rawptr_, inner); }
+    Ty* t_simd4f32() { return prim(Ty::simd4f32_); }
+    Ty* t_fixed_array(Ty* element, uint32_t length) {
+        Ty t;
+        t.k = Ty::fixed_array_;
+        t.args = {element};
+        t.array_len = length;
+        return intern(std::move(t));
+    }
+    Ty* t_slice(Ty* element) { return t_kind1(Ty::slice_, element); }
     Ty* t_fn(std::vector<Ty*> params_then_ret) {
         Ty t; t.k = Ty::fn_; t.args = std::move(params_then_ret);
         return intern(std::move(t));
@@ -312,19 +476,89 @@ struct CG2 {
     Ty* t_bytes() { return prim(Ty::bytes_); }
     Ty* t_file() { return prim(Ty::file_); }
     Ty* t_mmap() { return prim(Ty::mmap_); }
-    Ty* t_bufr() { return prim(Ty::bufr_); }
+
+    static int value_size(Ty* type) {
+        if (type->k == Ty::i1_) return 1;
+        if (type->k == Ty::i64_) return (type->bits ? type->bits : 64) / 8;
+        if (type->k == Ty::f64_) return type->bits == 32 ? 4 : 8;
+        if (type->k == Ty::dec_) return 16;
+        if (type->k == Ty::simd4f32_) return 16;
+        if (type->k == Ty::struct_) return static_cast<int>(type->layout_size);
+        if (type->k == Ty::fixed_array_)
+            return value_size(type->args[0]) * static_cast<int>(type->array_len);
+        if (type->k == Ty::slice_) return 16;
+        if (is_inline_option(type)) {
+            int payload_align = value_align(type->args[0]);
+            int payload_offset = align_up(1, payload_align);
+            return align_up(payload_offset + value_size(type->args[0]), payload_align);
+        }
+        if (is_inline_result(type)) {
+            int ok_align = value_align(type->args[0]);
+            int error_align = value_align(type->args[1]);
+            int aggregate_align = std::max(ok_align, error_align);
+            int ok_offset = align_up(1, ok_align);
+            int error_offset = align_up(ok_offset + value_size(type->args[0]), error_align);
+            return align_up(error_offset + value_size(type->args[1]), aggregate_align);
+        }
+        if (type->k == Ty::unit_) return 0;
+        return 8;
+    }
+    static int value_align(Ty* type) {
+        if (type->k == Ty::dec_) return 16;
+        if (type->k == Ty::simd4f32_) return 16;
+        if (type->k == Ty::struct_) return static_cast<int>(type->layout_align);
+        if (type->k == Ty::fixed_array_) return value_align(type->args[0]);
+        if (type->k == Ty::slice_) return 8;
+        if (is_inline_option(type)) return value_align(type->args[0]);
+        if (is_inline_result(type))
+            return std::max(value_align(type->args[0]), value_align(type->args[1]));
+        int size = value_size(type);
+        return size > 8 ? 8 : size > 0 ? size : 1;
+    }
+    static int align_up(int value, int align) {
+        return (value + align - 1) & -align;
+    }
+
+    TypeId checked_type(const Expr* expr) const { return hir.type_of(expr); }
+    Ty* checked_primitive(const Expr* expr) {
+        TypeId type = checked_type(expr);
+        if (!type) return nullptr;
+        IntLayout integer = hir.target().integer(type->k);
+        if (integer.bits) return t_int(integer.bits, !integer.is_signed);
+        uint8_t floating = hir.target().float_bits(type->k);
+        if (floating) return t_float(floating);
+        if (type->k == Type::K::decimal_) return t_dec();
+        return nullptr;
+    }
 
     std::string mangle(Ty* t) {
         switch (t->k) {
-            case Ty::i64_: return "int";
-            case Ty::f64_: return "float";
+            case Ty::i64_:
+                return std::string(t->is_unsigned ? "u" : "i") +
+                       std::to_string(t->bits ? t->bits : 64);
+            case Ty::f64_: return "f" + std::to_string(t->bits ? t->bits : 64);
             case Ty::i1_: return "bool";
             case Ty::str_: return "string";
             case Ty::dec_: return "decimal";
             case Ty::obj_: return t->name;
-            case Ty::enum_: return t->name;
+            case Ty::struct_: return t->name;
+            case Ty::enum_: {
+                std::string name = t->name;
+                for (Ty* arg : t->args) name += "_" + mangle(arg);
+                return name;
+            }
             case Ty::list_: return "List_" + mangle(t->args[0]);
             case Ty::map_: return "Map_" + mangle(t->args[0]) + "_" + mangle(t->args[1]);
+            case Ty::box_: return "Box_" + mangle(t->args[0]);
+            case Ty::arena_: return "Arena_" + mangle(t->args[0]);
+            case Ty::shared_: return "Shared_" + mangle(t->args[0]);
+            case Ty::weak_: return "Weak_" + mangle(t->args[0]);
+            case Ty::rawptr_: return "RawPtr_" + mangle(t->args[0]);
+            case Ty::simd4f32_: return "Simd4f32";
+            case Ty::fixed_array_:
+                return "Array" + std::to_string(t->array_len) + "_" +
+                       mangle(t->args[0]);
+            case Ty::slice_: return "Slice_" + mangle(t->args[0]);
             default: return "x";
         }
     }
@@ -341,38 +575,88 @@ struct CG2 {
         CImpl* im = up.get();
         im->decl = decl;
         im->mangled = mangled;
-        im->id = static_cast<int>(impls.size());
+        bool inline_value = decl->is_struct || decl->is_union;
+        im->id = inline_value ? -1 : static_cast<int>(impls.size());
+        if (inline_value) {
+            im->size = 0;
+            im->align = 1;
+        }
         for (size_t i = 0; i < decl->generics.size() && i < targs.size(); i++) {
             im->env[decl->generics[i].name] = targs[i];
         }
         impl_by_name[mangled] = im;
-        impls.push_back(std::move(up));
-        impl_queue.push_back(im);
+        if (inline_value) {
+            struct_impls.push_back(std::move(up));
+        } else {
+            impls.push_back(std::move(up));
+            impl_queue.push_back(im);
+        }
 
         // field types resolve as the class's own code
         std::string saved_pkg = cur_pkg;
         cur_pkg = pkg_of(decl->qualname);
 
         // parent chain (single class parent; interfaces carry no fields)
-        for (const std::string& s : supers_of(decl)) {
-            auto cit = class_decls.find(s);
-            if (cit != class_decls.end() && !cit->second->is_interface) {
-                im->parent = request_impl(cit->second, {}, line, col);
+        if (!inline_value) {
+            for (const std::string& s : supers_of(decl)) {
+                auto cit = class_decls.find(s);
+                if (cit != class_decls.end() && !cit->second->is_interface &&
+                    !cit->second->is_struct && !cit->second->is_union) {
+                    im->parent = request_impl(cit->second, {}, line, col);
+                }
             }
         }
         // fields: parent's first, then own
-        if (im->parent) im->fields = im->parent->fields;
+        if (im->parent) {
+            im->fields = im->parent->fields;
+            im->size = im->parent->size;
+        }
         for (const FieldDecl& f : decl->fields) {
             CImpl::FieldInfo fi;
             fi.name = f.name;
             fi.decl = &f;
             fi.ty = resolve(f.type.get(), im->env, f.line, f.col);
-            fi.offset = 16 + 8 * static_cast<int>(im->fields.size());
-            if (fi.offset / 8 > 57) {
+            fi.offset = decl->is_union ? 0 : align_up(im->size, value_align(fi.ty));
+            im->size = decl->is_union
+                           ? std::max(im->size, value_size(fi.ty))
+                           : fi.offset + value_size(fi.ty);
+            im->align = std::max(im->align, value_align(fi.ty));
+            if (!inline_value && fi.offset / 8 > 57) {
                 // pointer-slot masks stop at meta bit 60 — collector owns 61-63
                 err(f.line, f.col, "class '" + decl->name + "' has too many fields");
             }
             im->fields.push_back(std::move(fi));
+        }
+        if (inline_value) {
+            im->size = align_up(im->size, im->align);
+            type_defs += "%bs." + im->mangled + " = type {";
+            if (decl->is_union) {
+                // The biggest member is not always the most aligned one:
+                // `union { u8 bytes[16]; u64 word; }` is 16 bytes aligned to
+                // 8 in C. Start with the most-aligned member, then pad to the
+                // already-computed union size so LLVM gets both facts right.
+                const CImpl::FieldInfo* storage = nullptr;
+                for (const CImpl::FieldInfo& field : im->fields) {
+                    if (!storage || value_align(field.ty) > value_align(storage->ty) ||
+                        (value_align(field.ty) == value_align(storage->ty) &&
+                         value_size(field.ty) > value_size(storage->ty)))
+                        storage = &field;
+                }
+                if (storage) {
+                    type_defs += ll(storage->ty);
+                    int padding = im->size - value_size(storage->ty);
+                    if (padding > 0)
+                        type_defs += ", [" + std::to_string(padding) + " x i8]";
+                } else {
+                    type_defs += "i8";
+                }
+            } else {
+                for (size_t i = 0; i < im->fields.size(); i++) {
+                    if (i) type_defs += ", ";
+                    type_defs += ll(im->fields[i].ty);
+                }
+            }
+            type_defs += "}\n";
         }
         cur_pkg = saved_pkg;
         return im;
@@ -382,6 +666,10 @@ struct CG2 {
     Ty* resolve(const TypeRef* t, const std::map<std::string, Ty*>& env,
                 uint32_t line, uint32_t col) {
         if (!t) return t_unit();
+        if (t->kind == TypeRef::Kind::fixed_array) {
+            return t_fixed_array(resolve(t->array_elem.get(), env, line, col),
+                                 t->array_len);
+        }
         if (t->kind == TypeRef::Kind::fn) {
             std::vector<Ty*> sig;
             for (const TypePtr& p : t->fn_params)
@@ -393,30 +681,49 @@ struct CG2 {
         auto eit = env.find(n);
         if (eit != env.end()) return eit->second;
 
-        if (n == "int" || n == "i8" || n == "i16" || n == "i32" || n == "i64" ||
-            n == "u8" || n == "u16" || n == "u32" || n == "u64" || n == "byte")
-            return t_i64();
-        if (n == "float" || n == "f32" || n == "f64") return t_f64();
+        if (n == "int" || n == "i64") return t_int(64, false);
+        if (n == "i8") return t_int(8, false);
+        if (n == "i16") return t_int(16, false);
+        if (n == "i32") return t_int(32, false);
+        if (n == "u8" || n == "byte") return t_int(8, true);
+        if (n == "u16") return t_int(16, true);
+        if (n == "u32") return t_int(32, true);
+        if (n == "u64") return t_int(64, true);
+        if (n == "float" || n == "f64") return t_float(64);
+        if (n == "f32") return t_float(32);
         if (n == "bool") return t_bool();
         if (n == "string") return t_str();
         if (n == "decimal") return t_dec();
         if (n == "Error") return t_error();
         if (n == "List" && t->args.size() == 1)
             return t_list(resolve(t->args[0].get(), env, line, col));
-        if (n == "Map" && t->args.size() == 2)
+        if ((n == "Map" || n == "OrderedMap") && t->args.size() == 2)
             return t_map(resolve(t->args[0].get(), env, line, col),
-                         resolve(t->args[1].get(), env, line, col));
+                         resolve(t->args[1].get(), env, line, col),
+                         n == "OrderedMap");
         if (n == "Thread" && t->args.size() == 1)
             return t_kind1(Ty::thread_, resolve(t->args[0].get(), env, line, col));
         if (n == "Mutex" && t->args.size() == 1)
             return t_kind1(Ty::mutex_, resolve(t->args[0].get(), env, line, col));
         if (n == "Channel" && t->args.size() == 1)
             return t_kind1(Ty::chan_, resolve(t->args[0].get(), env, line, col));
+        if (n == "Box" && t->args.size() == 1)
+            return t_box(resolve(t->args[0].get(), env, line, col));
+        if (n == "Arena" && t->args.size() == 1)
+            return t_arena(resolve(t->args[0].get(), env, line, col));
+        if (n == "Shared" && t->args.size() == 1)
+            return t_shared(resolve(t->args[0].get(), env, line, col));
+        if (n == "Weak" && t->args.size() == 1)
+            return t_weak(resolve(t->args[0].get(), env, line, col));
+        if (n == "RawPtr" && t->args.size() == 1)
+            return t_rawptr(resolve(t->args[0].get(), env, line, col));
+        if (n == "Slice" && t->args.size() == 1)
+            return t_slice(resolve(t->args[0].get(), env, line, col));
+        if (n == "Simd4f32") return t_simd4f32();
         if (n == "AtomicInt") return t_atomic();
         if (n == "Bytes") return t_bytes();
         if (n == "File") return t_file();
         if (n == "MMap") return t_mmap();
-        if (n == "BufReader") return t_bufr();
         if (n == "Option" && t->args.size() == 1)
             return t_option(resolve(t->args[0].get(), env, line, col));
         if (n == "Result") {
@@ -436,7 +743,10 @@ struct CG2 {
             for (const TypePtr& a : t->args)
                 targs.push_back(resolve(a.get(), env, line, col));
             CImpl* im = request_impl(cit->second, std::move(targs), line, col);
-            return t_obj(im->mangled);
+            return (cit->second->is_struct || cit->second->is_union)
+                       ? t_struct(im->mangled, static_cast<uint32_t>(im->size),
+                                  static_cast<uint32_t>(im->align))
+                       : t_obj(im->mangled);
         }
         auto enit = enum_decls.find(key);
         if (enit != enum_decls.end()) {
@@ -448,6 +758,173 @@ struct CG2 {
         }
         err(line, col, "type '" + n + "'");
         return t_bad();
+    }
+
+    const ClassDecl* c_abi_record(const TypeRef* type) const {
+        if (!type || type->kind != TypeRef::Kind::named) return nullptr;
+        std::string key = type->resolved.empty() ? type->name : type->resolved;
+        auto found = class_decls.find(key);
+        if (found == class_decls.end() && type->resolved.empty())
+            found = class_decls.find(qual(type->name));
+        if (found == class_decls.end() || !found->second->is_c_layout ||
+            (!found->second->is_struct && !found->second->is_union))
+            return nullptr;
+        return found->second;
+    }
+
+    bool extern_has_aggregate(const FnDecl* function) const {
+        if (!function || !function->is_extern_c) return false;
+        if (function->ret && c_abi_record(function->ret.get())) return true;
+        for (const Param& parameter : function->params) {
+            if (parameter.type && parameter.type->kind == TypeRef::Kind::fn)
+                return true;
+            if (c_abi_record(parameter.type.get())) return true;
+        }
+        return false;
+    }
+
+    std::string request_callback_dispatch(Ty* function_type) {
+        auto found = callback_dispatches.find(function_type);
+        if (found != callback_dispatches.end()) return found->second;
+        std::string name = "beans_cb_dispatch_" +
+                           std::to_string(callback_dispatches.size());
+        std::string symbol = "@" + name;
+        callback_dispatches[function_type] = symbol;
+        std::string body = "define void " + symbol +
+                           "(ptr %closure, ptr %result, ptr %args) {\n"
+                           "  %fn = load ptr, ptr %closure\n";
+        std::vector<std::string> values;
+        for (size_t i = 0; i < function_type->fn_nparams(); i++) {
+            std::string slot = "%as" + std::to_string(i);
+            std::string pointer = "%ap" + std::to_string(i);
+            std::string value = "%av" + std::to_string(i);
+            body += "  " + slot + " = getelementptr ptr, ptr %args, i64 " +
+                    std::to_string(i) + "\n";
+            body += "  " + pointer + " = load ptr, ptr " + slot + "\n";
+            body += "  " + value + " = load " +
+                    std::string(ll(function_type->args[i])) + ", ptr " + pointer + "\n";
+            values.push_back(value);
+        }
+        Ty* result = function_type->fn_ret();
+        std::string call_args = "ptr %closure";
+        for (size_t i = 0; i < values.size(); i++)
+            call_args += ", " + std::string(ll(function_type->args[i])) + " " + values[i];
+        if (!result || result->k == Ty::unit_) {
+            body += "  call void %fn(" + call_args + ")\n  ret void\n}\n\n";
+        } else {
+            body += "  %return = call " + std::string(ll(result)) + " %fn(" +
+                    call_args + ")\n";
+            body += "  store " + std::string(ll(result)) +
+                    " %return, ptr %result\n  ret void\n}\n\n";
+        }
+        lifted += body;
+        return symbol;
+    }
+
+    std::string request_extern(const FnDecl* function) {
+        auto existing = extern_symbols.find(function);
+        if (existing != extern_symbols.end()) return existing->second;
+
+        if (!extern_has_aggregate(function)) {
+            Ty* ret = resolve(function->ret.get(), empty_env(), function->line,
+                              function->col);
+            std::string symbol = "@" + function->extern_name;
+            std::string declaration = "declare " + std::string(ll(ret)) + " " +
+                                      symbol + "(";
+            for (size_t i = 0; i < function->params.size(); i++) {
+                if (i) declaration += ", ";
+                Ty* parameter = resolve(function->params[i].type.get(), empty_env(),
+                                        function->params[i].line,
+                                        function->params[i].col);
+                declaration += ll(parameter);
+            }
+            globals += declaration + ")\n";
+            extern_symbols[function] = symbol;
+            return symbol;
+        }
+
+        std::string wrapper = "beans_ffi_wrap_" +
+                              std::to_string(extern_symbols.size());
+        globals += "declare void @" + wrapper + "(ptr, ptr)\n";
+        if (ffi_c.empty()) ffi_c = "#include <stdint.h>\n";
+        CAbiText abi = describe_c_abi(
+            *function, [&](const TypeRef* type) { return c_abi_record(type); }, wrapper);
+        ffi_c += abi.definitions;
+        for (const CAbiCallbackText& callback : abi.callbacks) {
+            Ty* type = resolve(function->params[callback.parameter_index].type.get(),
+                               empty_env(), function->line, function->col);
+            std::string dispatch = request_callback_dispatch(type);
+            if (!dispatch.empty() && dispatch[0] == '@') dispatch.erase(0, 1);
+            std::string prefix = wrapper + "_cb" +
+                                 std::to_string(callback.parameter_index);
+            ffi_c += "static _Thread_local void* " + prefix + "_env;\n";
+            ffi_c += "extern void " + dispatch + "(void*, void*, void**);\n";
+            ffi_c += "static " + callback.return_type + " " + prefix + "(";
+            for (size_t i = 0; i < callback.parameter_declarations.size(); i++) {
+                if (i) ffi_c += ", ";
+                ffi_c += callback.parameter_declarations[i];
+            }
+            if (callback.parameter_declarations.empty()) ffi_c += "void";
+            ffi_c += ") {\n  void* callback_args[" +
+                     std::to_string(std::max<size_t>(callback.parameter_types.size(), 1)) +
+                     "] = {";
+            for (size_t i = 0; i < callback.parameter_types.size(); i++) {
+                if (i) ffi_c += ", ";
+                ffi_c += "&value" + std::to_string(i);
+            }
+            if (callback.parameter_types.empty()) ffi_c += "0";
+            ffi_c += "};\n";
+            if (callback.return_type == "void") {
+                ffi_c += "  " + dispatch + "(" + prefix +
+                         "_env, 0, callback_args);\n}\n";
+            } else {
+                ffi_c += "  " + callback.return_type + " callback_result;\n  " +
+                         dispatch + "(" + prefix +
+                         "_env, &callback_result, callback_args);\n"
+                         "  return callback_result;\n}\n";
+            }
+        }
+        ffi_c += "\nvoid " + wrapper + "(void* result, void** args) {\n";
+        ffi_c += "  extern " + abi.return_type + " " + function->extern_name + "(";
+        for (size_t i = 0; i < abi.parameter_declarations.size(); i++) {
+            if (i) ffi_c += ", ";
+            ffi_c += abi.parameter_declarations[i];
+        }
+        if (abi.parameter_declarations.empty()) ffi_c += "void";
+        ffi_c += ");\n";
+        for (const CAbiCallbackText& callback : abi.callbacks) {
+            std::string prefix = wrapper + "_cb" +
+                                 std::to_string(callback.parameter_index);
+            ffi_c += "  void* " + prefix + "_old = " + prefix + "_env;\n";
+            ffi_c += "  " + prefix + "_env = *(void**)args[" +
+                     std::to_string(callback.parameter_index) + "];\n";
+        }
+        ffi_c += "  ";
+        if (function->ret) ffi_c += abi.return_type + " call_result = ";
+        ffi_c += function->extern_name + "(";
+        for (size_t i = 0; i < abi.parameter_types.size(); i++) {
+            if (i) ffi_c += ", ";
+            auto callback = std::find_if(
+                abi.callbacks.begin(), abi.callbacks.end(),
+                [&](const CAbiCallbackText& value) { return value.parameter_index == i; });
+            if (callback != abi.callbacks.end())
+                ffi_c += wrapper + "_cb" + std::to_string(i);
+            else
+                ffi_c += "*(" + abi.parameter_types[i] + "*)args[" +
+                         std::to_string(i) + "]";
+        }
+        ffi_c += ");\n";
+        for (const CAbiCallbackText& callback : abi.callbacks) {
+            std::string prefix = wrapper + "_cb" +
+                                 std::to_string(callback.parameter_index);
+            ffi_c += "  " + prefix + "_env = " + prefix + "_old;\n";
+        }
+        if (function->ret)
+            ffi_c += "  *(" + abi.return_type + "*)result = call_result;\n";
+        ffi_c += "}\n";
+        std::string symbol = "@" + wrapper;
+        extern_symbols[function] = symbol;
+        return symbol;
     }
 
     // ---- misc lookups ----
@@ -589,6 +1066,7 @@ struct CG2 {
     // so each element type gets one thunk that untypes the slots, calls the
     // fn value's code ptr (box layout {fnptr @0, ...}), and widens the i1
     std::map<Ty*, std::string> sort_thunks;
+    std::map<Ty*, std::string> sort_key_thunks;
     std::string request_sort_thunk(Ty* elem) {
         auto it = sort_thunks.find(elem);
         if (it != sort_thunks.end()) return it->second;
@@ -598,10 +1076,23 @@ struct CG2 {
         std::string t = "define internal i64 " + sym + "(ptr %box, i64 %a, i64 %b) {\n";
         std::string ta = "%a", tb = "%b";
         if (elem->k == Ty::f64_) {
-            t += "  %ta = bitcast i64 %a to double\n  %tb = bitcast i64 %b to double\n";
+            if (elem->bits == 32) {
+                t += "  %a32 = trunc i64 %a to i32\n  %b32 = trunc i64 %b to i32\n";
+                t += "  %ta = bitcast i32 %a32 to float\n"
+                     "  %tb = bitcast i32 %b32 to float\n";
+            } else {
+                t += "  %ta = bitcast i64 %a to double\n"
+                     "  %tb = bitcast i64 %b to double\n";
+            }
             ta = "%ta", tb = "%tb";
         } else if (elem->k == Ty::i1_) {
             t += "  %ta = trunc i64 %a to i1\n  %tb = trunc i64 %b to i1\n";
+            ta = "%ta", tb = "%tb";
+        } else if (elem->k == Ty::dec_) {
+            t += "  %ap = inttoptr i64 %a to ptr\n"
+                 "  %bp = inttoptr i64 %b to ptr\n"
+                 "  %ta = call i128 @beans_decv_unbox(ptr %ap)\n"
+                 "  %tb = call i128 @beans_decv_unbox(ptr %bp)\n";
             ta = "%ta", tb = "%tb";
         } else if (elem->k != Ty::i64_) {
             t += "  %ta = inttoptr i64 %a to ptr\n  %tb = inttoptr i64 %b to ptr\n";
@@ -610,6 +1101,42 @@ struct CG2 {
         t += "  %fp = load ptr, ptr %box\n";
         t += "  %r = call i1 %fp(ptr %box, " + lt + " " + ta + ", " + lt + " " + tb + ")\n";
         t += "  %z = zext i1 %r to i64\n  ret i64 %z\n}\n";
+        lifted += t;
+        return sym;
+    }
+
+    // sort_by_key bridges: evaluate one integer key per element, then let the
+    // runtime's stable radix path reorder key/value pairs without more calls.
+    std::string request_sort_key_thunk(Ty* elem) {
+        auto it = sort_key_thunks.find(elem);
+        if (it != sort_key_thunks.end()) return it->second;
+        std::string sym = "@bsortkey" + std::to_string(sort_key_thunks.size());
+        sort_key_thunks[elem] = sym;
+        std::string lt = ll(elem);
+        std::string t = "define internal i64 " + sym + "(ptr %box, i64 %a) {\n";
+        std::string value = "%a";
+        if (elem->k == Ty::f64_) {
+            if (elem->bits == 32) {
+                t += "  %a32 = trunc i64 %a to i32\n"
+                     "  %ta = bitcast i32 %a32 to float\n";
+            } else {
+                t += "  %ta = bitcast i64 %a to double\n";
+            }
+            value = "%ta";
+        } else if (elem->k == Ty::i1_) {
+            t += "  %ta = trunc i64 %a to i1\n";
+            value = "%ta";
+        } else if (elem->k == Ty::dec_) {
+            t += "  %ap = inttoptr i64 %a to ptr\n"
+                 "  %ta = call i128 @beans_decv_unbox(ptr %ap)\n";
+            value = "%ta";
+        } else if (elem->k != Ty::i64_) {
+            t += "  %ta = inttoptr i64 %a to ptr\n";
+            value = "%ta";
+        }
+        t += "  %fp = load ptr, ptr %box\n";
+        t += "  %r = call i64 %fp(ptr %box, " + lt + " " + value + ")\n";
+        t += "  ret i64 %r\n}\n";
         lifted += t;
         return sym;
     }
@@ -627,11 +1154,20 @@ struct CG2 {
         std::string b = "define internal ptr " + sym + "(i64 %v) {\n";
         switch (t->k) {
             case Ty::i64_:
-                b += "  %r = call ptr @beans_from_int(i64 %v)\n  ret ptr %r\n";
+                b += "  %r = call ptr @beans_from_" +
+                     std::string(t->is_unsigned ? "uint" : "int") +
+                     "(i64 %v)\n  ret ptr %r\n";
                 break;
             case Ty::f64_:
-                b += "  %f = bitcast i64 %v to double\n"
-                     "  %r = call ptr @beans_from_float(double %f)\n  ret ptr %r\n";
+                if (t->bits == 32) {
+                    b += "  %b = trunc i64 %v to i32\n"
+                         "  %f = bitcast i32 %b to float\n"
+                         "  %d = fpext float %f to double\n"
+                         "  %r = call ptr @beans_from_float(double %d)\n  ret ptr %r\n";
+                } else {
+                    b += "  %f = bitcast i64 %v to double\n"
+                         "  %r = call ptr @beans_from_float(double %f)\n  ret ptr %r\n";
+                }
                 break;
             case Ty::i1_:
                 b += "  %t = trunc i64 %v to i1\n  %z = zext i1 %t to i32\n"
@@ -684,13 +1220,22 @@ struct CG2 {
         std::string b = "define internal void " + sym + "(ptr %c, i64 %v) {\n";
         switch (t->k) {
             case Ty::i64_:
-                b += "  %s = call ptr @beans_from_int(i64 %v)\n"
+                b += "  %s = call ptr @beans_from_" +
+                     std::string(t->is_unsigned ? "uint" : "int") + "(i64 %v)\n" +
                      "  call void @beans_show_append(ptr %c, ptr %s)\n"
                      "  call void @beans_release(ptr %s)\n  ret void\n";
                 break;
             case Ty::f64_:
-                b += "  %f = bitcast i64 %v to double\n"
-                     "  %s = call ptr @beans_from_float(double %f)\n"
+                if (t->bits == 32) {
+                    b += "  %b = trunc i64 %v to i32\n"
+                         "  %f = bitcast i32 %b to float\n"
+                         "  %d = fpext float %f to double\n"
+                         "  %s = call ptr @beans_from_float(double %d)\n";
+                } else {
+                    b += "  %f = bitcast i64 %v to double\n"
+                         "  %s = call ptr @beans_from_float(double %f)\n";
+                }
+                b +=
                      "  call void @beans_show_append(ptr %c, ptr %s)\n"
                      "  call void @beans_release(ptr %s)\n  ret void\n";
                 break;
@@ -718,6 +1263,23 @@ struct CG2 {
                 break;
             }
             case Ty::enum_: {
+                if (is_niche_option(t)) {
+                    std::string inner = request_step(t->args[0]);
+                    b += "  %isnone = icmp eq i64 %v, 0\n"
+                         "  br i1 %isnone, label %none, label %some\n"
+                         "none:\n  call void @beans_show_append(ptr %c, ptr " +
+                         intern_string("none") +
+                         ")\n  ret void\n"
+                         "some:\n  call void @beans_show_append(ptr %c, ptr " +
+                         intern_string("some(") +
+                         ")\n"
+                         "  call void @beans_show_push_lit(ptr %c, ptr " +
+                         intern_string(")") +
+                         ")\n"
+                         "  call void @beans_show_push_val(ptr %c, ptr " + inner +
+                         ", i64 %v)\n  ret void\n";
+                    break;
+                }
                 struct VarInfo {
                     std::string name;
                     std::vector<Ty*> pays;
@@ -822,10 +1384,18 @@ struct CG2 {
                      "  ret i64 %z\n";
                 break;
             case Ty::f64_:
-                b += "  %x = bitcast i64 %a to double\n"
-                     "  %y = bitcast i64 %b to double\n"
-                     "  %c = fcmp oeq double %x, %y\n"
-                     "  %z = zext i1 %c to i64\n  ret i64 %z\n";
+                if (t->bits == 32) {
+                    b += "  %a32 = trunc i64 %a to i32\n"
+                         "  %b32 = trunc i64 %b to i32\n"
+                         "  %x = bitcast i32 %a32 to float\n"
+                         "  %y = bitcast i32 %b32 to float\n"
+                         "  %c = fcmp oeq float %x, %y\n";
+                } else {
+                    b += "  %x = bitcast i64 %a to double\n"
+                         "  %y = bitcast i64 %b to double\n"
+                         "  %c = fcmp oeq double %x, %y\n";
+                }
+                b += "  %z = zext i1 %c to i64\n  ret i64 %z\n";
                 break;
             case Ty::str_:
                 b += "  %p = inttoptr i64 %a to ptr\n  %q = inttoptr i64 %b to ptr\n"
@@ -842,6 +1412,18 @@ struct CG2 {
                      "  %c = call i64 @beans_bytes_eq(ptr %p, ptr %q)\n  ret i64 %c\n";
                 break;
             case Ty::enum_: {
+                if (is_niche_option(t)) {
+                    std::string inner = request_eq(t->args[0]);
+                    b += "  %an = icmp eq i64 %a, 0\n"
+                         "  %bn = icmp eq i64 %b, 0\n"
+                         "  br i1 %an, label %anull, label %aval\n"
+                         "anull:\n  %nz = zext i1 %bn to i64\n  ret i64 %nz\n"
+                         "aval:\n  br i1 %bn, label %no, label %values\n"
+                         "values:\n  %veq = call i64 " + inner +
+                         "(i64 %a, i64 %b)\n  ret i64 %veq\n"
+                         "no:\n  ret i64 0\n";
+                    break;
+                }
                 std::vector<std::vector<Ty*>> pays; // per variant tag
                 if (t->name == "Option") {
                     pays.push_back(t->args.empty() ? std::vector<Ty*>{}
@@ -934,7 +1516,9 @@ struct CG2 {
                 b += "  %h = call i64 @beans_slot_mix(i64 %a)\n  ret i64 %h\n";
                 break;
             case Ty::f64_:
-                b += "  %h = call i64 @beans_f64_hash(i64 %a)\n  ret i64 %h\n";
+                b += "  %h = call i64 @beans_" +
+                     std::string(t->bits == 32 ? "f32" : "f64") +
+                     "_hash(i64 %a)\n  ret i64 %h\n";
                 break;
             case Ty::str_:
                 b += "  %p = inttoptr i64 %a to ptr\n"
@@ -949,6 +1533,16 @@ struct CG2 {
                      "  %h = call i64 @beans_bytes_hash(ptr %p)\n  ret i64 %h\n";
                 break;
             case Ty::enum_: {
+                if (is_niche_option(t)) {
+                    std::string inner = request_hash(t->args[0]);
+                    b += "  %n = icmp eq i64 %a, 0\n"
+                         "  br i1 %n, label %none, label %some\n"
+                         "none:\n  %nh = call i64 @beans_slot_mix(i64 1)\n"
+                         "  ret i64 %nh\n"
+                         "some:\n  %sh = call i64 " + inner +
+                         "(i64 %a)\n  ret i64 %sh\n";
+                    break;
+                }
                 std::vector<std::vector<Ty*>> pays; // per variant tag
                 if (t->name == "Option") {
                     pays.push_back(t->args.empty() ? std::vector<Ty*>{}
@@ -1055,9 +1649,26 @@ struct CG2 {
             unify_tref(p->args[0].get(), arg->args[0], gens, env);
             return;
         }
-        if (p->name == "Map" && arg->k == Ty::map_ && p->args.size() == 2) {
+        if ((p->name == "Map" || p->name == "OrderedMap") &&
+            arg->k == Ty::map_ && p->args.size() == 2) {
             unify_tref(p->args[0].get(), arg->args[0], gens, env);
             unify_tref(p->args[1].get(), arg->args[1], gens, env);
+            return;
+        }
+        if (p->name == "Box" && arg->k == Ty::box_ && p->args.size() == 1) {
+            unify_tref(p->args[0].get(), arg->args[0], gens, env);
+            return;
+        }
+        if (p->name == "Arena" && arg->k == Ty::arena_ && p->args.size() == 1) {
+            unify_tref(p->args[0].get(), arg->args[0], gens, env);
+            return;
+        }
+        if (p->name == "Shared" && arg->k == Ty::shared_ && p->args.size() == 1) {
+            unify_tref(p->args[0].get(), arg->args[0], gens, env);
+            return;
+        }
+        if (p->name == "Weak" && arg->k == Ty::weak_ && p->args.size() == 1) {
+            unify_tref(p->args[0].get(), arg->args[0], gens, env);
             return;
         }
         if ((p->name == "Option" || p->name == "Result") && arg->k == Ty::enum_) {
@@ -1220,6 +1831,7 @@ static std::set<std::string> closure_free_names(const Expr* clo) {
 // every name captured by any closure anywhere in this body
 struct ClosureScan {
     std::set<std::string> captured;
+    std::set<std::string> taken;
     void block(const std::vector<StmtPtr>& b) {
         for (const StmtPtr& s : b) stmt(s.get());
     }
@@ -1236,6 +1848,10 @@ struct ClosureScan {
     }
     void expr(const Expr* e) {
         if (!e) return;
+        if (e->kind == Expr::Kind::unary && e->op == TokenKind::kw_take && e->rhs &&
+            e->rhs->kind == Expr::Kind::ident) {
+            taken.insert(std::string(e->rhs->text));
+        }
         if (e->kind == Expr::Kind::closure) {
             std::set<std::string> f = closure_free_names(e);
             captured.insert(f.begin(), f.end());
@@ -1270,6 +1886,72 @@ struct ClosureScan {
     }
 };
 
+// Conservative name-use counts for last-use ownership transfer. Shadowed
+// names are disabled; captured locals are already boxed and never qualify.
+struct ReadScan {
+    std::map<std::string, size_t> reads;
+    std::map<std::string, size_t> declarations;
+    void pattern(const Pattern* p) {
+        if (!p) return;
+        for (const Param& binding : p->bindings) declarations[binding.name] += 1;
+        for (const PatPtr& alt : p->alts) pattern(alt.get());
+    }
+    void block(const std::vector<StmtPtr>& body) {
+        for (const StmtPtr& stmt : body) scan_stmt(stmt.get());
+    }
+    void scan_stmt(const Stmt* stmt) {
+        if (!stmt) return;
+        if (stmt->kind == Stmt::Kind::let_) declarations[stmt->name] += 1;
+        if (stmt->kind == Stmt::Kind::for_in) declarations[stmt->loop_var] += 1;
+        expr(stmt->init.get());
+        if (stmt->target && stmt->target->kind != Expr::Kind::ident)
+            expr(stmt->target.get());
+        expr(stmt->value.get());
+        expr(stmt->expr.get());
+        expr(stmt->cond.get());
+        expr(stmt->iterable.get());
+        block(stmt->body);
+        block(stmt->else_body);
+    }
+    void expr(const Expr* e) {
+        if (!e) return;
+        if (e->kind == Expr::Kind::ident) {
+            reads[std::string(e->text)] += 1;
+            return;
+        }
+        if (e->kind == Expr::Kind::string_lit) {
+            std::vector<std::unique_ptr<std::string>> srcs;
+            for (StrPiece& piece : split_interp(e->text, srcs)) {
+                if (piece.expr) expr(piece.expr.get());
+            }
+            return;
+        }
+        if (e->kind == Expr::Kind::closure) {
+            for (const Param& param : e->params) declarations[param.name] += 1;
+        }
+        expr(e->lhs.get());
+        expr(e->rhs.get());
+        expr(e->callee.get());
+        for (const ExprPtr& arg : e->args) expr(arg.get());
+        expr(e->object.get());
+        expr(e->index_expr.get());
+        for (const InitEntry& entry : e->entries) {
+            expr(entry.key.get());
+            expr(entry.value.get());
+        }
+        expr(e->cond.get());
+        expr(e->then_e.get());
+        expr(e->else_e.get());
+        expr(e->subject.get());
+        for (const MatchArm& arm : e->arms) {
+            pattern(arm.pat.get());
+            expr(arm.value.get());
+            block(arm.body);
+        }
+        block(e->body);
+    }
+};
+
 // ---- per-function emitter ----------------------------------------------------
 
 struct FnEmit {
@@ -1299,21 +1981,32 @@ struct FnEmit {
     bool terminated = false;
     struct Var {
         std::string slot;
+        std::string live_flag; // take-able unboxed ref: does this frame own it?
         Ty* ty;
         bool boxed = false;
         bool owned = false; // frame holds a ref (lets); params/bindings borrow
+        bool inout = false; // slot aliases caller storage; never frame-owned
+        std::string direct_fn; // known closure target for never-reassigned locals
         int seq = 0;        // declaration order — deinit made release order
                             // observable, and the interpreter dies newest-first
+        size_t loop_depth = 0;
+        int decimal_scale = -1; // exact only while every path preserves it
     };
     int next_seq = 0;
     std::vector<std::map<std::string, Var>> scopes;
     struct LoopCtx { std::string brk, cont; size_t scope_depth; };
     std::vector<LoopCtx> loop_stack;
     std::vector<std::unique_ptr<std::string>> interp_srcs;
+    using EV = std::pair<std::string, Ty*>;
     // owned temporaries created while emitting the current statement
-    std::vector<std::string> temps;
+    std::vector<EV> temps;
     Ty* ret_ty = nullptr;
     std::set<std::string> boxed_names; // captured by closures
+    std::set<std::string> taken_names;
+    std::map<std::string, size_t> remaining_reads;
+    std::map<std::string, size_t> declaration_counts;
+    std::map<std::string, Var*> transfer_candidates;
+    std::map<const Expr*, std::string> closure_symbols;
     struct DeferRec {
         const Expr* expr;
         std::string flag; // armed?
@@ -1391,19 +2084,30 @@ struct FnEmit {
         bool boxed = boxed_names.count(name) > 0;
         std::string slot = "%v" + std::to_string(next_reg++) + "." + name;
         allocas += "  " + slot + " = alloca " + (boxed ? "ptr" : ll(t)) + "\n";
+        std::string live_flag;
+        if (!boxed && has_owned_refs(t)) {
+            live_flag = "%v" + std::to_string(next_reg++) + "." + name + ".live";
+            allocas += "  " + live_flag + " = alloca i1\n";
+        }
         if (boxed) {
             // the variable lives in a heap cell so closures share it.
             // params get their cell in the entry block; lets get a fresh cell
             // at their statement site.
             std::string cell = "%cell" + std::to_string(next_reg++);
-            long long cmeta = is_rc(t) ? fixed_meta(1) : 0;
-            std::string code = "  " + cell + " = call ptr @beans_alloc(i64 8, i64 " +
+            if (has_owned_refs(t) && !pointer_mask_fits(t))
+                cg.err(dline, dcol,
+                       "capturing this inline value exceeds ARC metadata capacity");
+            long long mask = pointer_mask(t);
+            long long cmeta = mask ? fixed_meta(mask) : 0;
+            std::string code = "  " + cell + " = call ptr @beans_alloc(i64 " +
+                               std::to_string(CG2::value_size(t)) + ", i64 " +
                                std::to_string(cmeta) + ")\n" +
                                "  store ptr " + cell + ", ptr " + slot + "\n";
             if (entry) entry_inits += code;
             else body += code;
         }
-        scopes.back()[name] = {slot, t, boxed, false, next_seq++};
+        scopes.back()[name] = {slot, live_flag, t, boxed, false, false, "", next_seq++,
+                               loop_stack.size()};
         return slot;
     }
     std::string fresh_slot(const char* tag, Ty* t) {
@@ -1414,11 +2118,12 @@ struct FnEmit {
 
     // ---- ownership bookkeeping ----
     void own(const std::string& val, Ty* t) {
-        if (is_rc(t) && !val.empty() && val[0] == '%') temps.push_back(val);
+        if (has_owned_refs(t) && !val.empty() && val[0] == '%')
+            temps.push_back({val, t});
     }
     bool consume(const std::string& val) {
         for (auto it = temps.rbegin(); it != temps.rend(); ++it) {
-            if (*it == val) {
+            if (it->first == val) {
                 temps.erase(std::next(it).base());
                 return true;
             }
@@ -1426,8 +2131,8 @@ struct FnEmit {
         return false;
     }
     bool is_temp(const std::string& val) const {
-        for (const std::string& t : temps) {
-            if (t == val) return true;
+        for (const EV& t : temps) {
+            if (t.first == val) return true;
         }
         return false;
     }
@@ -1437,15 +2142,84 @@ struct FnEmit {
     void emit_release(const std::string& val) {
         line("call void @beans_release(ptr " + val + ")");
     }
+    void emit_retain_value(const std::string& val, Ty* type) {
+        if (is_rc(type)) {
+            emit_retain(val);
+            return;
+        }
+        if (is_inline_option(type)) {
+            if (!has_owned_refs(type->args[0])) return;
+            std::string payload = reg();
+            line(payload + " = extractvalue " + std::string(ll(type)) + " " + val +
+                 ", 1");
+            emit_retain_value(payload, type->args[0]);
+            return;
+        }
+        if (is_inline_result(type)) {
+            for (size_t i = 0; i < 2; i++) {
+                if (!has_owned_refs(type->args[i])) continue;
+                std::string payload = reg();
+                line(payload + " = extractvalue " + std::string(ll(type)) + " " +
+                     val + ", " + std::to_string(i + 1));
+                emit_retain_value(payload, type->args[i]);
+            }
+        }
+    }
+    void emit_release_value(const std::string& val, Ty* type) {
+        if (is_rc(type)) {
+            emit_release(val);
+            return;
+        }
+        if (is_inline_option(type)) {
+            if (!has_owned_refs(type->args[0])) return;
+            std::string payload = reg();
+            line(payload + " = extractvalue " + std::string(ll(type)) + " " + val +
+                 ", 1");
+            emit_release_value(payload, type->args[0]);
+            return;
+        }
+        if (is_inline_result(type)) {
+            for (size_t i = 0; i < 2; i++) {
+                if (!has_owned_refs(type->args[i])) continue;
+                std::string payload = reg();
+                line(payload + " = extractvalue " + std::string(ll(type)) + " " +
+                     val + ", " + std::to_string(i + 1));
+                emit_release_value(payload, type->args[i]);
+            }
+        }
+    }
+    void emit_retain_value_entry(const std::string& val, Ty* type) {
+        if (is_rc(type)) {
+            entry_inits += "  call void @beans_retain(ptr " + val + ")\n";
+            return;
+        }
+        if (is_inline_option(type)) {
+            if (!has_owned_refs(type->args[0])) return;
+            std::string payload = reg();
+            entry_inits += "  " + payload + " = extractvalue " + ll(type) + " " + val +
+                           ", 1\n";
+            emit_retain_value_entry(payload, type->args[0]);
+            return;
+        }
+        if (is_inline_result(type)) {
+            for (size_t i = 0; i < 2; i++) {
+                if (!has_owned_refs(type->args[i])) continue;
+                std::string payload = reg();
+                entry_inits += "  " + payload + " = extractvalue " + ll(type) + " " +
+                               val + ", " + std::to_string(i + 1) + "\n";
+                emit_retain_value_entry(payload, type->args[i]);
+            }
+        }
+    }
     // release owned temps created since `mark`
     void flush_temps(size_t mark) {
         while (temps.size() > mark) {
-            emit_release(temps.back());
+            emit_release_value(temps.back().first, temps.back().second);
             temps.pop_back();
         }
     }
     // release the frame-owned locals of scopes [from_depth, end)
-    void release_scopes(size_t from_depth) {
+    void release_scopes(size_t from_depth, const std::string& except_slot = "") {
         for (size_t si = scopes.size(); si-- > from_depth;) {
             // newest declaration first — the scope map is alphabetical, but
             // deinit made release order observable and the interpreter's
@@ -1455,16 +2229,32 @@ struct FnEmit {
             std::sort(ordered.begin(), ordered.end(),
                       [](const Var* a, const Var* b) { return a->seq > b->seq; });
             for (const Var* v : ordered) {
+                if (!except_slot.empty() && v->slot == except_slot) continue;
                 if (v->boxed) {
                     if (v->owned) {
                         std::string cell = reg();
                         line(cell + " = load ptr, ptr " + v->slot);
                         emit_release(cell);
                     }
-                } else if (v->owned && is_rc(v->ty)) {
-                    std::string val = reg();
-                    line(val + " = load ptr, ptr " + v->slot);
-                    emit_release(val);
+                } else if (v->owned && has_owned_refs(v->ty)) {
+                    if (v->live_flag.empty()) {
+                        std::string val = reg();
+                        line(val + " = load " + std::string(ll(v->ty)) + ", ptr " +
+                             v->slot);
+                        emit_release_value(val, v->ty);
+                    } else {
+                        std::string live = reg();
+                        line(live + " = load i1, ptr " + v->live_flag);
+                        std::string drop = bb(), done = bb();
+                        line("br i1 " + live + ", label %" + drop + ", label %" + done);
+                        label(drop);
+                        std::string val = reg();
+                        line(val + " = load " + std::string(ll(v->ty)) + ", ptr " +
+                             v->slot);
+                        emit_release_value(val, v->ty);
+                        line("br label %" + done);
+                        label(done);
+                    }
                 }
             }
         }
@@ -1489,8 +2279,6 @@ struct FnEmit {
         return cell;
     }
 
-    using EV = std::pair<std::string, Ty*>;
-
     // Reads borrow — that is the discipline — but a borrow handed into a call
     // (argument, method receiver, match subject) can outlive its owner: the
     // callee may overwrite the container slot or object field it came from,
@@ -1499,10 +2287,10 @@ struct FnEmit {
     // the statement's temps. Idents, literals, and already-owned results are
     // skipped, so nothing lands on paths that did not need it.
     void pin_borrow(const Expr* a, const EV& v) {
-        if (!a || !is_rc(v.second)) return;
+        if (!a || !has_owned_refs(v.second)) return;
         if (a->kind != Expr::Kind::index && a->kind != Expr::Kind::field) return;
         if (is_temp(v.first)) return;
-        emit_retain(v.first);
+        emit_retain_value(v.first, v.second);
         own(v.first, v.second);
     }
 
@@ -1510,10 +2298,10 @@ struct FnEmit {
     // interpreter's value_eq: 0 raw slot (ints, bools, unit, pointer-identity
     // lists/objects), 1 f64 by IEEE value, 2 string content, 3 decimal value,
     // 4 generated structural thunk (enums, Bytes), 5 never equal (maps and
-    // resource handles — value_eq's default arm)
+    // resource handles), 6 f32 by IEEE value
     int eq_kind(Ty* t) {
         switch (t->k) {
-            case Ty::f64_: return 1;
+            case Ty::f64_: return t->bits == 32 ? 6 : 1;
             case Ty::str_: return 2;
             case Ty::dec_: return 3;
             case Ty::enum_:
@@ -1522,6 +2310,11 @@ struct FnEmit {
             case Ty::i1_:
             case Ty::unit_:
             case Ty::list_:
+            case Ty::box_:
+            case Ty::arena_:
+            case Ty::shared_:
+            case Ty::weak_:
+            case Ty::rawptr_:
             case Ty::obj_: return 0;
             default: return 5;
         }
@@ -1531,9 +2324,10 @@ struct FnEmit {
     std::string hash_thunk(Ty* t, int kind) { return kind == 4 ? cg.request_hash(t) : "null"; }
     // interp panics on integer divide/modulo by zero; a bare sdiv would give 0
     // silently on arm64 (and trap on x86) — emit the same panic on both paths
-    void guard_div_zero(const std::string& rhs, bool is_mod, uint32_t ln, uint32_t cl) {
+    void guard_div_zero(const std::string& rhs, Ty* type, bool is_mod,
+                        uint32_t ln, uint32_t cl) {
         std::string c = reg();
-        line(c + " = icmp eq i64 " + rhs + ", 0");
+        line(c + " = icmp eq " + std::string(ll(type)) + " " + rhs + ", 0");
         std::string bad = bb(), ok = bb();
         line("br i1 " + c + ", label %" + bad + ", label %" + ok);
         label(bad);
@@ -1549,10 +2343,11 @@ struct FnEmit {
     // exactly like the interpreter's value_less returning false
     int order_kind(Ty* t) {
         switch (t->k) {
-            case Ty::f64_: return 1;
+            case Ty::f64_: return t->bits == 32 ? 6 : 1;
             case Ty::str_: return 2;
             case Ty::dec_: return 3;
             case Ty::i64_:
+                return t->is_unsigned ? 5 : 0;
             case Ty::i1_: return 0;
             default: return 4;
         }
@@ -1560,9 +2355,16 @@ struct FnEmit {
 
     // value is about to be stored somewhere that owns it: transfer or +1
     void transfer_in(const EV& v) {
-        if (!is_rc(v.second)) return;
+        if (!has_owned_refs(v.second)) return;
         if (consume(v.first)) return; // ownership moves
-        emit_retain(v.first);
+        auto candidate = transfer_candidates.find(v.first);
+        if (candidate != transfer_candidates.end()) {
+            Var* source = candidate->second;
+            if (!source->live_flag.empty()) line("store i1 0, ptr " + source->live_flag);
+            transfer_candidates.erase(candidate);
+            return;
+        }
+        emit_retain_value(v.first, v.second);
     }
 
     // ---- allocation helpers ----
@@ -1574,6 +2376,44 @@ struct FnEmit {
     }
     // mask bits land in meta bits 3..60; 61-63 belong to the cycle collector
     static long long fixed_meta(long long mask) { return 1 | (mask << 3); }
+    static long long pointer_mask(Ty* type, int base = 0) {
+        if (!type) return 0;
+        if (is_rc(type)) {
+            int slot = base / 8;
+            return base % 8 == 0 && slot < 58 ? static_cast<long long>(1ULL << slot)
+                                               : 0;
+        }
+        if (is_inline_option(type)) {
+            int offset = CG2::align_up(1, CG2::value_align(type->args[0]));
+            return pointer_mask(type->args[0], base + offset);
+        }
+        if (is_inline_result(type)) {
+            int ok_offset = CG2::align_up(1, CG2::value_align(type->args[0]));
+            int error_offset = CG2::align_up(
+                ok_offset + CG2::value_size(type->args[0]),
+                CG2::value_align(type->args[1]));
+            return pointer_mask(type->args[0], base + ok_offset) |
+                   pointer_mask(type->args[1], base + error_offset);
+        }
+        return 0;
+    }
+    static bool pointer_mask_fits(Ty* type, int base = 0) {
+        if (!type) return true;
+        if (is_rc(type)) return base % 8 == 0 && base / 8 < 58;
+        if (is_inline_option(type)) {
+            int offset = CG2::align_up(1, CG2::value_align(type->args[0]));
+            return pointer_mask_fits(type->args[0], base + offset);
+        }
+        if (is_inline_result(type)) {
+            int ok_offset = CG2::align_up(1, CG2::value_align(type->args[0]));
+            int error_offset = CG2::align_up(
+                ok_offset + CG2::value_size(type->args[0]),
+                CG2::value_align(type->args[1]));
+            return pointer_mask_fits(type->args[0], base + ok_offset) &&
+                   pointer_mask_fits(type->args[1], base + error_offset);
+        }
+        return true;
+    }
     void store_at(const std::string& base, int offset, const std::string& val, Ty* t) {
         std::string p = reg();
         line(p + " = getelementptr i8, ptr " + base + ", i64 " + std::to_string(offset));
@@ -1585,30 +2425,144 @@ struct FnEmit {
         line(r + " = load " + std::string(ll(t)) + ", ptr " + p);
         return r;
     }
+    std::string load_slot_at(const std::string& base, int offset, Ty* type) {
+        return from_slot(load_at(base, offset, cg.t_i64()), type);
+    }
     // enum boxes own their payload refs; the box itself is an owned temp
     std::string box_enum(int tag, const std::vector<EV>& payload) {
         if (payload.empty()) return cg.intern_enum_tag(tag); // immortal singleton
         long long mask = 0;
         for (size_t i = 0; i < payload.size(); i++) {
-            if (is_rc(payload[i].second)) mask |= 1LL << (i + 1);
+            if (is_slot_rc(payload[i].second)) mask |= 1LL << (i + 1);
         }
         std::string b = alloc_bytes(8 + 8 * static_cast<int>(payload.size()),
                                     fixed_meta(mask));
         store_at(b, 0, std::to_string(tag), cg.t_i64());
         for (size_t i = 0; i < payload.size(); i++) {
             transfer_in(payload[i]);
-            store_at(b, 8 + 8 * static_cast<int>(i), payload[i].first, payload[i].second);
+            store_at(b, 8 + 8 * static_cast<int>(i), to_slot(payload[i], true),
+                     cg.t_i64());
         }
         own(b, cg.t_enum("Option", {})); // any rc type works for bookkeeping
         return b;
     }
+    std::string make_option_some(const EV& value, Ty* inner) {
+        Ty* opt = cg.t_option(inner);
+        if (is_inline_option(opt)) {
+            transfer_in(value);
+            std::string tagged = reg(), result = reg();
+            line(tagged + " = insertvalue " + std::string(ll(opt)) +
+                 " zeroinitializer, i1 true, 0");
+            line(result + " = insertvalue " + std::string(ll(opt)) + " " + tagged +
+                 ", " + ll(inner) + " " + value.first + ", 1");
+            own(result, opt);
+            return result;
+        }
+        if (!is_niche_option(opt)) return box_enum(0, {value});
+        transfer_in(value);
+        own(value.first, opt);
+        return value.first;
+    }
+    std::string make_option_none(Ty* inner) {
+        Ty* opt = cg.t_option(inner);
+        if (is_inline_option(opt)) return "zeroinitializer";
+        return is_niche_option(opt) ? "null" : box_enum(1, {});
+    }
 
-    // to raw i64 for list slots
-    std::string to_slot(const EV& v) {
-        if (v.second->k == Ty::i64_) return v.first;
+    std::string make_result_value(bool ok, const EV& value, Ty* ok_type,
+                                  Ty* error_type) {
+        Ty* result_type = cg.t_result(ok_type, error_type);
+        if (!is_inline_result(result_type))
+            return box_enum(ok ? 0 : 1, {value});
+        transfer_in(value);
+        std::string tagged = reg(), result = reg();
+        line(tagged + " = insertvalue " + std::string(ll(result_type)) +
+             " zeroinitializer, i1 " + (ok ? "false" : "true") + ", 0");
+        size_t field = ok ? 1 : 2;
+        line(result + " = insertvalue " + std::string(ll(result_type)) + " " + tagged +
+             ", " + ll(value.second) + " " + value.first + ", " +
+             std::to_string(field));
+        own(result, result_type);
+        return result;
+    }
+
+    std::string result_is_ok(const EV& result) {
+        std::string is_ok = reg();
+        if (is_inline_result(result.second)) {
+            std::string is_error = reg();
+            line(is_error + " = extractvalue " + std::string(ll(result.second)) + " " +
+                 result.first + ", 0");
+            line(is_ok + " = xor i1 " + is_error + ", true");
+        } else {
+            std::string tag = load_at(result.first, 0, cg.t_i64());
+            line(is_ok + " = icmp eq i64 " + tag + ", 0");
+        }
+        return is_ok;
+    }
+
+    std::string result_payload(const EV& result, bool ok) {
+        Ty* payload_type = result.second->args[ok ? 0 : 1];
+        if (is_inline_result(result.second)) {
+            std::string payload = reg();
+            line(payload + " = extractvalue " + std::string(ll(result.second)) + " " +
+                 result.first + ", " + std::to_string(ok ? 1 : 2));
+            return payload;
+        }
+        return load_slot_at(result.first, 8, payload_type);
+    }
+
+    std::string option_has(const EV& option) {
+        std::string result = reg();
+        if (is_inline_option(option.second)) {
+            line(result + " = extractvalue " + std::string(ll(option.second)) + " " +
+                 option.first + ", 0");
+        } else if (is_niche_option(option.second)) {
+            line(result + " = icmp ne ptr " + option.first + ", null");
+        } else {
+            std::string tag = load_at(option.first, 0, cg.t_i64());
+            line(result + " = icmp eq i64 " + tag + ", 0");
+        }
+        return result;
+    }
+
+    std::string option_payload(const EV& option, Ty* inner) {
+        if (is_inline_option(option.second)) {
+            std::string result = reg();
+            line(result + " = extractvalue " + std::string(ll(option.second)) + " " +
+                 option.first + ", 1");
+            return result;
+        }
+        if (is_niche_option(option.second)) return option.first;
+        return load_slot_at(option.first, 8, inner);
+    }
+
+    // Convert to the generic runtime's i64 slot. Decimal is inline everywhere
+    // else, but collections still have an eight-byte ABI, so make a small RC
+    // box here. A storing call takes that box; a lookup keeps it as a temporary.
+    std::string to_slot(const EV& v, bool storing = false) {
+        if (v.second->k == Ty::i64_) {
+            if (!v.second->bits || v.second->bits == 64) return v.first;
+            std::string r = reg();
+            line(r + " = " + (v.second->is_unsigned ? "zext" : "sext") + " " +
+                 std::string(ll(v.second)) + " " + v.first + " to i64");
+            return r;
+        }
         std::string r = reg();
+        if (v.second->k == Ty::dec_) {
+            std::string box = reg();
+            line(box + " = call ptr @beans_decv_box(i128 " + v.first + ")");
+            if (!storing) own(box, cg.t_str());
+            line(r + " = ptrtoint ptr " + box + " to i64");
+            return r;
+        }
         if (v.second->k == Ty::f64_) {
-            line(r + " = bitcast double " + v.first + " to i64");
+            if (v.second->bits == 32) {
+                std::string raw = reg();
+                line(raw + " = bitcast float " + v.first + " to i32");
+                line(r + " = zext i32 " + raw + " to i64");
+            } else {
+                line(r + " = bitcast double " + v.first + " to i64");
+            }
         } else if (v.second->k == Ty::i1_) {
             line(r + " = zext i1 " + v.first + " to i64");
         } else {
@@ -1616,13 +2570,47 @@ struct FnEmit {
         }
         return r;
     }
-    std::string from_slot(const std::string& v, Ty* t) {
-        if (t->k == Ty::i64_) return v;
+    std::string from_slot(const std::string& v, Ty* t, bool taking = false) {
+        if (t->k == Ty::i64_) {
+            if (!t->bits || t->bits == 64) return v;
+            std::string r = reg();
+            line(r + " = trunc i64 " + v + " to " + std::string(ll(t)));
+            return r;
+        }
         std::string r = reg();
-        if (t->k == Ty::f64_) line(r + " = bitcast i64 " + v + " to double");
+        if (t->k == Ty::dec_) {
+            std::string box = reg();
+            line(box + " = inttoptr i64 " + v + " to ptr");
+            line(r + " = call i128 @beans_decv_unbox(ptr " + box + ")");
+            if (taking) emit_release(box);
+            return r;
+        }
+        if (t->k == Ty::f64_) {
+            if (t->bits == 32) {
+                std::string raw = reg();
+                line(raw + " = trunc i64 " + v + " to i32");
+                line(r + " = bitcast i32 " + raw + " to float");
+            } else {
+                line(r + " = bitcast i64 " + v + " to double");
+            }
+        }
         else if (t->k == Ty::i1_) line(r + " = trunc i64 " + v + " to i1");
         else line(r + " = inttoptr i64 " + v + " to ptr");
         return r;
+    }
+    std::string as_f64(const EV& value) {
+        if (value.second->k != Ty::f64_ || value.second->bits != 32) return value.first;
+        std::string wide = reg();
+        line(wide + " = fpext float " + value.first + " to double");
+        return wide;
+    }
+    std::string normalize_integer(const std::string& value, Ty* type) {
+        (void)type;
+        return value;
+    }
+    std::string normalize_float(const std::string& value, Ty* type) {
+        (void)type;
+        return value;
     }
 
     // ---- expressions -------------------------------------------------------
@@ -1630,14 +2618,43 @@ struct FnEmit {
     EV eval(const Expr* e, Ty* hint = nullptr) {
         switch (e->kind) {
             case Expr::Kind::int_lit: {
+                TypeId checked = cg.checked_type(e);
+                if (checked && checked->k == Type::K::decimal_)
+                    return dec_literal(e->text);
+                if (Ty* typed = cg.checked_primitive(e)) {
+                    if (typed->k == Ty::f64_) {
+                        double value = parse_float_text(e->text);
+                        if (typed->bits == 32) value = static_cast<float>(value);
+                        return {fmt_double(value), typed};
+                    }
+                    if (typed->k == Ty::i64_)
+                        return {std::to_string(parse_int_text(e->text)), typed};
+                }
                 if (hint && hint->k == Ty::dec_) return dec_literal(e->text);
-                if (hint && hint->k == Ty::f64_)
-                    return {fmt_double(parse_float_text(e->text)), cg.t_f64()};
-                return {std::to_string(parse_int_text(e->text)), cg.t_i64()};
+                if (hint && hint->k == Ty::f64_) {
+                    double value = parse_float_text(e->text);
+                    if (hint->bits == 32) value = static_cast<float>(value);
+                    return {fmt_double(value), hint};
+                }
+                return {std::to_string(parse_int_text(e->text)),
+                        hint && hint->k == Ty::i64_ ? hint : cg.t_i64()};
             }
             case Expr::Kind::float_lit: {
+                TypeId checked = cg.checked_type(e);
+                if (checked && checked->k == Type::K::decimal_)
+                    return dec_literal(e->text);
+                if (Ty* typed = cg.checked_primitive(e)) {
+                    if (typed->k == Ty::f64_) {
+                        double value = parse_float_text(e->text);
+                        if (typed->bits == 32) value = static_cast<float>(value);
+                        return {fmt_double(value), typed};
+                    }
+                }
                 if (hint && hint->k == Ty::dec_) return dec_literal(e->text);
-                return {fmt_double(parse_float_text(e->text)), cg.t_f64()};
+                double value = parse_float_text(e->text);
+                Ty* type = hint && hint->k == Ty::f64_ ? hint : cg.t_f64();
+                if (type->bits == 32) value = static_cast<float>(value);
+                return {fmt_double(value), type};
             }
             case Expr::Kind::bool_lit:
                 return {e->bool_val ? "1" : "0", cg.t_bool()};
@@ -1646,15 +2663,33 @@ struct FnEmit {
             case Expr::Kind::ident: {
                 std::string name(e->text);
                 if (Var* v = find_var(name)) {
-                    return {var_read(v), v->ty};
+                    std::string value = var_read(v);
+                    auto remaining = remaining_reads.find(name);
+                    if (remaining != remaining_reads.end() && remaining->second > 0)
+                        remaining->second -= 1;
+                    bool last_read = remaining != remaining_reads.end() &&
+                                     remaining->second == 0 &&
+                                     declaration_counts[name] == 1 &&
+                                     v->loop_depth == loop_stack.size();
+                    bool overwritten_next =
+                        cg.hir.mir().can_move_before_overwrite(e);
+                    if ((last_read || overwritten_next) && v->owned && !v->boxed &&
+                        has_owned_refs(v->ty)) {
+                        transfer_candidates[value] = v;
+                    }
+                    return {value, v->ty};
                 }
                 if (name == "none") {
                     Ty* inner = hint && hint->k == Ty::enum_ && !hint->args.empty()
                                     ? hint->args[0]
                                     : cg.t_i64();
-                    std::string b = box_enum(1, {});
+                    std::string b = make_option_none(inner);
                     return {b, cg.t_option(inner)};
                 }
+                auto function = cg.fn_decls.find(
+                    e->resolved.empty() ? cg.qual(name) : e->resolved);
+                if (function != cg.fn_decls.end())
+                    return eval_top_fn_ref(e, function->second);
                 err(e, "reading '" + name + "'");
                 return {"0", cg.t_i64()};
             }
@@ -1666,16 +2701,55 @@ struct FnEmit {
                 return {"null", cg.t_bad()};
             }
             case Expr::Kind::unary: {
+                if (e->op == TokenKind::kw_inout) {
+                    if (!e->rhs || e->rhs->kind != Expr::Kind::ident) {
+                        err(e, "inout here");
+                        return {"null", cg.t_bad()};
+                    }
+                    Var* var = find_var(std::string(e->rhs->text));
+                    if (!var) {
+                        err(e, "inout local");
+                        return {"null", cg.t_bad()};
+                    }
+                    return {var_ptr(var), var->ty};
+                }
+                if (e->op == TokenKind::kw_take) {
+                    if (!e->rhs || e->rhs->kind != Expr::Kind::ident) {
+                        err(e, "take here");
+                        return {"0", cg.t_i64()};
+                    }
+                    Var* var = find_var(std::string(e->rhs->text));
+                    if (!var) {
+                        err(e, "taking this local");
+                        return {"0", cg.t_i64()};
+                    }
+                    std::string value = var_read(var);
+                    if (has_owned_refs(var->ty)) {
+                        if (var->boxed) {
+                            line("store " + std::string(ll(var->ty)) +
+                                 (is_rc(var->ty) ? " null, ptr "
+                                                : " zeroinitializer, ptr ") +
+                                 var_ptr(var));
+                        } else if (!var->live_flag.empty()) {
+                            line("store i1 0, ptr " + var->live_flag);
+                        } else if (!var->owned) {
+                            emit_retain_value(value, var->ty);
+                        }
+                        own(value, var->ty);
+                    }
+                    return {value, var->ty};
+                }
                 if (e->op == TokenKind::minus) {
                     EV v = eval(e->rhs.get(), hint);
                     std::string r = reg();
                     if (v.second->k == Ty::f64_) {
-                        line(r + " = fneg double " + v.first);
+                        line(r + " = fneg " + std::string(ll(v.second)) + " " + v.first);
+                        r = normalize_float(r, v.second);
                     } else if (v.second->k == Ty::dec_) {
-                        line(r + " = call ptr @beans_dec_neg(ptr " + v.first + ")");
-                        own(r, cg.t_dec());
+                        line(r + " = call i128 @beans_decv_neg(i128 " + v.first + ")");
                     } else {
-                        line(r + " = sub i64 0, " + v.first);
+                        line(r + " = sub " + std::string(ll(v.second)) + " 0, " + v.first);
+                        r = normalize_integer(r, v.second);
                     }
                     return {r, v.second};
                 }
@@ -1687,8 +2761,8 @@ struct FnEmit {
                 }
                 EV v = eval(e->rhs.get());
                 std::string r = reg();
-                line(r + " = xor i64 " + v.first + ", -1");
-                return {r, cg.t_i64()};
+                line(r + " = xor " + std::string(ll(v.second)) + " " + v.first + ", -1");
+                return {r, v.second};
             }
             case Expr::Kind::binary:
                 return eval_binary(e);
@@ -1704,7 +2778,9 @@ struct FnEmit {
                 // the key must be built as the map's key type — a bare 1.5 on
                 // a Map<decimal,_> read has to become a BDec, not float bits
                 Ty* ih = obj.second->k == Ty::map_    ? obj.second->args[0]
-                         : obj.second->k == Ty::list_ ? cg.t_i64()
+                         : (obj.second->k == Ty::list_ ||
+                            obj.second->k == Ty::fixed_array_ ||
+                            obj.second->k == Ty::slice_) ? cg.t_i64()
                                                       : nullptr;
                 EV idx = eval(e->index_expr.get(), ih);
                 if (obj.second->k == Ty::map_) {
@@ -1713,14 +2789,22 @@ struct FnEmit {
                     Ty* K = obj.second->args[0];
                     Ty* V = obj.second->args[1];
                     int kind = eq_kind(K);
-                    std::string okf = fresh_slot("mgok", cg.t_i64());
                     std::string raw = reg();
-                    line(raw + " = call i64 @beans_map_get(ptr " + obj.first + ", i64 " +
-                         to_slot(idx) + ", i64 " + std::to_string(kind) + ", ptr " + okf +
-                         ", ptr " + eq_thunk(K, kind) + ", ptr " + hash_thunk(K, kind) +
-                         ")");
                     std::string okv = reg(), c = reg();
-                    line(okv + " = load i64, ptr " + okf);
+                    if (kind == 0) {
+                        std::string pair = reg();
+                        line(pair + " = call {i64, i64} @beans_map_get_raw(ptr " +
+                             obj.first + ", i64 " + to_slot(idx) + ")");
+                        line(raw + " = extractvalue {i64, i64} " + pair + ", 0");
+                        line(okv + " = extractvalue {i64, i64} " + pair + ", 1");
+                    } else {
+                        std::string okf = fresh_slot("mgok", cg.t_i64());
+                        line(raw + " = call i64 @beans_map_get(ptr " + obj.first +
+                             ", i64 " + to_slot(idx) + ", i64 " +
+                             std::to_string(kind) + ", ptr " + okf + ", ptr " +
+                             eq_thunk(K, kind) + ", ptr " + hash_thunk(K, kind) + ")");
+                        line(okv + " = load i64, ptr " + okf);
+                    }
                     line(c + " = icmp ne i64 " + okv + ", 0");
                     std::string okb = bb(), badb = bb();
                     line("br i1 " + c + ", label %" + okb + ", label %" + badb);
@@ -1741,6 +2825,52 @@ struct FnEmit {
                     if (key_eaten) emit_release(idx.first);
                     return {from_slot(raw, V), V}; // borrowed from the map, like lists
                 }
+                if (obj.second->k == Ty::slice_) {
+                    Ty* element = obj.second->args[0];
+                    std::string pointer = reg(), length = reg();
+                    line(pointer + " = extractvalue {ptr, i64} " + obj.first + ", 0");
+                    line(length + " = extractvalue {ptr, i64} " + obj.first + ", 1");
+                    std::string index = to_slot(idx), inside = reg();
+                    line(inside + " = icmp ult i64 " + index + ", " + length);
+                    std::string ok = bb(), bad = bb();
+                    line("br i1 " + inside + ", label %" + ok + ", label %" + bad);
+                    label(bad);
+                    line("call void @beans_panic_slice_index(i64 " + index + ", i64 " +
+                         length + ", i64 " + std::to_string(e->line) + ", i64 " +
+                         std::to_string(e->col) + ")");
+                    line("unreachable");
+                    label(ok);
+                    std::string item_pointer = reg(), result = reg();
+                    line(item_pointer + " = getelementptr " + std::string(ll(element)) +
+                         ", ptr " + pointer + ", i64 " + index);
+                    line(result + " = load " + std::string(ll(element)) + ", ptr " +
+                         item_pointer + ", align 1");
+                    return {result, element};
+                }
+                if (obj.second->k == Ty::fixed_array_) {
+                    Ty* elem = obj.second->args[0];
+                    std::string index = to_slot(idx);
+                    std::string okc = reg();
+                    line(okc + " = icmp ult i64 " + index + ", " +
+                         std::to_string(obj.second->array_len));
+                    std::string okb = bb(), badb = bb();
+                    line("br i1 " + okc + ", label %" + okb + ", label %" + badb);
+                    label(badb);
+                    line("call void @beans_panic_array_index(i64 " + index + ", i64 " +
+                         std::to_string(obj.second->array_len) + ", i64 " +
+                         std::to_string(e->line) + ", i64 " +
+                         std::to_string(e->col) + ")");
+                    line("unreachable");
+                    label(okb);
+                    std::string slot = fresh_slot("arrread", obj.second);
+                    line("store " + std::string(ll(obj.second)) + " " + obj.first +
+                         ", ptr " + slot);
+                    std::string pointer = reg(), result = reg();
+                    line(pointer + " = getelementptr " + std::string(ll(obj.second)) +
+                         ", ptr " + slot + ", i64 0, i64 " + index);
+                    line(result + " = load " + std::string(ll(elem)) + ", ptr " + pointer);
+                    return {result, elem};
+                }
                 if (obj.second->k != Ty::list_) {
                     err(e, "indexing this");
                     return {"0", cg.t_i64()};
@@ -1748,23 +2878,39 @@ struct FnEmit {
                 // bounds-checked read
                 Ty* elem = obj.second->args[0];
                 std::string len = load_at(obj.first, 8, cg.t_i64());
+                std::string index = to_slot(idx);
                 std::string okc = reg();
-                line(okc + " = icmp ult i64 " + idx.first + ", " + len);
+                line(okc + " = icmp ult i64 " + index + ", " + len);
                 std::string okb = bb(), badb = bb();
                 line("br i1 " + okc + ", label %" + okb + ", label %" + badb);
                 label(badb);
-                line("call void @beans_panic_index(i64 " + idx.first + ", i64 " + len +
+                line("call void @beans_panic_index(i64 " + index + ", i64 " + len +
                      ", i64 1, i64 " + std::to_string(e->line) + ", i64 " +
                      std::to_string(e->col) + ")");
                 line("unreachable");
                 label(okb);
                 std::string data = load_at(obj.first, 0, cg.t_str()); // ptr
                 std::string ep = reg(), raw = reg();
-                line(ep + " = getelementptr i64, ptr " + data + ", i64 " + idx.first);
+                line(ep + " = getelementptr i64, ptr " + data + ", i64 " + index);
                 line(raw + " = load i64, ptr " + ep);
                 return {from_slot(raw, elem), elem};
             }
             case Expr::Kind::list_lit: {
+                if (hint && hint->k == Ty::fixed_array_) {
+                    Ty* elem = hint->args[0];
+                    std::string current = "poison";
+                    std::string array_type = ll(hint);
+                    std::string elem_type = ll(elem);
+                    for (size_t i = 0; i < e->args.size(); i++) {
+                        EV value = eval(e->args[i].get(), elem);
+                        std::string next = reg();
+                        line(next + " = insertvalue " + array_type + " " + current +
+                             ", " + elem_type + " " + value.first + ", " +
+                             std::to_string(i));
+                        current = next;
+                    }
+                    return {current, hint};
+                }
                 Ty* elem = hint && hint->k == Ty::list_ ? hint->args[0] : nullptr;
                 std::vector<EV> elems;
                 for (const ExprPtr& el : e->args) {
@@ -1775,10 +2921,11 @@ struct FnEmit {
                 if (!elem) elem = cg.t_i64();
                 std::string l = reg();
                 line(l + " = call ptr @beans_list_new(i64 " +
-                     std::string(is_rc(elem) ? "1" : "0") + ")");
+                     std::string(is_slot_rc(elem) ? "1" : "0") + ")");
                 for (const EV& v : elems) {
                     transfer_in(v);
-                    line("call void @beans_list_push(ptr " + l + ", i64 " + to_slot(v) + ")");
+                    line("call void @beans_list_push(ptr " + l + ", i64 " +
+                         to_slot(v, true) + ")");
                 }
                 own(l, cg.t_list(elem));
                 return {l, cg.t_list(elem)};
@@ -1794,18 +2941,24 @@ struct FnEmit {
                     return {"0", cg.t_i64()};
                 }
                 Ty* inner = v.second->args.empty() ? cg.t_i64() : v.second->args[0];
-                std::string tag = load_at(v.first, 0, cg.t_i64());
-                std::string c = reg();
-                line(c + " = icmp eq i64 " + tag + ", 0");
+                std::string c;
+                if (v.second->name == "Option") {
+                    c = option_has(v);
+                } else {
+                    c = result_is_ok(v);
+                }
                 std::string okb = bb(), errb = bb();
                 line("br i1 " + c + ", label %" + okb + ", label %" + errb);
                 label(errb);
-                if (!in_temps(v.first)) emit_retain(v.first); // caller gets +1
-                emit_ret("ret ptr " + v.first, v.first);
+                if (has_owned_refs(v.second) && !in_temps(v.first))
+                    emit_retain_value(v.first, v.second); // caller gets +1
+                emit_ret("ret " + std::string(ll(v.second)) + " " + v.first, v.first);
                 label(okb);
-                std::string payload = load_at(v.first, 8, inner);
-                if (is_rc(inner)) {
-                    emit_retain(payload); // survives the box
+                std::string payload = v.second->name == "Option"
+                                          ? option_payload(v, inner)
+                                          : result_payload(v, true);
+                if (has_owned_refs(inner)) {
+                    emit_retain_value(payload, inner); // survives the enum value
                     own(payload, inner);
                 }
                 return {payload, inner};
@@ -1817,7 +2970,7 @@ struct FnEmit {
                 label(then_bb);
                 size_t tmark = temps.size();
                 EV a = eval(e->then_e.get(), hint);
-                if (is_rc(a.second)) transfer_in(a);
+                if (has_owned_refs(a.second)) transfer_in(a);
                 std::string slot = fresh_slot("ifv", a.second);
                 line("store " + std::string(ll(a.second)) + " " + a.first + ", ptr " + slot);
                 flush_temps(tmark);
@@ -1825,7 +2978,7 @@ struct FnEmit {
                 label(else_bb);
                 size_t emark = temps.size();
                 EV b2 = eval(e->else_e.get(), hint ? hint : a.second);
-                if (is_rc(a.second)) transfer_in(b2);
+                if (has_owned_refs(a.second)) transfer_in(b2);
                 line("store " + std::string(ll(a.second)) + " " + b2.first + ", ptr " + slot);
                 flush_temps(emark);
                 line("br label %" + end_bb);
@@ -1854,6 +3007,7 @@ struct FnEmit {
         }
 
         std::string sym = "@clo" + std::to_string(cg.next_clo++);
+        closure_symbols[e] = sym;
         FnEmit fe(cg, e, sym, &caps, env);
         fe.pkg = pkg; // closure body is code of the same package
         cg.lifted += fe.emit();
@@ -1882,6 +3036,62 @@ struct FnEmit {
         return {box, fty};
     }
 
+    // A stored top-level function uses the same box shape and calling
+    // convention as a closure. Its tiny adapter ignores the environment word
+    // and forwards borrowed arguments to the normal top-level symbol.
+    EV eval_top_fn_ref(const Expr* e, const FnDecl* function) {
+        if (function->is_extern_c || !function->generics.empty()) {
+            err(e, "storing this function");
+            return {"null", cg.t_bad()};
+        }
+        std::vector<Ty*> signature;
+        for (const Param& parameter : function->params)
+            signature.push_back(
+                rt(parameter.type.get(), e->line, e->col));
+        Ty* result = function->ret
+                         ? rt(function->ret.get(), e->line, e->col)
+                         : cg.t_unit();
+        signature.push_back(result);
+        Ty* function_type = cg.t_fn(std::move(signature));
+
+        std::string adapter;
+        auto existing = cg.fn_ref_adapters.find(function);
+        if (existing != cg.fn_ref_adapters.end()) {
+            adapter = existing->second;
+        } else {
+            adapter = "@beans_fn_ref_" +
+                      std::to_string(cg.fn_ref_adapters.size());
+            cg.fn_ref_adapters[function] = adapter;
+            std::string body = "define " + std::string(ll(result)) + " " +
+                               adapter + "(ptr %env";
+            std::string call_arguments;
+            for (size_t i = 0; i < function->params.size(); i++) {
+                Ty* parameter = function_type->args[i];
+                body += ", " + std::string(ll(parameter)) + " %arg" +
+                        std::to_string(i);
+                if (i) call_arguments += ", ";
+                call_arguments += std::string(ll(parameter)) + " %arg" +
+                                  std::to_string(i);
+            }
+            body += ") {\n";
+            std::string target = "@b_" + function->qualname;
+            if (result->k == Ty::unit_) {
+                body += "  call void " + target + "(" + call_arguments +
+                        ")\n  ret void\n}\n\n";
+            } else {
+                body += "  %result = call " + std::string(ll(result)) + " " +
+                        target + "(" + call_arguments + ")\n  ret " +
+                        std::string(ll(result)) + " %result\n}\n\n";
+            }
+            cg.lifted += body;
+        }
+
+        std::string box = alloc_bytes(8, fixed_meta(0));
+        store_at(box, 0, adapter, cg.t_str());
+        own(box, function_type);
+        return {box, function_type};
+    }
+
     // call a closure/fn value: box layout {fnptr @0, cells @8...}
     EV call_fn_value(const EV& fnv, const Expr* e) {
         Ty* fty = fnv.second;
@@ -1895,34 +3105,185 @@ struct FnEmit {
         return emit_call(fp, ret, args_text(args, fnv.first));
     }
 
+    EV call_direct_fn_value(const EV& fnv, const Expr* e,
+                            const std::string& target) {
+        Ty* fty = fnv.second;
+        std::vector<EV> args;
+        for (size_t i = 0; i < e->args.size(); i++) {
+            Ty* hint = i < fty->fn_nparams() ? fty->args[i] : nullptr;
+            args.push_back(eval(e->args[i].get(), hint));
+        }
+        Ty* ret = fty->fn_ret() ? fty->fn_ret() : cg.t_unit();
+        return emit_call(target, ret, args_text(args, fnv.first));
+    }
+
     EV dec_literal(std::string_view text) {
         Decimal d = Decimal::parse(clean_number(text));
-        std::string r = reg();
-        line(r + " = call ptr @beans_dec_new(i128 " + i128_str(d.coeff) + ", i64 " +
-             std::to_string(d.scale) + ")");
-        own(r, cg.t_dec());
-        return {r, cg.t_dec()};
+        return {packed_decimal(d), cg.t_dec()};
+    }
+
+    bool decimal_literal_value(const Expr* e, Decimal& out) {
+        if (!e || (e->kind != Expr::Kind::int_lit &&
+                   e->kind != Expr::Kind::float_lit))
+            return false;
+        out = Decimal::parse(clean_number(e->text));
+        return true;
+    }
+
+    int known_decimal_scale(const Expr* e) {
+        if (!e) return -1;
+        switch (e->kind) {
+            case Expr::Kind::int_lit:
+            case Expr::Kind::float_lit: {
+                Decimal value = Decimal::parse(clean_number(e->text));
+                return value.scale;
+            }
+            case Expr::Kind::ident: {
+                Var* var = find_var(std::string(e->text));
+                return var && var->ty->k == Ty::dec_ ? var->decimal_scale : -1;
+            }
+            case Expr::Kind::unary:
+                return e->op == TokenKind::minus ? known_decimal_scale(e->rhs.get()) : -1;
+            case Expr::Kind::cast: {
+                if (!e->type || e->type->name != "decimal") return -1;
+                TypeId source = cg.checked_type(e->object.get());
+                return source && source->is_int() ? 0 : -1;
+            }
+            case Expr::Kind::binary: {
+                int left = known_decimal_scale(e->lhs.get());
+                int right = known_decimal_scale(e->rhs.get());
+                if (left < 0 || right < 0) return -1;
+                if (e->op == TokenKind::plus || e->op == TokenKind::minus)
+                    return std::max(left, right);
+                if (e->op == TokenKind::star && left <= 65535 - right)
+                    return left + right;
+                return -1;
+            }
+            case Expr::Kind::if_expr: {
+                int yes = known_decimal_scale(e->then_e.get());
+                int no = known_decimal_scale(e->else_e.get());
+                return yes >= 0 && yes == no ? yes : -1;
+            }
+            default:
+                return -1;
+        }
+    }
+
+    // A fixed-scale add needs no power-of-ten alignment. Decode the signed
+    // 112-bit coefficient with two shifts, check its exact bound, then put the
+    // scale bits back. This is much smaller than the generic decimal helper.
+    EV decimal_literal_add(const EV& lhs, const EV& rhs, Decimal literal,
+                           bool subtract, uint32_t line_no, uint32_t col_no,
+                           bool scale_is_known = false) {
+        const unsigned __int128 coeff_mask =
+            (static_cast<unsigned __int128>(1) << 112) - 1;
+        const unsigned __int128 scale_mask = ~coeff_mask;
+        const __int128 coeff_min =
+            -(static_cast<__int128>(1) << 111);
+        const __int128 coeff_max =
+            (static_cast<__int128>(1) << 111) - 1;
+        const __int128 delta = subtract ? -literal.coeff : literal.coeff;
+
+        auto emit_fixed = [&]() -> EV {
+            std::string shifted = reg(), coeff = reg();
+            line(shifted + " = shl i128 " + lhs.first + ", 16");
+            line(coeff + " = ashr i128 " + shifted + ", 16");
+            const __int128 limit =
+                delta >= 0 ? coeff_max - delta : coeff_min - delta;
+            std::string overflow = reg();
+            line(overflow + " = icmp " +
+                 std::string(delta >= 0 ? "sgt" : "slt") + " i128 " + coeff +
+                 ", " + u128_str(static_cast<unsigned __int128>(limit)));
+            std::string bad = bb(), okay = bb();
+            line("br i1 " + overflow + ", label %" + bad + ", label %" + okay);
+            label(bad);
+            line("call void @beans_panic(ptr " + cg.intern_string("decimal overflow") +
+                 ", i64 " + std::to_string(line_no) + ", i64 " +
+                 std::to_string(col_no) + ")");
+            line("unreachable");
+            label(okay);
+            std::string sum = reg();
+            line(sum + " = add i128 " + coeff + ", " +
+                 u128_str(static_cast<unsigned __int128>(delta)));
+            std::string masked = reg();
+            line(masked + " = and i128 " + sum + ", " + u128_str(coeff_mask));
+            std::string scale_part = reg();
+            line(scale_part + " = and i128 " + lhs.first + ", " +
+                 u128_str(scale_mask));
+            std::string packed = reg();
+            line(packed + " = or i128 " + scale_part + ", " + masked);
+            return {packed, cg.t_dec()};
+        };
+
+        if (scale_is_known) return emit_fixed();
+
+        std::string scale = reg();
+        line(scale + " = lshr i128 " + lhs.first + ", 112");
+        std::string same_scale = reg();
+        line(same_scale + " = icmp eq i128 " + scale + ", " +
+             std::to_string(literal.scale));
+        std::string fast = bb(), slow = bb(), done = bb();
+        std::string result_slot = fresh_slot("decfast", cg.t_dec());
+        line("br i1 " + same_scale + ", label %" + fast + ", label %" + slow);
+
+        label(fast);
+        EV fixed = emit_fixed();
+        line("store i128 " + fixed.first + ", ptr " + result_slot);
+        line("br label %" + done);
+
+        label(slow);
+        std::string fallback = reg();
+        line(fallback + " = call i128 @beans_decv_" +
+             std::string(subtract ? "sub" : "add") + "(i128 " + lhs.first +
+             ", i128 " + rhs.first + ")");
+        line("store i128 " + fallback + ", ptr " + result_slot);
+        line("br label %" + done);
+
+        label(done);
+        std::string result = reg();
+        line(result + " = load i128, ptr " + result_slot);
+        return {result, cg.t_dec()};
     }
 
     EV eval_string(const Expr* e) {
         std::vector<StrPiece> parts = split_interp(e->text, interp_srcs);
         if (parts.empty()) return {cg.intern_string(""), cg.t_str()};
-        std::string acc;
-        bool have = false;
+        struct BuildPiece {
+            int kind; // runtime: 0 string, 1 signed, 2 unsigned, 3 f64, 4 bool
+            std::string type;
+            std::string value;
+        };
+        std::vector<BuildPiece> pieces;
+        pieces.reserve(parts.size());
         for (StrPiece& p : parts) {
             std::string piece;
             if (p.expr) {
                 EV v = eval(p.expr.get());
+                if (!p.spec.has && v.second->k == Ty::i64_) {
+                    pieces.push_back(
+                        {v.second->is_unsigned ? 2 : 1, "i64", to_slot(v)});
+                    continue;
+                }
+                if (!p.spec.has && v.second->k == Ty::i1_) {
+                    std::string z = reg();
+                    line(z + " = zext i1 " + v.first + " to i32");
+                    pieces.push_back({4, "i32", z});
+                    continue;
+                }
+                if (!p.spec.has && v.second->k == Ty::f64_) {
+                    pieces.push_back({3, "double", as_f64(v)});
+                    continue;
+                }
                 if (p.spec.has && p.spec.places >= 0 && v.second->k == Ty::f64_) {
                     std::string fr = reg();
-                    line(fr + " = call ptr @beans_fmt_float(double " + v.first +
+                    line(fr + " = call ptr @beans_fmt_float(double " + as_f64(v) +
                          ", i64 " + std::to_string(p.spec.places) + ")");
                     own(fr, cg.t_str());
                     piece = fr;
                 } else if (p.spec.has && p.spec.places >= 0 &&
                            v.second->k == Ty::dec_) {
                     std::string fr = reg();
-                    line(fr + " = call ptr @beans_fmt_dec(ptr " + v.first +
+                    line(fr + " = call ptr @beans_decv_fmt(i128 " + v.first +
                          ", i64 " + std::to_string(p.spec.places) + ")");
                     own(fr, cg.t_str());
                     piece = fr;
@@ -1940,17 +3301,25 @@ struct FnEmit {
             } else {
                 piece = cg.intern_string(p.text);
             }
-            if (!have) {
-                acc = piece;
-                have = true;
-            } else {
-                std::string r = reg();
-                line(r + " = call ptr @beans_concat(ptr " + acc + ", ptr " + piece + ")");
-                own(r, cg.t_str());
-                acc = r;
-            }
+            pieces.push_back({0, "ptr", piece});
         }
-        return {acc, cg.t_str()};
+        if (pieces.size() == 1 && pieces[0].kind == 0)
+            return {pieces[0].value, cg.t_str()};
+
+        // Interpolation used to concatenate left-to-right. That allocated and
+        // copied every prefix, so `"item{x}_{y}"` made three throwaway
+        // strings. The runtime now also renders scalar pieces straight into
+        // that final allocation, avoiding temporary integer/bool/float strings.
+        std::string args;
+        for (const BuildPiece& piece : pieces) {
+            args += ", i64 " + std::to_string(piece.kind) + ", " + piece.type + " " +
+                    piece.value;
+        }
+        std::string r = reg();
+        line(r + " = call ptr (i64, ...) @beans_interpolate(i64 " +
+             std::to_string(pieces.size()) + args + ")");
+        own(r, cg.t_str());
+        return {r, cg.t_str()};
     }
 
     std::string to_str(const EV& v, const Expr* at) {
@@ -1958,15 +3327,17 @@ struct FnEmit {
         switch (v.second->k) {
             case Ty::str_: return v.first;
             case Ty::i64_:
-                line(r + " = call ptr @beans_from_int(i64 " + v.first + ")");
+                line(r + " = call ptr @beans_from_" +
+                     std::string(v.second->is_unsigned ? "uint" : "int") +
+                     "(i64 " + to_slot(v) + ")");
                 own(r, cg.t_str());
                 return r;
             case Ty::f64_:
-                line(r + " = call ptr @beans_from_float(double " + v.first + ")");
+                line(r + " = call ptr @beans_from_float(double " + as_f64(v) + ")");
                 own(r, cg.t_str());
                 return r;
             case Ty::dec_:
-                line(r + " = call ptr @beans_dec_str(ptr " + v.first + ")");
+                line(r + " = call ptr @beans_decv_str(i128 " + v.first + ")");
                 own(r, cg.t_str());
                 return r;
             case Ty::i1_: {
@@ -1995,6 +3366,125 @@ struct FnEmit {
                 err(at, "printing this value");
                 return cg.intern_string("?");
         }
+    }
+
+    std::string inline_equal(const std::string& left, const std::string& right,
+                             Ty* type) {
+        if (type->k == Ty::f64_) {
+            std::string same = reg();
+            line(same + " = fcmp oeq " + std::string(ll(type)) + " " + left + ", " +
+                 right);
+            return same;
+        }
+        if (type->k == Ty::simd4f32_) {
+            std::string all = "true";
+            for (int i = 0; i < 4; i++) {
+                std::string l = reg(), r = reg(), same = reg();
+                line(l + " = extractelement <4 x float> " + left + ", i32 " +
+                     std::to_string(i));
+                line(r + " = extractelement <4 x float> " + right + ", i32 " +
+                     std::to_string(i));
+                line(same + " = fcmp oeq float " + l + ", " + r);
+                if (all == "true") all = same;
+                else {
+                    std::string combined = reg();
+                    line(combined + " = and i1 " + all + ", " + same);
+                    all = combined;
+                }
+            }
+            return all;
+        }
+        if (type->k == Ty::fixed_array_) {
+            std::string all = "true";
+            for (uint32_t i = 0; i < type->array_len; i++) {
+                std::string l = reg(), r = reg();
+                line(l + " = extractvalue " + std::string(ll(type)) + " " + left + ", " +
+                     std::to_string(i));
+                line(r + " = extractvalue " + std::string(ll(type)) + " " + right + ", " +
+                     std::to_string(i));
+                std::string same = inline_equal(l, r, type->args[0]);
+                if (all == "true") all = same;
+                else {
+                    std::string combined = reg();
+                    line(combined + " = and i1 " + all + ", " + same);
+                    all = combined;
+                }
+            }
+            return all;
+        }
+        if (type->k == Ty::struct_) {
+            std::string all = "true";
+            auto it = cg.impl_by_name.find(type->name);
+            if (it == cg.impl_by_name.end() || it->second->decl->is_union) return "false";
+            for (size_t i = 0; i < it->second->fields.size(); i++) {
+                Ty* field = it->second->fields[i].ty;
+                std::string l = reg(), r = reg();
+                line(l + " = extractvalue " + std::string(ll(type)) + " " + left + ", " +
+                     std::to_string(i));
+                line(r + " = extractvalue " + std::string(ll(type)) + " " + right + ", " +
+                     std::to_string(i));
+                std::string same = inline_equal(l, r, field);
+                if (all == "true") all = same;
+                else {
+                    std::string combined = reg();
+                    line(combined + " = and i1 " + all + ", " + same);
+                    all = combined;
+                }
+            }
+            return all;
+        }
+        if (is_inline_option(type)) {
+            std::string left_has = reg(), right_has = reg();
+            line(left_has + " = extractvalue " + std::string(ll(type)) + " " + left +
+                 ", 0");
+            line(right_has + " = extractvalue " + std::string(ll(type)) + " " + right +
+                 ", 0");
+            std::string tags_same = reg();
+            line(tags_same + " = icmp eq i1 " + left_has + ", " + right_has);
+            std::string left_payload = reg(), right_payload = reg();
+            line(left_payload + " = extractvalue " + std::string(ll(type)) + " " + left +
+                 ", 1");
+            line(right_payload + " = extractvalue " + std::string(ll(type)) + " " +
+                 right + ", 1");
+            std::string payload_same =
+                inline_equal(left_payload, right_payload, type->args[0]);
+            std::string value_same = reg();
+            line(value_same + " = select i1 " + left_has + ", i1 " + payload_same +
+                 ", i1 true");
+            std::string result = reg();
+            line(result + " = and i1 " + tags_same + ", " + value_same);
+            return result;
+        }
+        if (is_inline_result(type)) {
+            std::string left_error = reg(), right_error = reg();
+            line(left_error + " = extractvalue " + std::string(ll(type)) + " " + left +
+                 ", 0");
+            line(right_error + " = extractvalue " + std::string(ll(type)) + " " +
+                 right + ", 0");
+            std::string tags_same = reg();
+            line(tags_same + " = icmp eq i1 " + left_error + ", " + right_error);
+            std::string left_ok = reg(), right_ok = reg();
+            std::string left_err = reg(), right_err = reg();
+            line(left_ok + " = extractvalue " + std::string(ll(type)) + " " + left +
+                 ", 1");
+            line(right_ok + " = extractvalue " + std::string(ll(type)) + " " + right +
+                 ", 1");
+            line(left_err + " = extractvalue " + std::string(ll(type)) + " " + left +
+                 ", 2");
+            line(right_err + " = extractvalue " + std::string(ll(type)) + " " + right +
+                 ", 2");
+            std::string ok_same = inline_equal(left_ok, right_ok, type->args[0]);
+            std::string err_same = inline_equal(left_err, right_err, type->args[1]);
+            std::string payload_same = reg();
+            line(payload_same + " = select i1 " + left_error + ", i1 " + err_same +
+                 ", i1 " + ok_same);
+            std::string result = reg();
+            line(result + " = and i1 " + tags_same + ", " + payload_same);
+            return result;
+        }
+        std::string same = reg();
+        line(same + " = icmp eq " + std::string(ll(type)) + " " + left + ", " + right);
+        return same;
     }
 
     EV eval_binary(const Expr* e) {
@@ -2053,12 +3543,36 @@ struct FnEmit {
             line(r + " = icmp " + (op == TokenKind::eq ? "ne" : "eq") + " i64 " + c + ", 0");
             return {r, cg.t_bool()};
         }
+        if (l.second->k == Ty::fixed_array_) {
+            std::string all = inline_equal(l.first, r2.first, l.second);
+            if (op == TokenKind::neq) {
+                line(r + " = xor i1 " + all + ", 1");
+                return {r, cg.t_bool()};
+            }
+            return {all, cg.t_bool()};
+        }
+        if (l.second->k == Ty::struct_) {
+            std::string all = inline_equal(l.first, r2.first, l.second);
+            if (op == TokenKind::neq) {
+                line(r + " = xor i1 " + all + ", 1");
+                return {r, cg.t_bool()};
+            }
+            return {all, cg.t_bool()};
+        }
         if (l.second->k == Ty::dec_) {
             switch (op) {
                 case TokenKind::plus:
                 case TokenKind::minus:
                 case TokenKind::star:
                 case TokenKind::slash: {
+                    Decimal literal;
+                    if ((op == TokenKind::plus || op == TokenKind::minus) &&
+                        decimal_literal_value(e->rhs.get(), literal))
+                        return decimal_literal_add(l, r2, literal,
+                                                   op == TokenKind::minus,
+                                                   e->line, e->col,
+                                                   known_decimal_scale(e->lhs.get()) ==
+                                                       literal.scale);
                     const char* fn = op == TokenKind::plus    ? "add"
                                      : op == TokenKind::minus ? "sub"
                                      : op == TokenKind::star  ? "mul"
@@ -2066,25 +3580,32 @@ struct FnEmit {
                     if (op == TokenKind::slash) {
                         // div panics on zero; it needs the source position so
                         // the message matches the interpreter's
-                        line(r + " = call ptr @beans_dec_div(ptr " + l.first +
-                             ", ptr " + r2.first + ", i64 " + std::to_string(e->line) +
+                        line(r + " = call i128 @beans_decv_div(i128 " + l.first +
+                             ", i128 " + r2.first + ", i64 " + std::to_string(e->line) +
                              ", i64 " + std::to_string(e->col) + ")");
                     } else {
-                        line(r + " = call ptr @beans_dec_" + fn + "(ptr " + l.first +
-                             ", ptr " + r2.first + ")");
+                        line(r + " = call i128 @beans_decv_" + fn + "(i128 " + l.first +
+                             ", i128 " + r2.first + ")");
                     }
-                    own(r, cg.t_dec());
                     return {r, cg.t_dec()};
                 }
                 default: {
                     std::string c = reg();
-                    line(c + " = call i32 @beans_dec_cmp(ptr " + l.first + ", ptr " +
-                         r2.first + ")");
+                    line(c + " = call i32 @beans_decv_cmp(i128 " + l.first +
+                         ", i128 " + r2.first + ")");
                     return cmp_result(c);
                 }
             }
         }
         if (l.second->k == Ty::enum_) {
+            if (is_inline_option(l.second) || is_inline_result(l.second)) {
+                std::string same = inline_equal(l.first, r2.first, l.second);
+                if (op == TokenKind::neq) {
+                    line(r + " = xor i1 " + same + ", true");
+                    return {r, cg.t_bool()};
+                }
+                return {same, cg.t_bool()};
+            }
             // structural equality like the interpreter's value_eq: tags first,
             // then payload fields, deep. Payload-free enums keep the plain tag
             // compare — same answer, no call.
@@ -2113,17 +3634,20 @@ struct FnEmit {
             return {r, cg.t_bool()};
         }
 
-        bool flt = l.second->k == Ty::f64_;
+        bool flt = l.second->k == Ty::f64_ || l.second->k == Ty::simd4f32_;
         auto arith = [&](const char* iop, const char* fop) -> EV {
-            line(r + " = " + (flt ? fop : iop) + " " + (flt ? "double" : "i64") + " " +
+            line(r + " = " + (flt ? fop : iop) + " " + std::string(ll(l.second)) + " " +
                  l.first + ", " + r2.first);
-            return {r, flt ? cg.t_f64() : cg.t_i64()};
+            r = flt ? normalize_float(r, l.second) : normalize_integer(r, l.second);
+            return {r, l.second};
         };
         auto compare = [&](const char* ipred, const char* fpred) -> EV {
-            if (flt) line(r + " = fcmp " + std::string(fpred) + " double " + l.first + ", " + r2.first);
+            if (flt) line(r + " = fcmp " + std::string(fpred) + " " +
+                          std::string(ll(l.second)) + " " + l.first + ", " + r2.first);
             else if (l.second->k == Ty::i1_)
                 line(r + " = icmp " + std::string(ipred) + " i1 " + l.first + ", " + r2.first);
-            else line(r + " = icmp " + std::string(ipred) + " i64 " + l.first + ", " + r2.first);
+            else line(r + " = icmp " + std::string(ipred) + " " +
+                      std::string(ll(l.second)) + " " + l.first + ", " + r2.first);
             return {r, cg.t_bool()};
         };
         switch (op) {
@@ -2131,22 +3655,34 @@ struct FnEmit {
             case TokenKind::minus: return arith("sub", "fsub");
             case TokenKind::star: return arith("mul", "fmul");
             case TokenKind::slash:
-                if (!flt) guard_div_zero(r2.first, false, e->line, e->col);
-                return arith("sdiv", "fdiv");
+                if (!flt) guard_div_zero(r2.first, l.second, false, e->line, e->col);
+                return arith(l.second->is_unsigned ? "udiv" : "sdiv", "fdiv");
             case TokenKind::percent:
-                if (!flt) guard_div_zero(r2.first, true, e->line, e->col);
-                return arith("srem", "frem");
-            case TokenKind::shl: return arith("shl", "shl");
-            case TokenKind::shr: return arith("ashr", "ashr");
+                if (!flt) guard_div_zero(r2.first, l.second, true, e->line, e->col);
+                return arith(l.second->is_unsigned ? "urem" : "srem", "frem");
+            case TokenKind::shl: {
+                std::string amount = reg();
+                line(amount + " = and " + std::string(ll(l.second)) + " " + r2.first +
+                     ", " + std::to_string((l.second->bits ? l.second->bits : 64) - 1));
+                r2.first = amount;
+                return arith("shl", "shl");
+            }
+            case TokenKind::shr: {
+                std::string amount = reg();
+                line(amount + " = and " + std::string(ll(l.second)) + " " + r2.first +
+                     ", " + std::to_string((l.second->bits ? l.second->bits : 64) - 1));
+                r2.first = amount;
+                return arith(l.second->is_unsigned ? "lshr" : "ashr", "ashr");
+            }
             case TokenKind::amp: return arith("and", "and");
             case TokenKind::pipe: return arith("or", "or");
             case TokenKind::caret: return arith("xor", "xor");
             case TokenKind::eq: return compare("eq", "oeq");
             case TokenKind::neq: return compare("ne", "one");
-            case TokenKind::lt: return compare("slt", "olt");
-            case TokenKind::le: return compare("sle", "ole");
-            case TokenKind::gt: return compare("sgt", "ogt");
-            case TokenKind::ge: return compare("sge", "oge");
+            case TokenKind::lt: return compare(l.second->is_unsigned ? "ult" : "slt", "olt");
+            case TokenKind::le: return compare(l.second->is_unsigned ? "ule" : "sle", "ole");
+            case TokenKind::gt: return compare(l.second->is_unsigned ? "ugt" : "sgt", "ogt");
+            case TokenKind::ge: return compare(l.second->is_unsigned ? "uge" : "sge", "oge");
             default:
                 err(e, "this operator");
                 return {"0", cg.t_i64()};
@@ -2173,6 +3709,28 @@ struct FnEmit {
             return {b, cg.t_enum(obj->resolved, {})};
         }
         EV v = eval(obj);
+        if (v.second->k == Ty::struct_) {
+            auto it = cg.impl_by_name.find(v.second->name);
+            if (it != cg.impl_by_name.end()) {
+                for (size_t i = 0; i < it->second->fields.size(); i++) {
+                    const CImpl::FieldInfo& field = it->second->fields[i];
+                    if (field.name != e->name) continue;
+                    if (it->second->decl->is_union) {
+                        std::string slot = fresh_slot("unionread", v.second);
+                        line("store " + std::string(ll(v.second)) + " " + v.first +
+                             ", ptr " + slot);
+                        std::string result = reg();
+                        line(result + " = load " + std::string(ll(field.ty)) +
+                             ", ptr " + slot);
+                        return {result, field.ty};
+                    }
+                    std::string result = reg();
+                    line(result + " = extractvalue " + std::string(ll(v.second)) + " " +
+                         v.first + ", " + std::to_string(i));
+                    return {result, field.ty};
+                }
+            }
+        }
         if (v.second->k == Ty::obj_) {
             if (v.second->name == "Error") {
                 int off = e->name == "msg" ? 16 : 24;
@@ -2193,9 +3751,10 @@ struct FnEmit {
 
     // exit path: release live temps (keeping the returned value), run armed
     // defers (newest first), release frame-owned locals, then return.
-    void emit_ret(const std::string& ret_instr, const std::string& except = "") {
-        for (const std::string& t : temps) {
-            if (t != except) emit_release(t);
+    void emit_ret(const std::string& ret_instr, const std::string& except = "",
+                  const std::string& moved_slot = "") {
+        for (const EV& t : temps) {
+            if (t.first != except) emit_release_value(t.first, t.second);
         }
         for (auto it = defers.rbegin(); it != defers.rend(); ++it) {
             std::string flag = reg();
@@ -2212,7 +3771,10 @@ struct FnEmit {
             line("br label %" + skipb);
             label(skipb);
         }
-        release_scopes(0);
+        // A direct `return local` can hand the local's frame-owned reference
+        // to the caller. Defers above still saw the live local; only the final
+        // frame drop is skipped. This is the first MIR last-use ARC fold.
+        release_scopes(0, moved_slot);
         if (!deinit_chain.empty()) {
             // parent's deinit after this one is fully done (defers included),
             // while self is still alive — the caller walks the children next
@@ -2222,24 +3784,83 @@ struct FnEmit {
         line(ret_instr);
     }
     bool in_temps(const std::string& v) const {
-        for (const std::string& t : temps) {
-            if (t == v) return true;
+        for (const EV& t : temps) {
+            if (t.first == v) return true;
         }
         return false;
     }
 
     void exec_index_assign(const Stmt* s) {
         EV obj = eval(s->target->object.get());
+        if (obj.second->k == Ty::fixed_array_) {
+            if (s->target->object->kind != Expr::Kind::ident) {
+                cg.err(s->line, s->col, "assigning into this fixed array");
+                return;
+            }
+            Var* owner = find_var(std::string(s->target->object->text));
+            if (!owner) {
+                cg.err(s->line, s->col, "finding this fixed array local");
+                return;
+            }
+            Ty* elem = obj.second->args[0];
+            EV idx = eval(s->target->index_expr.get(), cg.t_i64());
+            std::string index = to_slot(idx), okc = reg();
+            line(okc + " = icmp ult i64 " + index + ", " +
+                 std::to_string(obj.second->array_len));
+            std::string okb = bb(), badb = bb();
+            line("br i1 " + okc + ", label %" + okb + ", label %" + badb);
+            label(badb);
+            line("call void @beans_panic_array_index(i64 " + index + ", i64 " +
+                 std::to_string(obj.second->array_len) + ", i64 " +
+                 std::to_string(s->line) + ", i64 " + std::to_string(s->col) + ")");
+            line("unreachable");
+            label(okb);
+            std::string pointer = reg();
+            line(pointer + " = getelementptr " + std::string(ll(obj.second)) +
+                 ", ptr " + var_ptr(owner) + ", i64 0, i64 " + index);
+            EV value = eval(s->value.get(), elem);
+            if (s->op == TokenKind::assign) {
+                line("store " + std::string(ll(elem)) + " " + value.first +
+                     ", ptr " + pointer);
+                return;
+            }
+            bool floating = elem->k == Ty::f64_;
+            const char* operation = nullptr;
+            switch (s->op) {
+                case TokenKind::plus_eq: operation = floating ? "fadd" : "add"; break;
+                case TokenKind::minus_eq: operation = floating ? "fsub" : "sub"; break;
+                case TokenKind::star_eq: operation = floating ? "fmul" : "mul"; break;
+                case TokenKind::slash_eq:
+                    operation = floating ? "fdiv" : elem->is_unsigned ? "udiv" : "sdiv";
+                    break;
+                case TokenKind::percent_eq:
+                    operation = floating ? "frem" : elem->is_unsigned ? "urem" : "srem";
+                    break;
+                default: return;
+            }
+            if (!floating && (s->op == TokenKind::slash_eq ||
+                              s->op == TokenKind::percent_eq)) {
+                guard_div_zero(value.first, elem, s->op == TokenKind::percent_eq,
+                               s->value->line, s->value->col);
+            }
+            std::string current = reg(), result = reg();
+            line(current + " = load " + std::string(ll(elem)) + ", ptr " + pointer);
+            line(result + " = " + operation + " " + std::string(ll(elem)) + " " +
+                 current + ", " + value.first);
+            line("store " + std::string(ll(elem)) + " " + result + ", ptr " + pointer);
+            return;
+        }
         if (obj.second->k == Ty::list_) {
             Ty* elem = obj.second->args[0];
             EV idx = eval(s->target->index_expr.get());
             std::string len = load_at(obj.first, 8, cg.t_i64());
+            std::string index = to_slot(idx);
             std::string okc = reg();
-            line(okc + " = icmp ult i64 " + idx.first + ", " + len);
+            line(okc + " = icmp ult i64 " + index + ", " + len);
             std::string okb = bb(), badb = bb();
             line("br i1 " + okc + ", label %" + okb + ", label %" + badb);
             label(badb);
-            line("call void @beans_panic_index(i64 " + idx.first + ", i64 " + len +
+            line("call void @beans_panic_index(i64 " + index + ", i64 " + len +
                  ", i64 0, i64 " + std::to_string(s->line) + ", i64 " +
                  std::to_string(s->col) + ")");
             line("unreachable");
@@ -2248,15 +3869,15 @@ struct FnEmit {
             transfer_in(v);
             std::string data = load_at(obj.first, 0, cg.t_str());
             std::string ep = reg();
-            line(ep + " = getelementptr i64, ptr " + data + ", i64 " + idx.first);
-            if (is_rc(elem)) {
+            line(ep + " = getelementptr i64, ptr " + data + ", i64 " + index);
+            if (is_slot_rc(elem)) {
                 std::string oldraw = reg(), oldp = reg();
                 line(oldraw + " = load i64, ptr " + ep);
                 line(oldp + " = inttoptr i64 " + oldraw + " to ptr");
-                line("store i64 " + to_slot(v) + ", ptr " + ep);
+                line("store i64 " + to_slot(v, true) + ", ptr " + ep);
                 emit_release(oldp);
             } else {
-                line("store i64 " + to_slot(v) + ", ptr " + ep);
+                line("store i64 " + to_slot(v, true) + ", ptr " + ep);
             }
             return;
         }
@@ -2269,9 +3890,15 @@ struct FnEmit {
             // the map owns both refs — storing borrows here corrupted the heap
             transfer_in(k);
             transfer_in(v);
-            line("call void @beans_map_set(ptr " + obj.first + ", i64 " + to_slot(k) +
-                 ", i64 " + to_slot(v) + ", i64 " + std::to_string(kind) + ", ptr " +
-                 eq_thunk(K, kind) + ", ptr " + hash_thunk(K, kind) + ")");
+            if (kind == 0) {
+                line("call void @beans_map_set_raw(ptr " + obj.first + ", i64 " +
+                     to_slot(k, true) + ", i64 " + to_slot(v, true) + ")");
+            } else {
+                line("call void @beans_map_set(ptr " + obj.first + ", i64 " +
+                     to_slot(k, true) + ", i64 " + to_slot(v, true) + ", i64 " +
+                     std::to_string(kind) + ", ptr " + eq_thunk(K, kind) + ", ptr " +
+                     hash_thunk(K, kind) + ")");
+            }
             return;
         }
         cg.err(s->line, s->col, "assigning into this");
@@ -2280,6 +3907,23 @@ struct FnEmit {
     // where a field lives, for assignment
     std::pair<std::string, Ty*> field_ptr(const Expr* e) {
         EV v = eval(e->object.get());
+        if (v.second->k == Ty::struct_ && e->object->kind == Expr::Kind::ident) {
+            Var* owner = find_var(std::string(e->object->text));
+            auto it = cg.impl_by_name.find(v.second->name);
+            if (owner && it != cg.impl_by_name.end()) {
+                for (size_t i = 0; i < it->second->fields.size(); i++) {
+                    const CImpl::FieldInfo& field = it->second->fields[i];
+                    if (field.name != e->name) continue;
+                    if (it->second->decl->is_union)
+                        return {var_ptr(owner), field.ty};
+                    std::string pointer = reg();
+                    line(pointer + " = getelementptr " + std::string(ll(v.second)) +
+                         ", ptr " + var_ptr(owner) + ", i64 0, i32 " +
+                         std::to_string(i));
+                    return {pointer, field.ty};
+                }
+            }
+        }
         if (v.second->k == Ty::obj_) {
             auto it = cg.impl_by_name.find(v.second->name);
             if (it != cg.impl_by_name.end()) {
@@ -2311,7 +3955,8 @@ struct FnEmit {
                 err(e, "as? to an interface");
                 return {"null", cg.t_bad()};
             }
-            std::string id = load_at(v.first, 8, cg.t_i64());
+            std::string descriptor = load_at(v.first, 0, cg.t_str());
+            std::string id = load_at(descriptor, 0, cg.t_i64());
             std::string c = reg(), cb = reg();
             line(c + " = call i64 @beans_is_a(i64 " + id + ", i64 " +
                  std::to_string(it->second->id) + ")");
@@ -2320,12 +3965,12 @@ struct FnEmit {
             std::string slot = fresh_slot("asq", cg.t_str()); // ptr slot
             line("br i1 " + cb + ", label %" + yes + ", label %" + no);
             label(yes);
-            std::string sb = box_enum(0, {{v.first, to}});
+            std::string sb = make_option_some({v.first, to}, to);
             consume(sb);
             line("store ptr " + sb + ", ptr " + slot);
             line("br label %" + end);
             label(no);
-            std::string nb = box_enum(1, {});
+            std::string nb = make_option_none(to);
             consume(nb);
             line("store ptr " + nb + ", ptr " + slot);
             line("br label %" + end);
@@ -2338,33 +3983,62 @@ struct FnEmit {
         if (v.second == to) return v;
         std::string r = reg();
         if (v.second->k == Ty::i64_ && to->k == Ty::f64_) {
-            line(r + " = sitofp i64 " + v.first + " to double");
+            line(r + " = " + std::string(v.second->is_unsigned ? "uitofp" : "sitofp") +
+                 " " + std::string(ll(v.second)) + " " + v.first + " to " +
+                 std::string(ll(to)));
             return {r, to};
         }
         if (v.second->k == Ty::f64_ && to->k == Ty::i64_) {
-            line(r + " = fptosi double " + v.first + " to i64");
+            line(r + " = " + std::string(to->is_unsigned ? "fptoui" : "fptosi") +
+                 " " + std::string(ll(v.second)) + " " + v.first + " to " +
+                 std::string(ll(to)));
             return {r, to};
         }
         if (v.second->k == Ty::i64_ && to->k == Ty::dec_) {
-            line(r + " = call ptr @beans_dec_from_int(i64 " + v.first + ")");
-            own(r, to);
+            line(r + " = call i128 @beans_decv_from_int(i64 " + to_slot(v) + ")");
             return {r, to};
         }
         if (v.second->k == Ty::dec_ && to->k == Ty::i64_) {
-            line(r + " = call i64 @beans_dec_to_int(ptr " + v.first + ")");
-            return {r, to};
+            std::string raw = reg();
+            line(raw + " = call i64 @beans_decv_to_int(i128 " + v.first + ")");
+            return {from_slot(raw, to), to};
         }
         if (v.second->k == Ty::f64_ && to->k == Ty::dec_) {
-            line(r + " = call ptr @beans_dec_from_f64(double " + v.first + ")");
-            own(r, to);
+            std::string number = v.first;
+            if (v.second->bits == 32) {
+                number = reg();
+                line(number + " = fpext float " + v.first + " to double");
+            }
+            line(r + " = call i128 @beans_decv_from_f64(double " + number + ")");
             return {r, to};
         }
         if (v.second->k == Ty::dec_ && to->k == Ty::f64_) {
-            line(r + " = call double @beans_dec_to_f64(ptr " + v.first + ")");
+            std::string raw = reg();
+            line(raw + " = call double @beans_decv_to_f64(i128 " + v.first + ")");
+            if (to->bits == 32) {
+                line(r + " = fptrunc double " + raw + " to float");
+                return {r, to};
+            }
+            return {raw, to};
+        }
+        if (v.second->k == Ty::i64_ && to->k == Ty::i64_) {
+            if (v.second->bits == to->bits) return {v.first, to};
+            line(r + " = " +
+                 std::string(v.second->bits > to->bits
+                                 ? "trunc"
+                                 : v.second->is_unsigned ? "zext" : "sext") +
+                 " " + std::string(ll(v.second)) + " " + v.first + " to " +
+                 std::string(ll(to)));
+            return {r, to};
+        }
+        if (v.second->k == Ty::f64_ && to->k == Ty::f64_) {
+            if (v.second->bits == to->bits) return {v.first, to};
+            line(r + " = " + std::string(v.second->bits > to->bits ? "fptrunc" : "fpext") +
+                 " " + std::string(ll(v.second)) + " " + v.first + " to " +
+                 std::string(ll(to)));
             return {r, to};
         }
         if (v.second->k == Ty::obj_ && to->k == Ty::obj_) return {v.first, to}; // upcast
-        if (v.second->k == Ty::i64_ && to->k == Ty::i64_) return v; // sized ints folded
         err(e, "this cast");
         return {v.first, to};
     }
@@ -2397,7 +4071,7 @@ struct FnEmit {
         CImpl* im = nullptr;
         if (cd->generics.empty()) {
             im = cg.request_impl(cd, {}, e->line, e->col);
-        } else if (hint && hint->k == Ty::obj_) {
+        } else if (hint && (hint->k == Ty::obj_ || hint->k == Ty::struct_)) {
             auto it = cg.impl_by_name.find(hint->name);
             if (it != cg.impl_by_name.end()) im = it->second;
         }
@@ -2417,14 +4091,12 @@ struct FnEmit {
 
         std::vector<EV> args = eval_args(e, ini->params, owner->env);
 
-        int size = 16 + 8 * static_cast<int>(im->fields.size());
         long long mask = 0;
         for (const CImpl::FieldInfo& f : im->fields) {
             if (is_rc(f.ty)) mask |= 1LL << (f.offset / 8);
         }
-        std::string o = alloc_bytes(size, fixed_meta(mask));
-        line("store ptr @vt_" + im->mangled + ", ptr " + o);
-        store_at(o, 8, std::to_string(im->id), cg.t_i64());
+        std::string o = alloc_bytes(im->size, fixed_meta(mask));
+        line("store ptr @td_" + im->mangled + ", ptr " + o);
         for (const CImpl::FieldInfo& f : im->fields) {
             if (f.decl->def) {
                 EV v = eval(f.decl->def.get(), f.ty);
@@ -2432,14 +4104,16 @@ struct FnEmit {
                 store_at(o, f.offset, v.first, f.ty);
             } else if (f.ty->k == Ty::f64_) {
                 store_at(o, f.offset, fmt_double(0), f.ty);
-            } else if (f.ty->k == Ty::i64_ || f.ty->k == Ty::i1_) {
+            } else if (f.ty->k == Ty::i64_ || f.ty->k == Ty::i1_ ||
+                       f.ty->k == Ty::dec_) {
                 store_at(o, f.offset, "0", f.ty);
             } else {
                 store_at(o, f.offset, "null", f.ty);
             }
         }
         emit_fin_flag(o, im);
-        emit_call("@m_" + owner->mangled + "_init", cg.t_unit(), args_text(args, o));
+        emit_call("@m_" + owner->mangled + "_init", cg.t_unit(),
+                  args_text(args, o, &ini->params));
         own(o, cg.t_obj(im->mangled));
         return {o, cg.t_obj(im->mangled)};
     }
@@ -2454,22 +4128,31 @@ struct FnEmit {
             Ty* V = is_map_hint ? hint->args[1] : cg.t_i64();
             int kind = eq_kind(K);
             std::string m = reg();
+            bool ordered = is_map_hint && hint->name == "OrderedMap";
             line(m + " = call ptr @beans_map_new(i64 " +
-                 std::string(is_rc(K) ? "1" : "0") + ", i64 " +
-                 std::string(is_rc(V) ? "1" : "0") + ")");
+                 std::string(is_slot_rc(K) ? "1" : "0") + ", i64 " +
+                 std::string(is_slot_rc(V) ? "1" : "0") + ", i64 " +
+                 (ordered ? "1" : "0") + ")");
             for (const InitEntry& en : e->entries) {
                 EV k = en.key ? eval(en.key.get(), K)
                               : EV{cg.intern_string(en.name), cg.t_str()};
                 EV v = eval(en.value.get(), V);
                 transfer_in(k);
                 transfer_in(v);
-                line("call void @beans_map_set(ptr " + m + ", i64 " + to_slot(k) +
-                     ", i64 " + to_slot(v) + ", i64 " + std::to_string(kind) +
-                     ", ptr " + eq_thunk(K, kind) + ", ptr " + hash_thunk(K, kind) +
-                     ")");
+                if (kind == 0) {
+                    line("call void @beans_map_set_raw(ptr " + m + ", i64 " +
+                         to_slot(k, true) + ", i64 " + to_slot(v, true) + ")");
+                } else {
+                    line("call void @beans_map_set(ptr " + m + ", i64 " +
+                         to_slot(k, true) + ", i64 " + to_slot(v, true) +
+                         ", i64 " + std::to_string(kind) +
+                         ", ptr " + eq_thunk(K, kind) + ", ptr " +
+                         hash_thunk(K, kind) + ")");
+                }
             }
-            own(m, cg.t_map(K, V));
-            return {m, cg.t_map(K, V)};
+            Ty* map_type = cg.t_map(K, V, ordered);
+            own(m, map_type);
+            return {m, map_type};
         }
 
         CImpl* im = nullptr;
@@ -2485,7 +4168,7 @@ struct FnEmit {
             for (const TypePtr& t : e->type_args)
                 targs.push_back(rt(t.get(), e->line, e->col));
             im = cg.request_impl(cd, std::move(targs), e->line, e->col);
-        } else if (hint && hint->k == Ty::obj_) {
+        } else if (hint && (hint->k == Ty::obj_ || hint->k == Ty::struct_)) {
             // short init / generic with elided args: the declared type's impl
             auto it = cg.impl_by_name.find(hint->name);
             if (it != cg.impl_by_name.end()) im = it->second;
@@ -2494,14 +4177,50 @@ struct FnEmit {
             err(e, "building this");
             return {"null", cg.t_bad()};
         }
-        int size = 16 + 8 * static_cast<int>(im->fields.size());
+        if (im->decl->is_struct || im->decl->is_union) {
+            Ty* result_ty = cg.t_struct(im->mangled,
+                                        static_cast<uint32_t>(im->size),
+                                        static_cast<uint32_t>(im->align));
+            if (im->decl->is_union) {
+                std::string slot = fresh_slot("unioninit", result_ty);
+                line("store " + std::string(ll(result_ty)) +
+                     " zeroinitializer, ptr " + slot);
+                for (const InitEntry& entry : e->entries) {
+                    for (const CImpl::FieldInfo& field : im->fields) {
+                        if (field.name != entry.name) continue;
+                        EV value = eval(entry.value.get(), field.ty);
+                        line("store " + std::string(ll(field.ty)) + " " + value.first +
+                             ", ptr " + slot);
+                    }
+                }
+                std::string result = reg();
+                line(result + " = load " + std::string(ll(result_ty)) + ", ptr " + slot);
+                return {result, result_ty};
+            }
+            std::string aggregate = "zeroinitializer";
+            for (size_t i = 0; i < im->fields.size(); i++) {
+                const CImpl::FieldInfo& field = im->fields[i];
+                const InitEntry* given = nullptr;
+                for (const InitEntry& entry : e->entries) {
+                    if (entry.name == field.name) given = &entry;
+                }
+                const Expr* source = given ? given->value.get() : field.decl->def.get();
+                if (!source) continue;
+                EV value = eval(source, field.ty);
+                std::string next = reg();
+                line(next + " = insertvalue " + std::string(ll(result_ty)) + " " +
+                     aggregate + ", " + ll(field.ty) + " " + value.first + ", " +
+                     std::to_string(i));
+                aggregate = next;
+            }
+            return {aggregate, result_ty};
+        }
         long long mask = 0;
         for (const CImpl::FieldInfo& f : im->fields) {
             if (is_rc(f.ty)) mask |= 1LL << (f.offset / 8);
         }
-        std::string o = alloc_bytes(size, fixed_meta(mask));
-        line("store ptr @vt_" + im->mangled + ", ptr " + o);
-        store_at(o, 8, std::to_string(im->id), cg.t_i64());
+        std::string o = alloc_bytes(im->size, fixed_meta(mask));
+        line("store ptr @td_" + im->mangled + ", ptr " + o);
         for (const CImpl::FieldInfo& f : im->fields) {
             const InitEntry* given = nullptr;
             for (const InitEntry& en : e->entries) {
@@ -2517,7 +4236,8 @@ struct FnEmit {
                 store_at(o, f.offset, v.first, f.ty);
             } else if (f.ty->k == Ty::f64_) {
                 store_at(o, f.offset, fmt_double(0), f.ty);
-            } else if (f.ty->k == Ty::i64_ || f.ty->k == Ty::i1_) {
+            } else if (f.ty->k == Ty::i64_ || f.ty->k == Ty::i1_ ||
+                       f.ty->k == Ty::dec_) {
                 store_at(o, f.offset, "0", f.ty);
             } else {
                 store_at(o, f.offset, "null", f.ty);
@@ -2538,23 +4258,56 @@ struct FnEmit {
                         : nullptr;
             EV v = eval(e->args[i].get(), h);
             pin_borrow(e->args[i].get(), v);
+            if (i < params.size() && params[i].passing == Param::Passing::take)
+                transfer_in(v);
             out.push_back(v);
         }
         return out;
     }
-    std::string args_text(const std::vector<EV>& args, const std::string& self_val) {
+    std::string args_text(const std::vector<EV>& args, const std::string& self_val,
+                          const std::vector<Param>* params = nullptr) {
         std::string s;
         bool first = true;
         if (!self_val.empty()) {
             s += "ptr " + self_val;
             first = false;
         }
-        for (const EV& a : args) {
+        for (size_t i = 0; i < args.size(); i++) {
+            const EV& a = args[i];
             if (!first) s += ", ";
             first = false;
-            s += std::string(ll(a.second)) + " " + a.first;
+            if (params && i < params->size() &&
+                (*params)[i].passing == Param::Passing::inout)
+                s += "ptr " + a.first;
+            else
+                s += std::string(ll(a.second)) + " " + a.first;
         }
         return s;
+    }
+
+    EV emit_extern_bridge(const FnDecl* function, Ty* result,
+                          const std::vector<EV>& args) {
+        size_t slots = std::max<size_t>(args.size(), 1);
+        std::string pointers = "%v" + std::to_string(next_reg++) + ".ffiargs";
+        allocas += "  " + pointers + " = alloca [" + std::to_string(slots) +
+                   " x ptr]\n";
+        for (size_t i = 0; i < args.size(); i++) {
+            std::string value = fresh_slot("ffiarg", args[i].second);
+            line("store " + std::string(ll(args[i].second)) + " " + args[i].first +
+                 ", ptr " + value);
+            std::string place = reg();
+            line(place + " = getelementptr [" + std::to_string(slots) +
+                 " x ptr], ptr " + pointers + ", i64 0, i64 " + std::to_string(i));
+            line("store ptr " + value + ", ptr " + place);
+        }
+        std::string result_slot = "null";
+        if (result->k != Ty::unit_) result_slot = fresh_slot("ffiret", result);
+        line("call void " + cg.request_extern(function) + "(ptr " + result_slot +
+             ", ptr " + pointers + ")");
+        if (result->k == Ty::unit_) return {"", result};
+        std::string value = reg();
+        line(value + " = load " + std::string(ll(result)) + ", ptr " + result_slot);
+        return {value, result};
     }
 
     // plain or monomorphized call of a top-level fn, local or from a package
@@ -2562,7 +4315,12 @@ struct FnEmit {
         if (f->generics.empty()) {
             std::vector<EV> args = eval_args(e, f->params, CG2::empty_env());
             Ty* ret = cg.resolve(f->ret.get(), CG2::empty_env(), e->line, e->col);
-            return emit_call("@b_" + f->qualname, ret, args_text(args, ""));
+            if (f->is_extern_c && cg.extern_has_aggregate(f))
+                return emit_extern_bridge(f, ret, args);
+            std::string symbol = f->is_extern_c ? cg.request_extern(f)
+                                                 : "@b_" + f->qualname;
+            return emit_call(symbol, ret,
+                             args_text(args, "", &f->params));
         }
         // monomorphize: infer the generic params from the argument types
         std::set<std::string> gens;
@@ -2574,11 +4332,14 @@ struct FnEmit {
             if (i < f->params.size()) {
                 cg.unify_tref(f->params[i].type.get(), a.second, gens, fenv);
             }
+            if (i < f->params.size() &&
+                f->params[i].passing == Param::Passing::take)
+                transfer_in(a);
             args.push_back(std::move(a));
         }
         std::string sym = cg.request_fn(f, fenv);
         Ty* ret = cg.resolve(f->ret.get(), fenv, e->line, e->col);
-        return emit_call(sym, ret, args_text(args, ""));
+        return emit_call(sym, ret, args_text(args, "", &f->params));
     }
     EV emit_call(const std::string& target, Ty* ret, const std::string& args) {
         if (ret->k == Ty::unit_) {
@@ -2598,7 +4359,11 @@ struct FnEmit {
             std::string name(callee->text);
             if (Var* v = find_var(name)) {
                 EV fnv = {var_read(v), v->ty};
-                if (fnv.second->k == Ty::fn_) return call_fn_value(fnv, e);
+                if (fnv.second->k == Ty::fn_) {
+                    if (!v->direct_fn.empty())
+                        return call_direct_fn_value(fnv, e, v->direct_fn);
+                    return call_fn_value(fnv, e);
+                }
                 err(e, "calling this");
                 return {"0", cg.t_i64()};
             }
@@ -2607,18 +4372,20 @@ struct FnEmit {
                                 ? hint->args[0]
                                 : nullptr;
                 EV v = eval(e->args[0].get(), inner);
-                std::string b = box_enum(0, {v});
-                return {b, cg.t_option(inner ? inner : v.second)};
+                Ty* actual = inner ? inner : v.second;
+                std::string b = make_option_some(v, actual);
+                return {b, cg.t_option(actual)};
             }
             if (name == "ok") {
                 Ty* inner = hint && hint->k == Ty::enum_ && !hint->args.empty()
                                 ? hint->args[0]
                                 : nullptr;
                 EV v = eval(e->args[0].get(), inner);
-                std::string b = box_enum(0, {v});
-                return {b, cg.t_result(inner ? inner : v.second,
-                                       hint && hint->args.size() >= 2 ? hint->args[1]
-                                                                      : cg.t_error())};
+                Ty* ok_type = inner ? inner : v.second;
+                Ty* error_type = hint && hint->args.size() >= 2 ? hint->args[1]
+                                                                : cg.t_error();
+                std::string b = make_result_value(true, v, ok_type, error_type);
+                return {b, cg.t_result(ok_type, error_type)};
             }
             if (name == "err") {
                 EV v = eval(e->args[0].get());
@@ -2628,11 +4395,12 @@ struct FnEmit {
                     payload = make_error(v.first);
                     pty = cg.t_error();
                 }
-                std::string b = box_enum(1, {{payload, pty}});
                 Ty* ok = hint && hint->k == Ty::enum_ && !hint->args.empty()
                              ? hint->args[0]
                              : cg.t_i64();
-                return {b, cg.t_result(ok, pty)};
+                Ty* error_type = hint && hint->args.size() >= 2 ? hint->args[1] : pty;
+                std::string b = make_result_value(false, {payload, pty}, ok, error_type);
+                return {b, cg.t_result(ok, error_type)};
             }
             auto fit = cg.fn_decls.find(callee->resolved.empty() ? cg.qual(name)
                                                                  : callee->resolved);
@@ -2727,7 +4495,7 @@ struct FnEmit {
                 }
                 std::vector<EV> args = eval_args(e, ini->params, anc->env);
                 emit_call("@m_" + anc->mangled + "_init", cg.t_unit(),
-                          args_text(args, var_read(sv)));
+                          args_text(args, var_read(sv), &ini->params));
                 return {"", cg.t_unit()};
             }
             // pkg.Class(args) — the checker pinned the class key
@@ -2785,7 +4553,7 @@ struct FnEmit {
                         std::vector<EV> args = eval_args(e, m.params, im->env);
                         Ty* ret = cg.resolve(m.ret.get(), im->env, e->line, e->col);
                         return emit_call("@s_" + im->mangled + "_" + mname, ret,
-                                         args_text(args, ""));
+                                         args_text(args, "", &m.params));
                     }
                 }
             }
@@ -2804,13 +4572,28 @@ struct FnEmit {
                 if (ret->k == Ty::unit_) {
                     t += "  call void %f(ptr %env)\n  ret i64 0\n}\n\n";
                 } else if (ret->k == Ty::f64_) {
-                    t += "  %r = call double %f(ptr %env)\n";
-                    t += "  %b = bitcast double %r to i64\n  ret i64 %b\n}\n\n";
+                    t += "  %r = call " + std::string(ll(ret)) + " %f(ptr %env)\n";
+                    if (ret->bits == 32) {
+                        t += "  %b32 = bitcast float %r to i32\n";
+                        t += "  %b = zext i32 %b32 to i64\n  ret i64 %b\n}\n\n";
+                    } else {
+                        t += "  %b = bitcast double %r to i64\n  ret i64 %b\n}\n\n";
+                    }
                 } else if (ret->k == Ty::i64_) {
-                    t += "  %r = call i64 %f(ptr %env)\n  ret i64 %r\n}\n\n";
+                    t += "  %r = call " + std::string(ll(ret)) + " %f(ptr %env)\n";
+                    if (ret->bits == 64) {
+                        t += "  ret i64 %r\n}\n\n";
+                    } else {
+                        t += "  %z = " + std::string(ret->is_unsigned ? "zext" : "sext") +
+                             " " + std::string(ll(ret)) + " %r to i64\n  ret i64 %z\n}\n\n";
+                    }
                 } else if (ret->k == Ty::i1_) {
                     t += "  %r = call i1 %f(ptr %env)\n";
                     t += "  %z = zext i1 %r to i64\n  ret i64 %z\n}\n\n";
+                } else if (ret->k == Ty::dec_) {
+                    t += "  %r = call i128 %f(ptr %env)\n";
+                    t += "  %p = call ptr @beans_decv_box(i128 %r)\n";
+                    t += "  %z = ptrtoint ptr %p to i64\n  ret i64 %z\n}\n\n";
                 } else {
                     t += "  %r = call ptr %f(ptr %env)\n";
                     t += "  %z = ptrtoint ptr %r to i64\n  ret i64 %z\n}\n\n";
@@ -2823,13 +4606,150 @@ struct FnEmit {
                 own(r, cg.t_kind1(Ty::thread_, ret));
                 return {r, cg.t_kind1(Ty::thread_, ret)};
             }
+            if (n == "Slice" && mname == "from_raw") {
+                Ty* element = hint && hint->k == Ty::slice_ ? hint->args[0]
+                                                             : cg.t_i64();
+                EV pointer = eval(e->args[0].get(), cg.t_rawptr(element));
+                EV length = eval(e->args[1].get(), cg.t_i64());
+                std::string negative = reg();
+                line(negative + " = icmp slt i64 " + length.first + ", 0");
+                std::string neg_bad = bb(), after_negative = bb();
+                line("br i1 " + negative + ", label %" + neg_bad + ", label %" +
+                     after_negative);
+                label(neg_bad);
+                line("call void @beans_panic(ptr " +
+                     cg.intern_string("negative slice length") + ", i64 " +
+                     std::to_string(e->line) + ", i64 " +
+                     std::to_string(e->col) + ")");
+                line("unreachable");
+                label(after_negative);
+                std::string nonempty = reg(), nullp = reg(), invalid = reg();
+                line(nonempty + " = icmp ne i64 " + length.first + ", 0");
+                line(nullp + " = icmp eq ptr " + pointer.first + ", null");
+                line(invalid + " = and i1 " + nonempty + ", " + nullp);
+                std::string null_bad = bb(), ok = bb();
+                line("br i1 " + invalid + ", label %" + null_bad + ", label %" + ok);
+                label(null_bad);
+                line("call void @beans_panic(ptr " +
+                     cg.intern_string("null pointer with non-empty slice") +
+                     ", i64 " + std::to_string(e->line) + ", i64 " +
+                     std::to_string(e->col) + ")");
+                line("unreachable");
+                label(ok);
+                std::string with_pointer = reg(), result = reg();
+                line(with_pointer + " = insertvalue {ptr, i64} poison, ptr " +
+                     pointer.first + ", 0");
+                line(result + " = insertvalue {ptr, i64} " + with_pointer +
+                     ", i64 " + length.first + ", 1");
+                return {result, cg.t_slice(element)};
+            }
+
+            if (n == "Simd4f32") {
+                Ty* vector = cg.t_simd4f32();
+                Ty* f32 = cg.t_float(32);
+                if (mname == "splat") {
+                    EV value = eval(e->args[0].get(), f32);
+                    std::string first = reg(), result = reg();
+                    line(first + " = insertelement <4 x float> poison, float " +
+                         value.first + ", i32 0");
+                    line(result + " = shufflevector <4 x float> " + first +
+                         ", <4 x float> poison, <4 x i32> zeroinitializer");
+                    return {result, vector};
+                }
+                if (mname == "of") {
+                    std::string current = "poison";
+                    for (size_t i = 0; i < 4; i++) {
+                        EV value = eval(e->args[i].get(), f32);
+                        std::string next = reg();
+                        line(next + " = insertelement <4 x float> " + current +
+                             ", float " + value.first + ", i32 " +
+                             std::to_string(i));
+                        current = next;
+                    }
+                    return {current, vector};
+                }
+                if (mname == "load") {
+                    EV pointer = eval(e->args[0].get(), cg.t_rawptr(f32));
+                    std::string nullp = reg();
+                    line(nullp + " = icmp eq ptr " + pointer.first + ", null");
+                    std::string bad = bb(), ok = bb();
+                    line("br i1 " + nullp + ", label %" + bad + ", label %" + ok);
+                    label(bad);
+                    line("call void @beans_panic(ptr " +
+                         cg.intern_string("null SIMD load") + ", i64 " +
+                         std::to_string(e->line) + ", i64 " +
+                         std::to_string(e->col) + ")");
+                    line("unreachable");
+                    label(ok);
+                    std::string result = reg();
+                    line(result + " = load <4 x float>, ptr " + pointer.first +
+                         ", align 1");
+                    return {result, vector};
+                }
+            }
+            if (n == "RawPtr") {
+                Ty* inner = hint && hint->k == Ty::rawptr_ ? hint->args[0] : cg.t_i64();
+                Ty* result = cg.t_rawptr(inner);
+                if (mname == "alloc") {
+                    EV count = eval(e->args[0].get(), cg.t_i64());
+                    std::string r = reg();
+                    line(r + " = call ptr @beans_raw_alloc(i64 " + count.first +
+                         ", i64 " + std::to_string(CG2::value_size(inner)) +
+                         ", i64 " + std::to_string(e->line) + ", i64 " +
+                         std::to_string(e->col) + ")");
+                    return {r, result};
+                }
+                if (mname == "from_address") {
+                    EV address = eval(e->args[0].get(), cg.t_int(64, true));
+                    std::string r = reg();
+                    line(r + " = inttoptr i64 " + address.first + " to ptr");
+                    return {r, result};
+                }
+                if (mname == "null") return {"null", result};
+            }
+            if (n == "Arena" && mname == "new") {
+                EV cap = eval(e->args[0].get(), cg.t_i64());
+                Ty* inner = hint && hint->k == Ty::arena_ ? hint->args[0] : cg.t_i64();
+                std::string r = reg();
+                line(r + " = call ptr @beans_arena_new(i64 " + cap.first + ", i64 " +
+                     std::string(is_slot_rc(inner) ? "1" : "0") + ", i64 " +
+                     std::to_string(e->line) + ", i64 " + std::to_string(e->col) + ")");
+                Ty* result = cg.t_arena(inner);
+                own(r, result);
+                return {r, result};
+            }
+            if (n == "Box" && mname == "new") {
+                Ty* inner = hint && hint->k == Ty::box_ ? hint->args[0] : nullptr;
+                EV v = eval(e->args[0].get(), inner);
+                transfer_in(v);
+                std::string r = reg();
+                line(r + " = call ptr @beans_box_new(i64 " + to_slot(v, true) +
+                     ", i64 " + std::string(is_slot_rc(v.second) ? "1" : "0") +
+                     ")");
+                Ty* result = cg.t_box(inner ? inner : v.second);
+                own(r, result);
+                return {r, result};
+            }
+            if (n == "Shared" && mname == "new") {
+                Ty* inner = hint && hint->k == Ty::shared_ ? hint->args[0] : nullptr;
+                EV v = eval(e->args[0].get(), inner);
+                transfer_in(v);
+                std::string r = reg();
+                line(r + " = call ptr @beans_shared_new(i64 " + to_slot(v, true) +
+                     ", i64 " + std::string(is_slot_rc(v.second) ? "1" : "0") +
+                     ")");
+                Ty* result = cg.t_shared(inner ? inner : v.second);
+                own(r, result);
+                return {r, result};
+            }
             if (n == "Mutex" && mname == "new") {
                 Ty* inner = hint && hint->k == Ty::mutex_ ? hint->args[0] : nullptr;
                 EV v = eval(e->args[0].get(), inner);
                 transfer_in(v);
                 std::string r = reg();
-                line(r + " = call ptr @beans_mutex_new(i64 " + to_slot(v) + ", i64 " +
-                     std::string(is_rc(v.second) ? "1" : "0") + ")");
+                line(r + " = call ptr @beans_mutex_new(i64 " + to_slot(v, true) +
+                     ", i64 " + std::string(is_slot_rc(v.second) ? "1" : "0") +
+                     ")");
                 own(r, cg.t_kind1(Ty::mutex_, v.second));
                 return {r, cg.t_kind1(Ty::mutex_, inner ? inner : v.second)};
             }
@@ -2838,7 +4758,7 @@ struct FnEmit {
                 Ty* elem = hint && hint->k == Ty::chan_ ? hint->args[0] : cg.t_i64();
                 std::string r = reg();
                 line(r + " = call ptr @beans_chan_new(i64 " + cap.first + ", i64 " +
-                     std::string(is_rc(elem) ? "1" : "0") + ")");
+                     std::string(is_slot_rc(elem) ? "1" : "0") + ")");
                 own(r, cg.t_kind1(Ty::chan_, elem));
                 return {r, cg.t_kind1(Ty::chan_, elem)};
             }
@@ -2849,8 +4769,7 @@ struct FnEmit {
                 own(r, cg.t_atomic());
                 return {r, cg.t_atomic()};
             }
-            if (n == "Bytes" || n == "File" || n == "Dir" || n == "MMap" || n == "Path" ||
-                n == "BufReader") {
+            if (n == "Bytes" || n == "File" || n == "Dir" || n == "MMap") {
                 for (const BuiltinStatic& b : builtin_statics()) {
                     if (n != b.cls || mname != b.name) continue;
                     std::string args;
@@ -2896,9 +4815,68 @@ struct FnEmit {
                         std::vector<EV> args = eval_args(e, m.params, im->env);
                         Ty* ret = cg.resolve(m.ret.get(), im->env, e->line, e->col);
                         return emit_call("@s_" + im->mangled + "_" + mname, ret,
-                                         args_text(args, ""));
+                                         args_text(args, "", &m.params));
                     }
                 }
+            }
+        }
+
+        // Scalarize the very common `list.pop().or(default)` chain. A scalar
+        // Option is still boxed at ABI/storage boundaries, but this temporary
+        // never escapes: keep its has-bit in control flow and move the popped
+        // slot straight to the result. Besides avoiding allocation, this keeps
+        // source order: pop happens before the eagerly evaluated default.
+        if (mname == "or" && e->args.size() == 1 && obj->kind == Expr::Kind::call &&
+            obj->args.empty() && obj->callee &&
+            obj->callee->kind == Expr::Kind::field && obj->callee->name == "pop") {
+            const Expr* list_expr = obj->callee->object.get();
+            EV list = eval(list_expr);
+            if (list.second->k == Ty::list_) {
+                Ty* elem = list.second->args[0];
+                std::string len = load_at(list.first, 8, cg.t_i64());
+                std::string has = reg();
+                line(has + " = icmp sgt i64 " + len + ", 0");
+                std::string someb = bb(), noneb = bb(), popped_end = bb();
+                std::string popped_slot = fresh_slot("popraw", elem);
+                line("br i1 " + has + ", label %" + someb + ", label %" + noneb);
+                label(someb);
+                std::string n1 = reg();
+                line(n1 + " = sub i64 " + len + ", 1");
+                store_at(list.first, 8, n1, cg.t_i64());
+                std::string data = load_at(list.first, 0, cg.t_str());
+                std::string ep = reg(), raw = reg();
+                line(ep + " = getelementptr i64, ptr " + data + ", i64 " + n1);
+                line(raw + " = load i64, ptr " + ep);
+                std::string popped = from_slot(raw, elem, true);
+                line("store " + std::string(ll(elem)) + " " + popped + ", ptr " +
+                     popped_slot);
+                line("br label %" + popped_end);
+                label(noneb);
+                line("br label %" + popped_end);
+                label(popped_end);
+
+                EV dflt = eval(e->args[0].get(), elem);
+                if (is_rc(elem)) transfer_in(dflt);
+                std::string use_popped = bb(), use_default = bb(), end = bb();
+                std::string out = fresh_slot("popor", elem);
+                line("br i1 " + has + ", label %" + use_popped + ", label %" +
+                     use_default);
+                label(use_popped);
+                std::string value = reg();
+                line(value + " = load " + std::string(ll(elem)) + ", ptr " +
+                     popped_slot);
+                if (is_rc(elem)) emit_release(dflt.first);
+                line("store " + std::string(ll(elem)) + " " + value + ", ptr " + out);
+                line("br label %" + end);
+                label(use_default);
+                line("store " + std::string(ll(elem)) + " " + dflt.first + ", ptr " +
+                     out);
+                line("br label %" + end);
+                label(end);
+                std::string result = reg();
+                line(result + " = load " + std::string(ll(elem)) + ", ptr " + out);
+                own(result, elem);
+                return {result, elem};
             }
         }
 
@@ -2932,7 +4910,6 @@ struct FnEmit {
             case BT::bytes: return cg.t_bytes();
             case BT::file: return cg.t_file();
             case BT::mmap: return cg.t_mmap();
-            case BT::bufr: return cg.t_bufr();
             case BT::list_str: return cg.t_list(cg.t_str());
             default: return cg.t_i64();
         }
@@ -2971,13 +4948,13 @@ struct FnEmit {
             size_t smark = temps.size();
             std::string okv = from_slot(raw, ok_t);
             if (is_rc(ok_t)) own(okv, ok_t); // runtime hands over its ref
-            std::string sb = box_enum(0, {{okv, ok_t}});
+            std::string sb = make_option_some({okv, ok_t}, ok_t);
             consume(sb);
             line("store ptr " + sb + ", ptr " + slot);
             flush_temps(smark);
             line("br label %" + endb);
             label(noneb);
-            std::string nb = box_enum(1, {});
+            std::string nb = make_option_none(ok_t);
             consume(nb);
             line("store ptr " + nb + ", ptr " + slot);
             line("br label %" + endb);
@@ -2986,56 +4963,6 @@ struct FnEmit {
             line(r + " = load ptr, ptr " + slot);
             own(r, cg.t_option(ok_t));
             return {r, cg.t_option(ok_t)};
-        }
-        if (ret == BT::res_opt_str) {
-            // {i64, ptr}: err set → err(e); val 0 → ok(none); else ok(some(str))
-            Ty* opt_t = cg.t_option(cg.t_str());
-            Ty* res_t = cg.t_result(opt_t, cg.t_error());
-            std::string sr = reg();
-            line(sr + " = call {i64, ptr} @" + std::string(sym) + "(" + args + ")");
-            std::string raw = reg(), errp = reg(), c = reg();
-            line(raw + " = extractvalue {i64, ptr} " + sr + ", 0");
-            line(errp + " = extractvalue {i64, ptr} " + sr + ", 1");
-            line(c + " = icmp eq ptr " + errp + ", null");
-            std::string okb = bb(), errb = bb(), endb = bb();
-            std::string slot = fresh_slot("ros", cg.t_str());
-            line("br i1 " + c + ", label %" + okb + ", label %" + errb);
-            label(okb);
-            std::string c2 = reg();
-            line(c2 + " = icmp ne i64 " + raw + ", 0");
-            std::string someb = bb(), noneb = bb();
-            line("br i1 " + c2 + ", label %" + someb + ", label %" + noneb);
-            label(someb);
-            size_t smark = temps.size();
-            std::string sv = from_slot(raw, cg.t_str());
-            own(sv, cg.t_str()); // runtime hands over its ref
-            std::string inner = box_enum(0, {{sv, cg.t_str()}});
-            std::string ob = box_enum(0, {{inner, opt_t}});
-            consume(ob);
-            line("store ptr " + ob + ", ptr " + slot);
-            flush_temps(smark);
-            line("br label %" + endb);
-            label(noneb);
-            size_t nmark = temps.size();
-            std::string ni = box_enum(1, {});
-            std::string nb = box_enum(0, {{ni, opt_t}});
-            consume(nb);
-            line("store ptr " + nb + ", ptr " + slot);
-            flush_temps(nmark);
-            line("br label %" + endb);
-            label(errb);
-            size_t emark = temps.size();
-            own(errp, cg.t_error()); // ready-made Error object, rc 1, ours
-            std::string eb = box_enum(1, {{errp, cg.t_error()}});
-            consume(eb);
-            line("store ptr " + eb + ", ptr " + slot);
-            flush_temps(emark);
-            line("br label %" + endb);
-            label(endb);
-            std::string r = reg();
-            line(r + " = load ptr, ptr " + slot);
-            own(r, res_t);
-            return {r, res_t};
         }
         switch (ret) {
             case BT::unit:
@@ -3081,7 +5008,7 @@ struct FnEmit {
                     okv = reg();
                     line(okv + " = icmp ne i64 " + raw + ", 0");
                 } else {
-                    okv = from_slot(raw, ok_t);
+                    okv = from_slot(raw, ok_t, ok_t->k == Ty::dec_);
                     if (is_rc(ok_t)) own(okv, ok_t); // runtime hands over its ref
                 }
                 std::string ob = box_enum(0, {{okv, ok_t}});
@@ -3156,11 +5083,15 @@ struct FnEmit {
             std::vector<EV> args = eval_args(e, fm.decl->params, *fm.env);
             Ty* ret = cg.resolve(fm.decl->ret.get(), *fm.env, e->line, e->col);
             int slot = cg.selector(mname);
-            std::string vt = load_at(recv.first, 0, cg.t_str()); // ptr
+            std::string descriptor = load_at(recv.first, 0, cg.t_str());
             std::string sp = reg(), fp = reg();
-            line(sp + " = getelementptr ptr, ptr " + vt + ", i64 " + std::to_string(slot));
+            // Descriptor word 0 is the class id; method slots follow inline.
+            // Keeping the table here saves one dependent load on every call.
+            line(sp + " = getelementptr ptr, ptr " + descriptor + ", i64 " +
+                 std::to_string(slot + 1));
             line(fp + " = load ptr, ptr " + sp);
-            return emit_call(fp, ret, args_text(args, recv.first));
+            return emit_call(fp, ret,
+                             args_text(args, recv.first, &fm.decl->params));
         }
 
         // enum methods (direct) and Option/Result builtins
@@ -3172,25 +5103,23 @@ struct FnEmit {
                         std::vector<EV> args = eval_args(e, m.params, CG2::empty_env());
                         Ty* ret = cg.resolve(m.ret.get(), CG2::empty_env(), e->line, e->col);
                         return emit_call("@em_" + rt_->name + "_" + mname, ret,
-                                         args_text(args, recv.first));
+                                         args_text(args, recv.first, &m.params));
                     }
                 }
             }
             Ty* inner = rt_->args.empty() ? cg.t_i64() : rt_->args[0];
             if (mname == "or") {
                 EV dflt = eval(e->args[0].get(), inner);
-                if (is_rc(inner)) transfer_in(dflt);
-                std::string tag = load_at(recv.first, 0, cg.t_i64());
-                std::string c = reg();
-                line(c + " = icmp eq i64 " + tag + ", 0");
+                if (has_owned_refs(inner)) transfer_in(dflt);
+                std::string c = option_has(recv);
                 std::string hasb = bb(), endb = bb();
                 std::string slot = fresh_slot("orv", inner);
                 line("store " + std::string(ll(inner)) + " " + dflt.first + ", ptr " + slot);
                 line("br i1 " + c + ", label %" + hasb + ", label %" + endb);
                 label(hasb);
-                if (is_rc(inner)) emit_release(dflt.first);
-                std::string payload = load_at(recv.first, 8, inner);
-                if (is_rc(inner)) emit_retain(payload);
+                if (has_owned_refs(inner)) emit_release_value(dflt.first, inner);
+                std::string payload = option_payload(recv, inner);
+                if (has_owned_refs(inner)) emit_retain_value(payload, inner);
                 line("store " + std::string(ll(inner)) + " " + payload + ", ptr " + slot);
                 line("br label %" + endb);
                 label(endb);
@@ -3201,9 +5130,12 @@ struct FnEmit {
             }
             if (mname == "expect") {
                 EV msg = eval(e->args[0].get());
-                std::string tag = load_at(recv.first, 0, cg.t_i64());
-                std::string c = reg();
-                line(c + " = icmp eq i64 " + tag + ", 0");
+                std::string c;
+                if (rt_->name == "Option") {
+                    c = option_has(recv);
+                } else {
+                    c = result_is_ok(recv);
+                }
                 std::string okb = bb(), badb = bb();
                 line("br i1 " + c + ", label %" + okb + ", label %" + badb);
                 label(badb);
@@ -3211,18 +5143,27 @@ struct FnEmit {
                      std::to_string(e->line) + ", i64 " + std::to_string(e->col) + ")");
                 line("unreachable");
                 label(okb);
-                std::string payload = load_at(recv.first, 8, inner);
-                if (is_rc(inner)) {
-                    emit_retain(payload);
+                std::string payload = rt_->name == "Option"
+                                          ? option_payload(recv, inner)
+                                          : result_payload(recv, true);
+                if (has_owned_refs(inner)) {
+                    emit_retain_value(payload, inner);
                     own(payload, inner);
                 }
                 return {payload, inner};
             }
             if (mname == "is_some" || mname == "is_ok" || mname == "is_none") {
-                std::string tag = load_at(recv.first, 0, cg.t_i64());
-                std::string r = reg();
-                line(r + " = icmp " + (mname == "is_none" ? "ne" : "eq") + " i64 " + tag +
-                     ", 0");
+                std::string r;
+                if (rt_->name == "Option") {
+                    r = option_has(recv);
+                    if (mname == "is_none") {
+                        std::string inverted = reg();
+                        line(inverted + " = xor i1 " + r + ", true");
+                        r = inverted;
+                    }
+                } else {
+                    r = result_is_ok(recv);
+                }
                 return {r, cg.t_bool()};
             }
             err(e, "method '" + mname + "'");
@@ -3233,38 +5174,44 @@ struct FnEmit {
         switch (rt_->k) {
             case Ty::i64_:
                 if (mname == "abs") {
+                    if (recv.second->is_unsigned) return recv;
                     std::string neg = reg(), c = reg(), r = reg();
-                    line(neg + " = sub i64 0, " + recv.first);
-                    line(c + " = icmp slt i64 " + recv.first + ", 0");
-                    line(r + " = select i1 " + c + ", i64 " + neg + ", i64 " + recv.first);
-                    return {r, cg.t_i64()};
+                    std::string type = ll(recv.second);
+                    line(neg + " = sub " + type + " 0, " + recv.first);
+                    line(c + " = icmp slt " + type + " " + recv.first + ", 0");
+                    line(r + " = select i1 " + c + ", " + type + " " + neg + ", " +
+                         type + " " + recv.first);
+                    r = normalize_integer(r, recv.second);
+                    return {r, recv.second};
                 }
                 break;
             case Ty::f64_:
                 if (mname == "abs") {
                     std::string r = reg();
-                    line(r + " = call double @llvm.fabs.f64(double " + recv.first + ")");
-                    return {r, cg.t_f64()};
+                    std::string suffix = recv.second->bits == 32 ? "f32" : "f64";
+                    line(r + " = call " + std::string(ll(recv.second)) + " @llvm.fabs." +
+                         suffix + "(" + std::string(ll(recv.second)) + " " + recv.first + ")");
+                    r = normalize_float(r, recv.second);
+                    return {r, recv.second};
                 }
                 if (mname == "round") {
                     std::string r = reg();
-                    line(r + " = call i64 @beans_f64_round(double " + recv.first + ")");
+                    line(r + " = call i64 @beans_f64_round(double " + as_f64(recv) + ")");
                     return {r, cg.t_i64()};
                 }
                 break;
             case Ty::dec_:
                 if (mname == "abs") {
                     std::string r = reg();
-                    line(r + " = call ptr @beans_dec_abs(ptr " + recv.first + ")");
-                    own(r, cg.t_dec()); // fresh BDec — unowned, it leaked
+                    line(r + " = call i128 @beans_decv_abs(i128 " + recv.first + ")");
                     return {r, cg.t_dec()};
                 }
                 if (mname == "round") {
                     EV p = eval(e->args[0].get());
                     std::string r = reg();
-                    line(r + " = call ptr @beans_dec_round(ptr " + recv.first + ", i64 " +
+                    line(r + " = call i128 @beans_decv_round(i128 " + recv.first +
+                         ", i64 " +
                          p.first + ")");
-                    own(r, cg.t_dec());
                     return {r, cg.t_dec()};
                 }
                 break;
@@ -3300,21 +5247,283 @@ struct FnEmit {
                 }
                 break;
             }
-            case Ty::bufr_: {
-                for (const BuiltinMethod& b : builtin_methods()) {
-                    if (b.recv == BT::bufr && mname == b.name) {
-                        return emit_builtin(b, recv, e);
+            case Ty::fixed_array_:
+                if (mname == "len")
+                    return {std::to_string(rt_->array_len), cg.t_i64()};
+                break;
+            case Ty::simd4f32_: {
+                if (mname == "lane") {
+                    EV index = eval(e->args[0].get(), cg.t_i64());
+                    std::string below = reg(), above = reg(), outside = reg();
+                    line(below + " = icmp slt i64 " + index.first + ", 0");
+                    line(above + " = icmp sgt i64 " + index.first + ", 3");
+                    line(outside + " = or i1 " + below + ", " + above);
+                    std::string bad = bb(), ok = bb();
+                    line("br i1 " + outside + ", label %" + bad + ", label %" + ok);
+                    label(bad);
+                    line("call void @beans_panic(ptr " +
+                         cg.intern_string("SIMD lane out of range") + ", i64 " +
+                         std::to_string(e->line) + ", i64 " +
+                         std::to_string(e->col) + ")");
+                    line("unreachable");
+                    label(ok);
+                    std::string result = reg();
+                    line(result + " = extractelement <4 x float> " + recv.first +
+                         ", i64 " + index.first);
+                    return {result, cg.t_float(32)};
+                }
+                if (mname == "sum") {
+                    std::string lane0 = reg(), lane1 = reg(), lane2 = reg(), lane3 = reg();
+                    std::string pair0 = reg(), pair1 = reg(), result = reg();
+                    line(lane0 + " = extractelement <4 x float> " + recv.first + ", i32 0");
+                    line(lane1 + " = extractelement <4 x float> " + recv.first + ", i32 1");
+                    line(lane2 + " = extractelement <4 x float> " + recv.first + ", i32 2");
+                    line(lane3 + " = extractelement <4 x float> " + recv.first + ", i32 3");
+                    line(pair0 + " = fadd float " + lane0 + ", " + lane1);
+                    line(pair1 + " = fadd float " + lane2 + ", " + lane3);
+                    line(result + " = fadd float " + pair0 + ", " + pair1);
+                    return {result, cg.t_float(32)};
+                }
+                if (mname == "store") {
+                    EV pointer = eval(e->args[0].get(), cg.t_rawptr(cg.t_float(32)));
+                    std::string nullp = reg();
+                    line(nullp + " = icmp eq ptr " + pointer.first + ", null");
+                    std::string bad = bb(), ok = bb();
+                    line("br i1 " + nullp + ", label %" + bad + ", label %" + ok);
+                    label(bad);
+                    line("call void @beans_panic(ptr " +
+                         cg.intern_string("null SIMD store") + ", i64 " +
+                         std::to_string(e->line) + ", i64 " +
+                         std::to_string(e->col) + ")");
+                    line("unreachable");
+                    label(ok);
+                    line("store <4 x float> " + recv.first + ", ptr " + pointer.first +
+                         ", align 1");
+                    return {"", cg.t_unit()};
+                }
+                break;
+            }
+            case Ty::slice_: {
+                Ty* element = rt_->args[0];
+                std::string pointer = reg(), length = reg();
+                line(pointer + " = extractvalue {ptr, i64} " + recv.first + ", 0");
+                line(length + " = extractvalue {ptr, i64} " + recv.first + ", 1");
+                if (mname == "len") return {length, cg.t_i64()};
+                if (mname == "as_ptr") return {pointer, cg.t_rawptr(element)};
+                if (mname == "get" || mname == "set") {
+                    EV index = eval(e->args[0].get(), cg.t_i64());
+                    std::string inside = reg();
+                    line(inside + " = icmp ult i64 " + index.first + ", " + length);
+                    std::string ok = bb(), bad = bb();
+                    line("br i1 " + inside + ", label %" + ok + ", label %" + bad);
+                    label(bad);
+                    line("call void @beans_panic_slice_index(i64 " + index.first +
+                         ", i64 " + length + ", i64 " + std::to_string(e->line) +
+                         ", i64 " + std::to_string(e->col) + ")");
+                    line("unreachable");
+                    label(ok);
+                    std::string item_pointer = reg();
+                    line(item_pointer + " = getelementptr " + std::string(ll(element)) +
+                         ", ptr " + pointer + ", i64 " + index.first);
+                    if (mname == "get") {
+                        std::string result = reg();
+                        line(result + " = load " + std::string(ll(element)) +
+                             ", ptr " + item_pointer + ", align 1");
+                        return {result, element};
                     }
+                    EV value = eval(e->args[1].get(), element);
+                    line("store " + std::string(ll(element)) + " " + value.first +
+                         ", ptr " + item_pointer + ", align 1");
+                    return {"", cg.t_unit()};
+                }
+                if (mname == "subslice") {
+                    EV from = eval(e->args[0].get(), cg.t_i64());
+                    EV to = eval(e->args[1].get(), cg.t_i64());
+                    std::string ordered = reg(), within = reg(), valid = reg();
+                    line(ordered + " = icmp ule i64 " + from.first + ", " + to.first);
+                    line(within + " = icmp ule i64 " + to.first + ", " + length);
+                    line(valid + " = and i1 " + ordered + ", " + within);
+                    std::string ok = bb(), bad = bb();
+                    line("br i1 " + valid + ", label %" + ok + ", label %" + bad);
+                    label(bad);
+                    line("call void @beans_panic(ptr " +
+                         cg.intern_string("slice range out of bounds") + ", i64 " +
+                         std::to_string(e->line) + ", i64 " +
+                         std::to_string(e->col) + ")");
+                    line("unreachable");
+                    label(ok);
+                    std::string start = reg(), count = reg();
+                    line(start + " = getelementptr " + std::string(ll(element)) +
+                         ", ptr " + pointer + ", i64 " + from.first);
+                    line(count + " = sub i64 " + to.first + ", " + from.first);
+                    std::string with_pointer = reg(), result = reg();
+                    line(with_pointer + " = insertvalue {ptr, i64} poison, ptr " +
+                         start + ", 0");
+                    line(result + " = insertvalue {ptr, i64} " + with_pointer +
+                         ", i64 " + count + ", 1");
+                    return {result, rt_};
+                }
+                break;
+            }
+            case Ty::rawptr_: {
+                Ty* inner = rt_->args[0];
+                auto guard_null = [&](const char* message) {
+                    std::string nullp = reg();
+                    line(nullp + " = icmp eq ptr " + recv.first + ", null");
+                    std::string bad = bb(), ok = bb();
+                    line("br i1 " + nullp + ", label %" + bad + ", label %" + ok);
+                    label(bad);
+                    line("call void @beans_panic(ptr " + cg.intern_string(message) +
+                         ", i64 " + std::to_string(e->line) + ", i64 " +
+                         std::to_string(e->col) + ")");
+                    line("unreachable");
+                    label(ok);
+                };
+                auto guard_atomic_alignment = [&] {
+                    int align = CG2::value_align(inner);
+                    if (align <= 1) return;
+                    std::string address = reg(), low = reg(), bad_value = reg();
+                    line(address + " = ptrtoint ptr " + recv.first + " to i64");
+                    line(low + " = and i64 " + address + ", " +
+                         std::to_string(align - 1));
+                    line(bad_value + " = icmp ne i64 " + low + ", 0");
+                    std::string bad = bb(), ok = bb();
+                    line("br i1 " + bad_value + ", label %" + bad + ", label %" + ok);
+                    label(bad);
+                    line("call void @beans_panic(ptr " +
+                         cg.intern_string("unaligned raw pointer atomic access") +
+                         ", i64 " + std::to_string(e->line) + ", i64 " +
+                         std::to_string(e->col) + ")");
+                    line("unreachable");
+                    label(ok);
+                };
+                if (mname == "read" || mname == "read_volatile") {
+                    guard_null("null raw pointer read");
+                    std::string value = reg();
+                    line(value + " = load " +
+                         std::string(mname == "read_volatile" ? "volatile " : "") +
+                         std::string(ll(inner)) + ", ptr " + recv.first);
+                    return {value, inner};
+                }
+                if (mname == "write" || mname == "write_volatile") {
+                    EV value = eval(e->args[0].get(), inner);
+                    guard_null("null raw pointer write");
+                    line("store " +
+                         std::string(mname == "write_volatile" ? "volatile " : "") +
+                         std::string(ll(inner)) + " " + value.first + ", ptr " +
+                         recv.first);
+                    return {"", cg.t_unit()};
+                }
+                if (mname == "offset") {
+                    EV count = eval(e->args[0].get(), cg.t_i64());
+                    std::string result = reg();
+                    line(result + " = getelementptr " + std::string(ll(inner)) +
+                         ", ptr " + recv.first + ", i64 " + count.first);
+                    return {result, rt_};
+                }
+                if (mname == "address") {
+                    std::string address = reg();
+                    line(address + " = ptrtoint ptr " + recv.first + " to i64");
+                    return {address, cg.t_int(64, true)};
+                }
+                if (mname == "is_null") {
+                    std::string result = reg();
+                    line(result + " = icmp eq ptr " + recv.first + ", null");
+                    return {result, cg.t_bool()};
+                }
+                if (mname == "element_size") {
+                    return {std::to_string(CG2::value_size(inner)), cg.t_i64()};
+                }
+                if (mname == "element_align") {
+                    return {std::to_string(CG2::value_align(inner)), cg.t_i64()};
+                }
+                if (mname == "copy_from") {
+                    EV source = eval(e->args[0].get(), rt_);
+                    EV count = eval(e->args[1].get(), cg.t_i64());
+                    line("call void @beans_raw_copy(ptr " + recv.first + ", ptr " +
+                         source.first + ", i64 " + count.first + ", i64 " +
+                         std::to_string(CG2::value_size(inner)) + ", i64 " +
+                         std::to_string(e->line) + ", i64 " +
+                         std::to_string(e->col) + ")");
+                    return {"", cg.t_unit()};
+                }
+                if (mname == "fill_zero") {
+                    EV count = eval(e->args[0].get(), cg.t_i64());
+                    line("call void @beans_raw_zero(ptr " + recv.first + ", i64 " +
+                         count.first + ", i64 " +
+                         std::to_string(CG2::value_size(inner)) + ", i64 " +
+                         std::to_string(e->line) + ", i64 " +
+                         std::to_string(e->col) + ")");
+                    return {"", cg.t_unit()};
+                }
+                if (mname == "atomic_load") {
+                    guard_null("null raw pointer atomic load");
+                    guard_atomic_alignment();
+                    std::string value = reg();
+                    line(value + " = load atomic " + std::string(ll(inner)) +
+                         ", ptr " + recv.first + " seq_cst, align " +
+                         std::to_string(CG2::value_align(inner)));
+                    return {value, inner};
+                }
+                if (mname == "atomic_store") {
+                    EV value = eval(e->args[0].get(), inner);
+                    guard_null("null raw pointer atomic store");
+                    guard_atomic_alignment();
+                    line("store atomic " + std::string(ll(inner)) + " " + value.first +
+                         ", ptr " + recv.first + " seq_cst, align " +
+                         std::to_string(CG2::value_align(inner)));
+                    return {"", cg.t_unit()};
+                }
+                if (mname == "atomic_fetch_add") {
+                    EV value = eval(e->args[0].get(), inner);
+                    guard_null("null raw pointer atomic fetch_add");
+                    guard_atomic_alignment();
+                    std::string old = reg();
+                    line(old + " = atomicrmw add ptr " + recv.first + ", " +
+                         std::string(ll(inner)) + " " + value.first + " seq_cst");
+                    return {old, inner};
+                }
+                if (mname == "atomic_compare_exchange") {
+                    EV expected = eval(e->args[0].get(), inner);
+                    EV desired = eval(e->args[1].get(), inner);
+                    guard_null("null raw pointer atomic compare_exchange");
+                    guard_atomic_alignment();
+                    std::string pair = reg(), success = reg();
+                    line(pair + " = cmpxchg ptr " + recv.first + ", " +
+                         std::string(ll(inner)) + " " + expected.first + ", " +
+                         std::string(ll(inner)) + " " + desired.first +
+                         " seq_cst seq_cst");
+                    line(success + " = extractvalue {" + std::string(ll(inner)) +
+                         ", i1} " + pair + ", 1");
+                    return {success, cg.t_bool()};
+                }
+                if (mname == "free") {
+                    line("call void @beans_raw_free(ptr " + recv.first + ")");
+                    return {"", cg.t_unit()};
                 }
                 break;
             }
             case Ty::list_: {
                 Ty* elem = rt_->args[0];
+                if (mname == "clone") {
+                    std::string copy = reg();
+                    line(copy + " = call ptr @beans_list_clone(ptr " + recv.first + ")");
+                    Ty* result = cg.t_list(elem);
+                    own(copy, result);
+                    return {copy, result};
+                }
+                if (mname == "reserve") {
+                    EV capacity = eval(e->args[0].get());
+                    line("call void @beans_list_reserve(ptr " + recv.first + ", i64 " +
+                         capacity.first + ", i64 " + std::to_string(e->line) +
+                         ", i64 " + std::to_string(e->col) + ")");
+                    return {"", cg.t_unit()};
+                }
                 if (mname == "push") {
                     EV v = eval(e->args[0].get(), elem);
                     transfer_in(v);
                     line("call void @beans_list_push(ptr " + recv.first + ", i64 " +
-                         to_slot(v) + ")");
+                         to_slot(v, true) + ")");
                     return {"", cg.t_unit()};
                 }
                 if (mname == "len") {
@@ -3335,14 +5544,14 @@ struct FnEmit {
                     std::string ep = reg(), raw = reg();
                     line(ep + " = getelementptr i64, ptr " + data + ", i64 " + n1);
                     line(raw + " = load i64, ptr " + ep);
-                    std::string popped = from_slot(raw, elem);
+                    std::string popped = from_slot(raw, elem, true);
                     own(popped, elem); // moved out of the list
-                    std::string sb = box_enum(0, {{popped, elem}});
+                    std::string sb = make_option_some({popped, elem}, elem);
                     consume(sb);
                     line("store ptr " + sb + ", ptr " + slot);
                     line("br label %" + endb);
                     label(noneb);
-                    std::string nb = box_enum(1, {});
+                    std::string nb = make_option_none(elem);
                     consume(nb);
                     line("store ptr " + nb + ", ptr " + slot);
                     line("br label %" + endb);
@@ -3365,12 +5574,12 @@ struct FnEmit {
                     std::string ep = reg(), raw = reg();
                     line(ep + " = getelementptr i64, ptr " + data + ", i64 " + idx.first);
                     line(raw + " = load i64, ptr " + ep);
-                    std::string sb = box_enum(0, {{from_slot(raw, elem), elem}});
+                    std::string sb = make_option_some({from_slot(raw, elem), elem}, elem);
                     consume(sb);
                     line("store ptr " + sb + ", ptr " + slot);
                     line("br label %" + endb);
                     label(noneb);
-                    std::string nb = box_enum(1, {});
+                    std::string nb = make_option_none(elem);
                     consume(nb);
                     line("store ptr " + nb + ", ptr " + slot);
                     line("br label %" + endb);
@@ -3393,12 +5602,12 @@ struct FnEmit {
                     std::string slot = fresh_slot("max", cg.t_str());
                     line("br i1 " + c + ", label %" + someb + ", label %" + noneb);
                     label(someb);
-                    std::string sb = box_enum(0, {{from_slot(raw, elem), elem}});
+                    std::string sb = make_option_some({from_slot(raw, elem), elem}, elem);
                     consume(sb);
                     line("store ptr " + sb + ", ptr " + slot);
                     line("br label %" + endb);
                     label(noneb);
-                    std::string nb = box_enum(1, {});
+                    std::string nb = make_option_none(elem);
                     consume(nb);
                     line("store ptr " + nb + ", ptr " + slot);
                     line("br label %" + endb);
@@ -3459,12 +5668,12 @@ struct FnEmit {
                     std::string ep = reg(), raw = reg();
                     line(ep + " = getelementptr i64, ptr " + data + ", i64 " + at);
                     line(raw + " = load i64, ptr " + ep);
-                    std::string sb = box_enum(0, {{from_slot(raw, elem), elem}});
+                    std::string sb = make_option_some({from_slot(raw, elem), elem}, elem);
                     consume(sb);
                     line("store ptr " + sb + ", ptr " + slot);
                     line("br label %" + endb);
                     label(noneb);
-                    std::string nb = box_enum(1, {});
+                    std::string nb = make_option_none(elem);
                     consume(nb);
                     line("store ptr " + nb + ", ptr " + slot);
                     line("br label %" + endb);
@@ -3487,12 +5696,12 @@ struct FnEmit {
                     std::string slot = fresh_slot("min", cg.t_str());
                     line("br i1 " + c + ", label %" + someb + ", label %" + noneb);
                     label(someb);
-                    std::string sb = box_enum(0, {{from_slot(raw, elem), elem}});
+                    std::string sb = make_option_some({from_slot(raw, elem), elem}, elem);
                     consume(sb);
                     line("store ptr " + sb + ", ptr " + slot);
                     line("br label %" + endb);
                     label(noneb);
-                    std::string nb = box_enum(1, {});
+                    std::string nb = make_option_none(elem);
                     consume(nb);
                     line("store ptr " + nb + ", ptr " + slot);
                     line("br label %" + endb);
@@ -3517,12 +5726,12 @@ struct FnEmit {
                     std::string slot = fresh_slot("iof", cg.t_str());
                     line("br i1 " + c + ", label %" + someb + ", label %" + noneb);
                     label(someb);
-                    std::string sb = box_enum(0, {{raw, cg.t_i64()}});
+                    std::string sb = make_option_some({raw, cg.t_i64()}, cg.t_i64());
                     consume(sb);
                     line("store ptr " + sb + ", ptr " + slot);
                     line("br label %" + endb);
                     label(noneb);
-                    std::string nb = box_enum(1, {});
+                    std::string nb = make_option_none(cg.t_i64());
                     consume(nb);
                     line("store ptr " + nb + ", ptr " + slot);
                     line("br label %" + endb);
@@ -3537,7 +5746,7 @@ struct FnEmit {
                     EV v = eval(e->args[1].get(), elem);
                     transfer_in(v);
                     line("call void @beans_list_insert(ptr " + recv.first + ", i64 " +
-                         idx.first + ", i64 " + to_slot(v) + ", i64 " +
+                         idx.first + ", i64 " + to_slot(v, true) + ", i64 " +
                          std::to_string(e->line) + ", i64 " + std::to_string(e->col) +
                          ")");
                     return {"", cg.t_unit()};
@@ -3548,7 +5757,7 @@ struct FnEmit {
                     line(raw + " = call i64 @beans_list_remove(ptr " + recv.first +
                          ", i64 " + idx.first + ", i64 " + std::to_string(e->line) +
                          ", i64 " + std::to_string(e->col) + ")");
-                    std::string v = from_slot(raw, elem);
+                    std::string v = from_slot(raw, elem, true);
                     if (is_rc(elem)) own(v, elem); // moved out of the list
                     return {v, elem};
                 }
@@ -3584,6 +5793,13 @@ struct FnEmit {
                          thunk + ", ptr " + clo.first + ")");
                     return {"", cg.t_unit()};
                 }
+                if (mname == "sort_by_key") {
+                    EV clo = eval(e->args[0].get());
+                    std::string thunk = cg.request_sort_key_thunk(elem);
+                    line("call void @beans_list_sort_by_key(ptr " + recv.first +
+                         ", ptr " + thunk + ", ptr " + clo.first + ")");
+                    return {"", cg.t_unit()};
+                }
                 break;
             }
             case Ty::map_: {
@@ -3592,37 +5808,88 @@ struct FnEmit {
                 int kind = eq_kind(K);
                 std::string keq = eq_thunk(K, kind);
                 std::string khash = hash_thunk(K, kind);
+                if (mname == "clone") {
+                    std::string copy = reg();
+                    line(copy + " = call ptr @beans_map_clone(ptr " + recv.first +
+                         ", i64 " + std::to_string(kind) + ", ptr " + khash + ")");
+                    Ty* result = rt_;
+                    own(copy, result);
+                    return {copy, result};
+                }
+                if (mname == "reserve") {
+                    EV capacity = eval(e->args[0].get());
+                    line("call void @beans_map_reserve(ptr " + recv.first + ", i64 " +
+                         capacity.first + ", i64 " + std::to_string(kind) +
+                         ", ptr " + khash + ", i64 " + std::to_string(e->line) +
+                         ", i64 " + std::to_string(e->col) + ")");
+                    return {"", cg.t_unit()};
+                }
                 if (mname == "set") {
                     EV k = eval(e->args[0].get(), K);
                     EV v = eval(e->args[1].get(), V);
                     transfer_in(k);
                     transfer_in(v);
-                    line("call void @beans_map_set(ptr " + recv.first + ", i64 " +
-                         to_slot(k) + ", i64 " + to_slot(v) + ", i64 " +
-                         std::to_string(kind) + ", ptr " + keq + ", ptr " + khash +
-                         ")");
+                    if (kind == 0) {
+                        line("call void @beans_map_set_raw(ptr " + recv.first +
+                             ", i64 " + to_slot(k, true) + ", i64 " +
+                             to_slot(v, true) + ")");
+                    } else {
+                        line("call void @beans_map_set(ptr " + recv.first + ", i64 " +
+                             to_slot(k, true) + ", i64 " + to_slot(v, true) +
+                             ", i64 " +
+                             std::to_string(kind) + ", ptr " + keq + ", ptr " +
+                             khash + ")");
+                    }
                     return {"", cg.t_unit()};
+                }
+                if (mname == "insert") {
+                    EV k = eval(e->args[0].get(), K);
+                    EV v = eval(e->args[1].get(), V);
+                    transfer_in(k);
+                    transfer_in(v);
+                    std::string raw = reg(), result = reg();
+                    if (kind == 0) {
+                        line(raw + " = call i64 @beans_map_insert_raw(ptr " +
+                             recv.first + ", i64 " + to_slot(k, true) + ", i64 " +
+                             to_slot(v, true) + ")");
+                    } else {
+                        line(raw + " = call i64 @beans_map_insert(ptr " + recv.first +
+                             ", i64 " + to_slot(k, true) + ", i64 " +
+                             to_slot(v, true) + ", i64 " + std::to_string(kind) +
+                             ", ptr " + keq + ", ptr " + khash + ")");
+                    }
+                    line(result + " = icmp ne i64 " + raw + ", 0");
+                    return {result, cg.t_bool()};
                 }
                 if (mname == "get") {
                     EV k = eval(e->args[0].get(), K);
-                    std::string okf = fresh_slot("gokf", cg.t_i64());
                     std::string raw = reg();
-                    line(raw + " = call i64 @beans_map_get(ptr " + recv.first + ", i64 " +
-                         to_slot(k) + ", i64 " + std::to_string(kind) + ", ptr " + okf +
-                         ", ptr " + keq + ", ptr " + khash + ")");
                     std::string okv = reg(), c = reg();
-                    line(okv + " = load i64, ptr " + okf);
+                    if (kind == 0) {
+                        std::string pair = reg();
+                        line(pair + " = call {i64, i64} @beans_map_get_raw(ptr " +
+                             recv.first + ", i64 " + to_slot(k) + ")");
+                        line(raw + " = extractvalue {i64, i64} " + pair + ", 0");
+                        line(okv + " = extractvalue {i64, i64} " + pair + ", 1");
+                    } else {
+                        std::string okf = fresh_slot("gokf", cg.t_i64());
+                        line(raw + " = call i64 @beans_map_get(ptr " + recv.first +
+                             ", i64 " + to_slot(k) + ", i64 " +
+                             std::to_string(kind) + ", ptr " + okf + ", ptr " + keq +
+                             ", ptr " + khash + ")");
+                        line(okv + " = load i64, ptr " + okf);
+                    }
                     line(c + " = icmp ne i64 " + okv + ", 0");
                     std::string someb = bb(), noneb = bb(), endb = bb();
                     std::string slot = fresh_slot("mg", cg.t_str());
                     line("br i1 " + c + ", label %" + someb + ", label %" + noneb);
                     label(someb);
-                    std::string sb = box_enum(0, {{from_slot(raw, V), V}});
+                    std::string sb = make_option_some({from_slot(raw, V), V}, V);
                     consume(sb);
                     line("store ptr " + sb + ", ptr " + slot);
                     line("br label %" + endb);
                     label(noneb);
-                    std::string nb = box_enum(1, {});
+                    std::string nb = make_option_none(V);
                     consume(nb);
                     line("store ptr " + nb + ", ptr " + slot);
                     line("br label %" + endb);
@@ -3637,6 +5904,13 @@ struct FnEmit {
                 }
                 if (mname == "contains") {
                     EV k = eval(e->args[0].get(), K);
+                    if (kind == 0) {
+                        std::string raw = reg(), r = reg();
+                        line(raw + " = call i64 @beans_map_contains_raw(ptr " +
+                             recv.first + ", i64 " + to_slot(k) + ")");
+                        line(r + " = icmp ne i64 " + raw + ", 0");
+                        return {r, cg.t_bool()};
+                    }
                     std::string okf = fresh_slot("cokf", cg.t_i64());
                     std::string raw = reg();
                     (void)raw;
@@ -3652,9 +5926,14 @@ struct FnEmit {
                 if (mname == "remove") {
                     EV k = eval(e->args[0].get(), K);
                     std::string c = reg(), r = reg();
-                    line(c + " = call i64 @beans_map_remove(ptr " + recv.first +
-                         ", i64 " + to_slot(k) + ", i64 " + std::to_string(kind) +
-                         ", ptr " + keq + ", ptr " + khash + ")");
+                    if (kind == 0) {
+                        line(c + " = call i64 @beans_map_remove_raw(ptr " + recv.first +
+                             ", i64 " + to_slot(k) + ")");
+                    } else {
+                        line(c + " = call i64 @beans_map_remove(ptr " + recv.first +
+                             ", i64 " + to_slot(k) + ", i64 " + std::to_string(kind) +
+                             ", ptr " + keq + ", ptr " + khash + ")");
+                    }
                     line(r + " = icmp ne i64 " + c + ", 0");
                     return {r, cg.t_bool()};
                 }
@@ -3672,13 +5951,137 @@ struct FnEmit {
                 }
                 break;
             }
+            case Ty::arena_: {
+                Ty* inner = rt_->args[0];
+                if (mname == "put") {
+                    EV value = eval(e->args[0].get(), inner);
+                    transfer_in(value);
+                    std::string handle = reg();
+                    line(handle + " = call i64 @beans_arena_put(ptr " + recv.first +
+                         ", i64 " + to_slot(value, true) + ")");
+                    return {handle, cg.t_i64()};
+                }
+                if (mname == "get") {
+                    EV handle = eval(e->args[0].get(), cg.t_i64());
+                    std::string ok_slot = fresh_slot("arena.ok", cg.t_i64());
+                    std::string raw = reg();
+                    line(raw + " = call i64 @beans_arena_get(ptr " + recv.first +
+                         ", i64 " + handle.first + ", ptr " + ok_slot + ")");
+                    std::string ok = reg(), cond = reg();
+                    line(ok + " = load i64, ptr " + ok_slot);
+                    line(cond + " = icmp ne i64 " + ok + ", 0");
+                    std::string someb = bb(), noneb = bb(), endb = bb();
+                    std::string slot = fresh_slot("arena.option", cg.t_str());
+                    line("br i1 " + cond + ", label %" + someb + ", label %" + noneb);
+                    label(someb);
+                    std::string sb = make_option_some({from_slot(raw, inner), inner}, inner);
+                    consume(sb);
+                    line("store ptr " + sb + ", ptr " + slot);
+                    line("br label %" + endb);
+                    label(noneb);
+                    std::string nb = make_option_none(inner);
+                    consume(nb);
+                    line("store ptr " + nb + ", ptr " + slot);
+                    line("br label %" + endb);
+                    label(endb);
+                    std::string result = reg();
+                    line(result + " = load ptr, ptr " + slot);
+                    own(result, cg.t_option(inner));
+                    return {result, cg.t_option(inner)};
+                }
+                if (mname == "at") {
+                    EV handle = eval(e->args[0].get(), cg.t_i64());
+                    std::string raw = reg();
+                    line(raw + " = call i64 @beans_arena_at(ptr " + recv.first +
+                         ", i64 " + handle.first + ", i64 " +
+                         std::to_string(e->line) + ", i64 " +
+                         std::to_string(e->col) + ")");
+                    std::string value = from_slot(raw, inner);
+                    if (is_rc(inner)) {
+                        emit_retain(value);
+                        own(value, inner);
+                    }
+                    return {value, inner};
+                }
+                if (mname == "len") {
+                    std::string len = reg();
+                    line(len + " = call i64 @beans_arena_len(ptr " + recv.first + ")");
+                    return {len, cg.t_i64()};
+                }
+                if (mname == "clear") {
+                    line("call void @beans_arena_clear(ptr " + recv.first + ")");
+                    return {"", cg.t_unit()};
+                }
+                break;
+            }
+            case Ty::box_: {
+                Ty* inner = rt_->args[0];
+                if (mname == "get") {
+                    std::string raw = reg();
+                    line(raw + " = call i64 @beans_box_get(ptr " + recv.first + ")");
+                    std::string value = from_slot(raw, inner);
+                    if (is_rc(inner)) {
+                        emit_retain(value);
+                        own(value, inner);
+                    }
+                    return {value, inner};
+                }
+                if (mname == "set") {
+                    EV value = eval(e->args[0].get(), inner);
+                    transfer_in(value);
+                    line("call void @beans_box_set(ptr " + recv.first + ", i64 " +
+                         to_slot(value, true) + ")");
+                    return {"", cg.t_unit()};
+                }
+                break;
+            }
+            case Ty::shared_: {
+                Ty* inner = rt_->args[0];
+                if (mname == "get") {
+                    std::string raw = reg();
+                    line(raw + " = call i64 @beans_shared_get(ptr " + recv.first + ")");
+                    std::string value = from_slot(raw, inner);
+                    if (is_rc(inner)) {
+                        emit_retain(value);
+                        own(value, inner);
+                    }
+                    return {value, inner};
+                }
+                if (mname == "downgrade") {
+                    std::string weak = reg();
+                    line(weak + " = call ptr @beans_shared_downgrade(ptr " + recv.first +
+                         ")");
+                    Ty* result = cg.t_weak(inner);
+                    own(weak, result);
+                    return {weak, result};
+                }
+                break;
+            }
+            case Ty::weak_: {
+                Ty* inner = rt_->args[0];
+                if (mname == "upgrade") {
+                    std::string strong = reg();
+                    line(strong + " = call ptr @beans_weak_upgrade(ptr " + recv.first +
+                         ")");
+                    Ty* result = cg.t_option(cg.t_shared(inner));
+                    own(strong, result);
+                    return {strong, result};
+                }
+                if (mname == "expired") {
+                    std::string raw = reg(), result = reg();
+                    line(raw + " = call i64 @beans_weak_expired(ptr " + recv.first + ")");
+                    line(result + " = icmp ne i64 " + raw + ", 0");
+                    return {result, cg.t_bool()};
+                }
+                break;
+            }
             case Ty::thread_: {
                 if (mname == "join") {
                     Ty* ret = rt_->args[0];
                     std::string raw = reg();
                     line(raw + " = call i64 @beans_thread_join(ptr " + recv.first + ")");
                     if (ret->k == Ty::unit_) return {"", cg.t_unit()};
-                    return {from_slot(raw, ret), ret};
+                    return {from_slot(raw, ret, true), ret};
                 }
                 break;
             }
@@ -3704,7 +6107,7 @@ struct FnEmit {
                     transfer_in(v);
                     std::string ok = reg();
                     line(ok + " = call i64 @beans_chan_send(ptr " + recv.first + ", i64 " +
-                         to_slot(v) + ")");
+                         to_slot(v, true) + ")");
                     std::string c = reg();
                     line(c + " = icmp ne i64 " + ok + ", 0");
                     std::string okb = bb(), badb = bb();
@@ -3729,14 +6132,14 @@ struct FnEmit {
                     std::string slot = fresh_slot("rv", cg.t_str());
                     line("br i1 " + c + ", label %" + someb + ", label %" + noneb);
                     label(someb);
-                    std::string recvd = from_slot(raw, elem);
+                    std::string recvd = from_slot(raw, elem, true);
                     own(recvd, elem); // the queue's ref moves to us
-                    std::string sb = box_enum(0, {{recvd, elem}});
+                    std::string sb = make_option_some({recvd, elem}, elem);
                     consume(sb);
                     line("store ptr " + sb + ", ptr " + slot);
                     line("br label %" + endb);
                     label(noneb);
-                    std::string nb = box_enum(1, {});
+                    std::string nb = make_option_none(elem);
                     consume(nb);
                     line("store ptr " + nb + ", ptr " + slot);
                     line("br label %" + endb);
@@ -3783,7 +6186,7 @@ struct FnEmit {
     // ---- match ----
     EV eval_match(const Expr* e, Ty* hint) {
         EV subj = eval(e->subject.get());
-        pin_borrow(e->subject.get(), subj);
+        if (cg.hir.mir().match_subject_needs_pin(e)) pin_borrow(e->subject.get(), subj);
         std::string endb = bb();
         // any block arm means statement position (checker-enforced): the whole
         // match is valueless and expr-arm values die as arm-local temps —
@@ -3798,7 +6201,10 @@ struct FnEmit {
         // previous iteration's already-dead pointer
         auto make_slot = [&] {
             slot = fresh_slot("mat", result);
-            if (is_rc(result)) entry_inits += "  store ptr null, ptr " + slot + "\n";
+            if (has_owned_refs(result))
+                entry_inits += "  store " + std::string(ll(result)) + " " +
+                               (is_rc(result) ? "null" : "zeroinitializer") +
+                               ", ptr " + slot + "\n";
         };
         if (result && result->k != Ty::unit_) make_slot();
 
@@ -3835,7 +6241,7 @@ struct FnEmit {
                 }
             }
             if (result && !unit_result && v.second->k != Ty::unit_) {
-                if (is_rc(result)) transfer_in(v);
+                if (has_owned_refs(result)) transfer_in(v);
                 line("store " + std::string(ll(result)) + " " + v.first + ", ptr " + slot);
             }
             if (!terminated) {
@@ -3848,7 +6254,9 @@ struct FnEmit {
         if (unit_result || !result) return {"", cg.t_unit()};
         std::string r = reg();
         line(r + " = load " + std::string(ll(result)) + ", ptr " + slot);
-        if (is_rc(result)) line("store ptr null, ptr " + slot);
+        if (has_owned_refs(result))
+            line("store " + std::string(ll(result)) + " " +
+                 (is_rc(result) ? "null" : "zeroinitializer") + ", ptr " + slot);
         own(r, result);
         return {r, result};
     }
@@ -3880,34 +6288,60 @@ struct FnEmit {
                          lit.first + ")");
                     line(r + " = icmp eq i32 " + c + ", 0");
                 } else if (subj.second->k == Ty::f64_) {
-                    line(r + " = fcmp oeq double " + subj.first + ", " + lit.first);
+                    line(r + " = fcmp oeq " + std::string(ll(subj.second)) + " " +
+                         subj.first + ", " + lit.first);
                 } else if (subj.second->k == Ty::i1_) {
                     line(r + " = icmp eq i1 " + subj.first + ", " + lit.first);
                 } else if (subj.second->k == Ty::dec_) {
                     std::string c = reg();
-                    line(c + " = call i32 @beans_dec_cmp(ptr " + subj.first + ", ptr " +
-                         lit.first + ")");
+                    line(c + " = call i32 @beans_decv_cmp(i128 " + subj.first +
+                         ", i128 " + lit.first + ")");
                     line(r + " = icmp eq i32 " + c + ", 0");
                 } else {
-                    line(r + " = icmp eq i64 " + subj.first + ", " + lit.first);
+                    line(r + " = icmp eq " + std::string(ll(subj.second)) + " " +
+                         subj.first + ", " + lit.first);
                 }
                 return r;
             }
             case Pattern::Kind::range: {
-                EV lo = eval(p->lit.get());
-                EV hi = eval(p->lit2.get());
+                EV lo = eval(p->lit.get(), subj.second);
+                EV hi = eval(p->lit2.get(), subj.second);
                 std::string a = reg(), b2 = reg(), r = reg();
-                line(a + " = icmp sge i64 " + subj.first + ", " + lo.first);
-                line(b2 + " = icmp " + (p->inclusive ? "sle" : "slt") + " i64 " +
+                std::string ge = subj.second->is_unsigned ? "uge" : "sge";
+                std::string end = p->inclusive
+                                      ? (subj.second->is_unsigned ? "ule" : "sle")
+                                      : (subj.second->is_unsigned ? "ult" : "slt");
+                line(a + " = icmp " + ge + " " + std::string(ll(subj.second)) + " " +
+                     subj.first + ", " + lo.first);
+                line(b2 + " = icmp " + end + " " + std::string(ll(subj.second)) + " " +
                      subj.first + ", " + hi.first);
                 line(r + " = and i1 " + a + ", " + b2);
                 return r;
             }
             case Pattern::Kind::name: {
                 int tag = cg.variant_tag(subj.second->name, p->name);
-                std::string t = load_at(subj.first, 0, cg.t_i64());
+                if (subj.second->name == "Option" && is_inline_option(subj.second)) {
+                    std::string has = option_has(subj);
+                    if (tag == 0) return has;
+                    std::string none = reg();
+                    line(none + " = xor i1 " + has + ", true");
+                    return none;
+                }
+                if (subj.second->name == "Result" && is_inline_result(subj.second)) {
+                    std::string ok = result_is_ok(subj);
+                    if (tag == 0) return ok;
+                    std::string error = reg();
+                    line(error + " = xor i1 " + ok + ", true");
+                    return error;
+                }
                 std::string r = reg();
-                line(r + " = icmp eq i64 " + t + ", " + std::to_string(tag));
+                if (is_niche_option(subj.second)) {
+                    line(r + " = icmp " + std::string(tag == 0 ? "ne" : "eq") +
+                         " ptr " + subj.first + ", null");
+                } else {
+                    std::string t = load_at(subj.first, 0, cg.t_i64());
+                    line(r + " = icmp eq i64 " + t + ", " + std::to_string(tag));
+                }
                 return r;
             }
         }
@@ -3940,7 +6374,14 @@ struct FnEmit {
         std::vector<Ty*> ptys =
             payload_types(subj.second->name, p->name, subj.second->args, p->line, p->col);
         for (size_t i = 0; i < p->bindings.size() && i < ptys.size(); i++) {
-            std::string v = load_at(subj.first, 8 + 8 * static_cast<int>(i), ptys[i]);
+            std::string v;
+            if (subj.second->name == "Option" && i == 0) {
+                v = option_payload(subj, ptys[i]);
+            } else if (subj.second->name == "Result" && i == 0) {
+                v = result_payload(subj, p->name == "ok");
+            } else {
+                v = load_slot_at(subj.first, 8 + 8 * static_cast<int>(i), ptys[i]);
+            }
             std::string slot = alloc_slot(p->bindings[i].name, ptys[i]);
             line("store " + std::string(ll(ptys[i])) + " " + v + ", ptr " + slot);
         }
@@ -3969,27 +6410,41 @@ struct FnEmit {
                 Ty* t = rt(s->type.get(), s->line, s->col);
                 if (t->k == Ty::bad_ || t->k == Ty::unit_) return;
                 bool borrow = false;
-                if (is_rc(t) && s->init && s->init->kind == Expr::Kind::ident) {
+                if (has_owned_refs(t) && s->init && s->init->kind == Expr::Kind::ident) {
                     std::string src(s->init->text);
                     Var* sv = find_var(src);
                     borrow = sv && !sv->boxed && !boxed_names.count(s->name) &&
+                             !taken_names.count(s->name) &&
                              !ever_assigned(src) && !ever_assigned(s->name);
                 }
                 EV v = eval(s->init.get(), t);
                 if (!borrow) transfer_in(v);
                 alloc_slot(s->name, t);
                 Var* var = find_var(s->name);
-                var->owned = !borrow && (is_rc(t) || var->boxed);
+                var->owned = !borrow && (has_owned_refs(t) || var->boxed);
+                if (t->k == Ty::dec_)
+                    var->decimal_scale = known_decimal_scale(s->init.get());
+                if (s->init && s->init->kind == Expr::Kind::closure &&
+                    !ever_assigned(s->name)) {
+                    auto known = closure_symbols.find(s->init.get());
+                    if (known != closure_symbols.end()) var->direct_fn = known->second;
+                }
                 line("store " + std::string(ll(t)) + " " + v.first + ", ptr " +
                      var_ptr(var));
+                if (!var->live_flag.empty())
+                    line("store i1 " + std::string(var->owned ? "1" : "0") +
+                         ", ptr " + var->live_flag);
                 break;
             }
             case Stmt::Kind::assign: {
                 std::string ptr;
                 Ty* t = nullptr;
+                Var* local_var = nullptr;
                 if (s->target->kind == Expr::Kind::ident) {
                     Var* var = find_var(std::string(s->target->text));
                     if (!var) { cg.err(s->line, s->col, "this assignment"); return; }
+                    local_var = var;
+                    var->direct_fn.clear();
                     ptr = var_ptr(var);
                     t = var->ty;
                 } else if (s->target->kind == Expr::Kind::field) {
@@ -4005,12 +6460,27 @@ struct FnEmit {
                 }
                 EV v = eval(s->value.get(), t);
                 if (s->op == TokenKind::assign) {
-                    if (is_rc(t)) {
+                    if (local_var && t->k == Ty::dec_)
+                        local_var->decimal_scale = -1;
+                    if (has_owned_refs(t)) {
                         transfer_in(v);
                         std::string old = reg();
-                        line(old + " = load ptr, ptr " + ptr);
+                        line(old + " = load " + std::string(ll(t)) + ", ptr " + ptr);
                         line("store " + std::string(ll(t)) + " " + v.first + ", ptr " + ptr);
-                        emit_release(old);
+                        if (local_var && !local_var->live_flag.empty()) {
+                            std::string live = reg();
+                            line(live + " = load i1, ptr " + local_var->live_flag);
+                            std::string drop = bb(), done = bb();
+                            line("br i1 " + live + ", label %" + drop + ", label %" +
+                                 done);
+                            label(drop);
+                            emit_release_value(old, t);
+                            line("br label %" + done);
+                            label(done);
+                            line("store i1 1, ptr " + local_var->live_flag);
+                        } else {
+                            emit_release_value(old, t);
+                        }
                     } else {
                         line("store " + std::string(ll(t)) + " " + v.first + ", ptr " + ptr);
                     }
@@ -4020,39 +6490,62 @@ struct FnEmit {
                 line(cur + " = load " + std::string(ll(t)) + ", ptr " + ptr);
                 std::string r = reg();
                 if (t->k == Ty::dec_) {
+                    Decimal literal;
+                    if ((s->op == TokenKind::plus_eq ||
+                         s->op == TokenKind::minus_eq) &&
+                        decimal_literal_value(s->value.get(), literal)) {
+                        const int known_scale =
+                            local_var ? local_var->decimal_scale : -1;
+                        EV updated = decimal_literal_add(
+                            {cur, t}, v, literal,
+                            s->op == TokenKind::minus_eq,
+                            s->value->line, s->value->col,
+                            known_scale == literal.scale);
+                        if (local_var && known_scale >= 0 &&
+                            literal.scale > known_scale)
+                            local_var->decimal_scale = -1;
+                        line("store i128 " + updated.first + ", ptr " + ptr);
+                        return;
+                    }
+                    if (local_var) local_var->decimal_scale = -1;
                     const char* fn = s->op == TokenKind::plus_eq    ? "add"
                                      : s->op == TokenKind::minus_eq ? "sub"
                                      : s->op == TokenKind::star_eq  ? "mul"
                                                                     : "div";
                     if (s->op == TokenKind::slash_eq) {
-                        line(r + " = call ptr @beans_dec_div(ptr " + cur + ", ptr " +
-                             v.first + ", i64 " + std::to_string(s->value->line) +
+                        line(r + " = call i128 @beans_decv_div(i128 " + cur +
+                             ", i128 " + v.first + ", i64 " +
+                             std::to_string(s->value->line) +
                              ", i64 " + std::to_string(s->value->col) + ")");
                     } else {
-                        line(r + " = call ptr @beans_dec_" + fn + "(ptr " + cur +
-                             ", ptr " + v.first + ")");
+                        line(r + " = call i128 @beans_decv_" + fn + "(i128 " + cur +
+                             ", i128 " + v.first + ")");
                     }
-                    line("store ptr " + r + ", ptr " + ptr);
-                    emit_release(cur);
+                    line("store i128 " + r + ", ptr " + ptr);
                     return;
                 } else {
-                    bool flt = t->k == Ty::f64_;
+                    bool flt = t->k == Ty::f64_ || t->k == Ty::simd4f32_;
                     const char* op = nullptr;
                     switch (s->op) {
                         case TokenKind::plus_eq: op = flt ? "fadd" : "add"; break;
                         case TokenKind::minus_eq: op = flt ? "fsub" : "sub"; break;
                         case TokenKind::star_eq: op = flt ? "fmul" : "mul"; break;
-                        case TokenKind::slash_eq: op = flt ? "fdiv" : "sdiv"; break;
-                        case TokenKind::percent_eq: op = flt ? "frem" : "srem"; break;
+                        case TokenKind::slash_eq:
+                            op = flt ? "fdiv" : t->is_unsigned ? "udiv" : "sdiv";
+                            break;
+                        case TokenKind::percent_eq:
+                            op = flt ? "frem" : t->is_unsigned ? "urem" : "srem";
+                            break;
                         default: return;
                     }
                     if (!flt && (s->op == TokenKind::slash_eq ||
                                  s->op == TokenKind::percent_eq)) {
-                        guard_div_zero(v.first, s->op == TokenKind::percent_eq,
+                        guard_div_zero(v.first, t, s->op == TokenKind::percent_eq,
                                        s->value->line, s->value->col);
                     }
-                    line(r + " = " + op + " " + (flt ? "double" : "i64") + " " + cur +
+                    line(r + " = " + op + " " + std::string(ll(t)) + " " + cur +
                          ", " + v.first);
+                    r = flt ? normalize_float(r, t) : normalize_integer(r, t);
                 }
                 line("store " + std::string(ll(t)) + " " + r + ", ptr " + ptr);
                 break;
@@ -4075,8 +6568,18 @@ struct FnEmit {
                     emit_ret("ret i32 0");
                 } else if (s->expr) {
                     EV v = eval(s->expr.get(), ret_ty);
-                    if (is_rc(v.second) && !consume(v.first)) emit_retain(v.first);
-                    emit_ret("ret " + std::string(ll(v.second)) + " " + v.first);
+                    std::string moved_slot;
+                    if (has_owned_refs(v.second) &&
+                        s->expr->kind == Expr::Kind::ident) {
+                        Var* local = find_var(std::string(s->expr->text));
+                        if (local && local->owned && !local->boxed)
+                            moved_slot = local->slot;
+                    }
+                    if (has_owned_refs(v.second) && moved_slot.empty() &&
+                        !consume(v.first))
+                        emit_retain_value(v.first, v.second);
+                    emit_ret("ret " + std::string(ll(v.second)) + " " + v.first,
+                             "", moved_slot);
                 } else {
                     emit_ret("ret void");
                 }
@@ -4085,7 +6588,7 @@ struct FnEmit {
             }
             case Stmt::Kind::brk:
                 if (!loop_stack.empty()) {
-                    for (const std::string& t : temps) emit_release(t);
+                    for (const EV& t : temps) emit_release_value(t.first, t.second);
                     release_scopes(loop_stack.back().scope_depth);
                     line("br label %" + loop_stack.back().brk);
                     terminated = true;
@@ -4093,7 +6596,7 @@ struct FnEmit {
                 break;
             case Stmt::Kind::cont:
                 if (!loop_stack.empty()) {
-                    for (const std::string& t : temps) emit_release(t);
+                    for (const EV& t : temps) emit_release_value(t.first, t.second);
                     release_scopes(loop_stack.back().scope_depth);
                     line("br label %" + loop_stack.back().cont);
                     terminated = true;
@@ -4159,18 +6662,22 @@ struct FnEmit {
     void exec_for_in(const Stmt* s) {
         if (s->iterable && s->iterable->kind == Expr::Kind::range) {
             EV lo = eval(s->iterable->lhs.get());
-            EV hi = eval(s->iterable->rhs.get());
+            EV hi = eval(s->iterable->rhs.get(), lo.second);
+            Ty* elem = lo.second;
             scopes.emplace_back();
-            alloc_slot(s->loop_var, cg.t_i64());
+            alloc_slot(s->loop_var, elem);
             Var* lv = find_var(s->loop_var);
             if (lv->boxed) lv->owned = true;
-            line("store i64 " + lo.first + ", ptr " + var_ptr(lv));
+            line("store " + std::string(ll(elem)) + " " + lo.first + ", ptr " + var_ptr(lv));
             std::string head = bb(), body_bb = bb(), step = bb(), end = bb();
             line("br label %" + head);
             label(head);
             std::string cur = var_read(lv), c = reg();
-            line(c + " = icmp " + (s->iterable->inclusive ? "sle" : "slt") + " i64 " +
-                 cur + ", " + hi.first);
+            std::string pred = s->iterable->inclusive
+                                   ? (elem->is_unsigned ? "ule" : "sle")
+                                   : (elem->is_unsigned ? "ult" : "slt");
+            line(c + " = icmp " + pred + " " + std::string(ll(elem)) + " " + cur +
+                 ", " + hi.first);
             line("br i1 " + c + ", label %" + body_bb + ", label %" + end);
             label(body_bb);
             loop_stack.push_back({end, step, scopes.size()});
@@ -4179,8 +6686,8 @@ struct FnEmit {
             if (!terminated) line("br label %" + step);
             label(step);
             std::string cur2 = var_read(lv), nxt = reg();
-            line(nxt + " = add i64 " + cur2 + ", 1");
-            line("store i64 " + nxt + ", ptr " + var_ptr(lv));
+            line(nxt + " = add " + std::string(ll(elem)) + " " + cur2 + ", 1");
+            line("store " + std::string(ll(elem)) + " " + nxt + ", ptr " + var_ptr(lv));
             line("br label %" + head);
             label(end);
             scopes.pop_back();
@@ -4188,6 +6695,84 @@ struct FnEmit {
         }
         // list iteration by index
         EV it = eval(s->iterable.get());
+        if (it.second->k == Ty::slice_) {
+            Ty* element = it.second->args[0];
+            std::string pointer = reg(), length = reg();
+            line(pointer + " = extractvalue {ptr, i64} " + it.first + ", 0");
+            line(length + " = extractvalue {ptr, i64} " + it.first + ", 1");
+            scopes.emplace_back();
+            std::string idx = fresh_slot("idx", cg.t_i64());
+            line("store i64 0, ptr " + idx);
+            alloc_slot(s->loop_var, element);
+            Var* loop_value = find_var(s->loop_var);
+            std::string head = bb(), body_bb = bb(), step = bb(), end = bb();
+            line("br label %" + head);
+            label(head);
+            std::string index = reg(), condition = reg();
+            line(index + " = load i64, ptr " + idx);
+            line(condition + " = icmp slt i64 " + index + ", " + length);
+            line("br i1 " + condition + ", label %" + body_bb + ", label %" + end);
+            label(body_bb);
+            std::string item_pointer = reg(), item = reg();
+            line(item_pointer + " = getelementptr " + std::string(ll(element)) +
+                 ", ptr " + pointer + ", i64 " + index);
+            line(item + " = load " + std::string(ll(element)) + ", ptr " +
+                 item_pointer + ", align 1");
+            line("store " + std::string(ll(element)) + " " + item + ", ptr " +
+                 var_ptr(loop_value));
+            loop_stack.push_back({end, step, scopes.size()});
+            exec_block(s->body);
+            loop_stack.pop_back();
+            if (!terminated) line("br label %" + step);
+            label(step);
+            std::string old_index = reg(), next_index = reg();
+            line(old_index + " = load i64, ptr " + idx);
+            line(next_index + " = add i64 " + old_index + ", 1");
+            line("store i64 " + next_index + ", ptr " + idx);
+            line("br label %" + head);
+            label(end);
+            scopes.pop_back();
+            return;
+        }
+        if (it.second->k == Ty::fixed_array_) {
+            Ty* elem = it.second->args[0];
+            std::string storage = fresh_slot("arrayiter", it.second);
+            line("store " + std::string(ll(it.second)) + " " + it.first +
+                 ", ptr " + storage);
+            scopes.emplace_back();
+            std::string idx = fresh_slot("idx", cg.t_i64());
+            line("store i64 0, ptr " + idx);
+            alloc_slot(s->loop_var, elem);
+            Var* lv = find_var(s->loop_var);
+            std::string head = bb(), body_bb = bb(), step = bb(), end = bb();
+            line("br label %" + head);
+            label(head);
+            std::string i = reg(), condition = reg();
+            line(i + " = load i64, ptr " + idx);
+            line(condition + " = icmp slt i64 " + i + ", " +
+                 std::to_string(it.second->array_len));
+            line("br i1 " + condition + ", label %" + body_bb + ", label %" + end);
+            label(body_bb);
+            std::string pointer = reg(), item = reg();
+            line(pointer + " = getelementptr " + std::string(ll(it.second)) +
+                 ", ptr " + storage + ", i64 0, i64 " + i);
+            line(item + " = load " + std::string(ll(elem)) + ", ptr " + pointer);
+            line("store " + std::string(ll(elem)) + " " + item + ", ptr " +
+                 var_ptr(lv));
+            loop_stack.push_back({end, step, scopes.size()});
+            exec_block(s->body);
+            loop_stack.pop_back();
+            if (!terminated) line("br label %" + step);
+            label(step);
+            std::string old_index = reg(), next_index = reg();
+            line(old_index + " = load i64, ptr " + idx);
+            line(next_index + " = add i64 " + old_index + ", 1");
+            line("store i64 " + next_index + ", ptr " + idx);
+            line("br label %" + head);
+            label(end);
+            scopes.pop_back();
+            return;
+        }
         if (it.second->k != Ty::list_) {
             cg.err(s->line, s->col, "looping over this");
             return;
@@ -4247,6 +6832,21 @@ struct FnEmit {
             ClosureScan scan;
             scan.block(body_ref);
             boxed_names = std::move(scan.captured);
+            taken_names = std::move(scan.taken);
+        }
+        {
+            ReadScan scan;
+            if (has_self) scan.declarations["self"] += 1;
+            for (const Param& param : params_ref) scan.declarations[param.name] += 1;
+            if (captured) {
+                for (const auto& [name, type] : *captured) {
+                    (void)type;
+                    scan.declarations[name] += 1;
+                }
+            }
+            scan.block(body_ref);
+            remaining_reads = std::move(scan.reads);
+            declaration_counts = std::move(scan.declarations);
         }
 
         Ty* self_ty = nullptr;
@@ -4281,7 +6881,7 @@ struct FnEmit {
             first = false;
             std::string slot = alloc_slot("self", self_ty, true);
             bool bx = boxed_names.count("self") > 0;
-            store_param("%self.arg", slot, "ptr", bx, is_rc(self_ty));
+            store_param("%self.arg", slot, "ptr", bx, self_ty, false);
             if (bx) scopes.back()["self"].owned = true; // the frame made the cell
         }
         for (size_t i = 0; i < params_ref.size(); i++) {
@@ -4290,11 +6890,22 @@ struct FnEmit {
             if (!first) header += ", ";
             first = false;
             std::string preg = "%p" + std::to_string(i);
+            if (params_ref[i].passing == Param::Passing::inout) {
+                header += "ptr " + preg;
+                scopes.back()[params_ref[i].name] = {
+                    preg, "", pt, false, false, true, "", next_seq++, loop_stack.size()};
+                continue;
+            }
             header += std::string(ll(pt)) + " " + preg;
             std::string slot = alloc_slot(params_ref[i].name, pt, true);
             bool bx = boxed_names.count(params_ref[i].name) > 0;
-            store_param(preg, slot, ll(pt), bx, is_rc(pt));
-            if (bx) scopes.back()[params_ref[i].name].owned = true;
+            bool takes = params_ref[i].passing == Param::Passing::take;
+            store_param(preg, slot, ll(pt), bx, pt, takes);
+            Var& param_var = scopes.back()[params_ref[i].name];
+            if (bx || takes) param_var.owned = true;
+            if (takes && !bx && has_owned_refs(pt) && !param_var.live_flag.empty()) {
+                entry_inits += "  store i1 1, ptr " + param_var.live_flag + "\n";
+            }
         }
         header += ") {\nentry:\n";
 
@@ -4310,7 +6921,8 @@ struct FnEmit {
                 std::string cell = cp + ".c";
                 entry_inits += "  " + cell + " = load ptr, ptr " + cp + "\n";
                 entry_inits += "  store ptr " + cell + ", ptr " + slot + "\n";
-                scopes.back()[name] = {slot, ty, true};
+                scopes.back()[name] = {slot, "", ty, true, false, false, "", next_seq++,
+                                       loop_stack.size()};
             }
         }
 
@@ -4330,8 +6942,20 @@ struct FnEmit {
         if (!terminated) {
             if (is_main) emit_ret("ret i32 0");
             else if (ret_ty->k == Ty::unit_) emit_ret("ret void");
-            else if (ret_ty->k == Ty::f64_) emit_ret("ret double " + fmt_double(0));
-            else if (ret_ty->k == Ty::i64_ || ret_ty->k == Ty::i1_)
+            else if (ret_ty->k == Ty::f64_) emit_ret("ret " + std::string(ll(ret_ty)) +
+                                                      " " + fmt_double(0));
+            else if (ret_ty->k == Ty::simd4f32_)
+                emit_ret("ret <4 x float> zeroinitializer");
+            else if (ret_ty->k == Ty::fixed_array_)
+                emit_ret("ret " + std::string(ll(ret_ty)) + " zeroinitializer");
+            else if (ret_ty->k == Ty::struct_)
+                emit_ret("ret " + std::string(ll(ret_ty)) + " zeroinitializer");
+            else if (ret_ty->k == Ty::slice_)
+                emit_ret("ret {ptr, i64} zeroinitializer");
+            else if (is_inline_option(ret_ty) || is_inline_result(ret_ty))
+                emit_ret("ret " + std::string(ll(ret_ty)) + " zeroinitializer");
+            else if (ret_ty->k == Ty::i64_ || ret_ty->k == Ty::i1_ ||
+                     ret_ty->k == Ty::dec_)
                 emit_ret("ret " + std::string(ll(ret_ty)) + " 0");
             else emit_ret("ret ptr null");
         }
@@ -4345,33 +6969,38 @@ struct FnEmit {
     // param → its slot; boxed params store into their heap cell instead.
     // the cell owns its content, so RC params get a +1 going in.
     void store_param(const std::string& preg, const std::string& slot,
-                     const std::string& lty, bool boxed, bool rc) {
+                     const std::string& lty, bool boxed, Ty* type, bool takes) {
         if (!boxed) {
             entry_inits += "  store " + lty + " " + preg + ", ptr " + slot + "\n";
             return;
         }
         std::string cell = preg + ".cell";
         entry_inits += "  " + cell + " = load ptr, ptr " + slot + "\n";
-        if (rc) entry_inits += "  call void @beans_retain(ptr " + preg + ")\n";
+        if (has_owned_refs(type) && !takes) emit_retain_value_entry(preg, type);
         entry_inits += "  store " + lty + " " + preg + ", ptr " + cell + "\n";
     }
 };
 
 // ---- CodeGen driver ---------------------------------------------------------
 
-CodeGen::CodeGen(const Program& prog) : prog_(prog) {}
+CodeGen::CodeGen(const HirProgram& hir) : hir_(hir), prog_(hir.ast()) {}
 
 void CodeGen::error_at(uint32_t line, uint32_t col, std::string msg) {
     errors_.push_back({std::move(msg), line, col});
 }
 
 std::string CodeGen::generate() {
-    CG2 cg(prog_, errors_);
+    CG2 cg(hir_, errors_);
 
     for (const auto& pkg : prog_.packages) {
         for (const auto& pf : pkg->files) {
             // top-level functions (generic ones are emitted on demand)
             for (const FnDecl& f : pf->mod.fns) {
+                if (f.is_extern_c) {
+                    cg.cur_pkg = pkg->prefix;
+                    cg.request_extern(&f);
+                    continue;
+                }
                 if (!f.generics.empty()) continue;
                 bool main = f.qualname == "main";
                 FnEmit fe(cg, f, main ? "@main" : "@b_" + f.qualname, main,
@@ -4439,6 +7068,7 @@ std::string CodeGen::generate() {
     }
 
     if (!errors_.empty()) return "";
+    ffi_c_ = std::move(cg.ffi_c);
 
     // deinit dispatches from the C runtime through the vtable, so its slot
     // must exist even though beans code can never call it by name
@@ -4450,14 +7080,19 @@ std::string CodeGen::generate() {
     }
     if (any_deinit) cg.selector("deinit");
 
-    // vtables: every impl gets a table over the global selector set
+    // Static descriptors: class id first, then the global selector table
+    // inline. Objects carry one descriptor pointer, so dispatch needs the same
+    // two dependent loads as a C++ vptr call.
     int nsel = static_cast<int>(cg.selectors.size());
     std::string tables;
     for (const auto& up : cg.impls) {
         CImpl* im = up.get();
-        tables += "@vt_" + im->mangled + " = internal constant [" +
-                  std::to_string(nsel > 0 ? nsel : 1) + " x ptr] [";
-        for (int s = 0; s < (nsel > 0 ? nsel : 1); s++) {
+        int slots = nsel > 0 ? nsel : 1;
+        tables += "@td_" + im->mangled + " = internal constant {i64, [" +
+                  std::to_string(slots) + " x ptr]} {i64 " +
+                  std::to_string(im->id) + ", [" + std::to_string(slots) +
+                  " x ptr] [";
+        for (int s = 0; s < slots; s++) {
             if (s) tables += ", ";
             std::string sym = "null";
             for (const auto& [name, idx] : cg.selectors) {
@@ -4467,7 +7102,7 @@ std::string CodeGen::generate() {
             }
             tables += "ptr " + sym;
         }
-        tables += "]\n";
+        tables += "]}\n";
     }
     // vtable slot the C runtime dispatches deinit through; -1 = program has none
     tables += "@beans_deinit_sel = global i64 " +
@@ -4488,13 +7123,21 @@ std::string CodeGen::generate() {
 
     std::string out;
     out += "; generated by beansc\n";
+    out += cg.type_defs;
+    if (!cg.type_defs.empty()) out += "\n";
     out += "declare ptr @beans_alloc(i64, i64)\n";
+    out += "declare ptr @beans_raw_alloc(i64, i64, i64, i64)\n";
+    out += "declare void @beans_raw_free(ptr)\n";
+    out += "declare void @beans_raw_copy(ptr, ptr, i64, i64, i64, i64)\n";
+    out += "declare void @beans_raw_zero(ptr, i64, i64, i64, i64)\n";
     out += "declare void @beans_retain(ptr)\n";
     out += "declare void @beans_release(ptr)\n";
     out += "declare ptr @beans_from_int(i64)\n";
+    out += "declare ptr @beans_from_uint(i64)\n";
     out += "declare ptr @beans_from_float(double)\n";
     out += "declare ptr @beans_from_bool(i32)\n";
     out += "declare ptr @beans_concat(ptr, ptr)\n";
+    out += "declare ptr @beans_interpolate(i64, ...)\n";
     out += "declare void @beans_println(ptr)\n";
     out += "declare void @beans_print(ptr)\n";
     out += "declare i32 @beans_str_cmp(ptr, ptr)\n";
@@ -4504,12 +7147,11 @@ std::string CodeGen::generate() {
             case BT::unit: return "void";
             case BT::self_recv: return "void";
             case BT::f64: return "double";
-            case BT::dec: return "ptr";
+            case BT::dec: return "i128";
             case BT::str: return "ptr";
             case BT::bytes: return "ptr";
             case BT::file: return "ptr";
             case BT::mmap: return "ptr";
-            case BT::bufr: return "ptr";
             case BT::list_str: return "ptr";
             case BT::opt_i64:
             case BT::opt_str: return "{i64, i64}";
@@ -4521,7 +7163,6 @@ std::string CodeGen::generate() {
             case BT::res_bytes:
             case BT::res_file:
             case BT::res_mmap:
-            case BT::res_opt_str:
             case BT::res_list_str: return "{i64, ptr}";
             default: return "i64"; // i64, boolean
         }
@@ -4555,8 +7196,25 @@ std::string CodeGen::generate() {
     out += "declare i64 @beans_bytes_eq(ptr, ptr)\n";
     out += "declare void @beans_panic(ptr, i64, i64)\n";
     out += "declare void @beans_panic_index(i64, i64, i64, i64, i64)\n";
+    out += "declare void @beans_panic_array_index(i64, i64, i64, i64)\n";
+    out += "declare void @beans_panic_slice_index(i64, i64, i64, i64)\n";
     out += "declare i64 @beans_is_a(i64, i64)\n";
+    out += "declare ptr @beans_box_new(i64, i64)\n";
+    out += "declare i64 @beans_box_get(ptr)\n";
+    out += "declare void @beans_box_set(ptr, i64)\n";
+    out += "declare ptr @beans_shared_new(i64, i64)\n";
+    out += "declare i64 @beans_shared_get(ptr)\n";
+    out += "declare ptr @beans_shared_downgrade(ptr)\n";
+    out += "declare ptr @beans_weak_upgrade(ptr)\n";
+    out += "declare i64 @beans_weak_expired(ptr)\n";
+    out += "declare ptr @beans_arena_new(i64, i64, i64, i64)\n";
+    out += "declare i64 @beans_arena_put(ptr, i64)\n";
+    out += "declare i64 @beans_arena_get(ptr, i64, ptr)\n";
+    out += "declare i64 @beans_arena_at(ptr, i64, i64, i64)\n";
+    out += "declare i64 @beans_arena_len(ptr)\n";
+    out += "declare void @beans_arena_clear(ptr)\n";
     out += "declare ptr @beans_list_new(i64)\n";
+    out += "declare ptr @beans_list_clone(ptr)\n";
     out += "declare ptr @beans_list_join(ptr, ptr, i64)\n";
     out += "declare ptr @beans_show_list(ptr, ptr)\n";
     out += "declare ptr @beans_show_run(ptr, i64)\n";
@@ -4566,6 +7224,7 @@ std::string CodeGen::generate() {
     out += "declare void @beans_show_list_iter(ptr, ptr, ptr)\n";
     out += "declare ptr @beans_list_join_show(ptr, ptr, ptr)\n";
     out += "declare void @beans_list_push(ptr, i64)\n";
+    out += "declare void @beans_list_reserve(ptr, i64, i64, i64)\n";
     out += "declare i64 @beans_list_min(ptr, i64, ptr)\n";
     out += "declare i64 @beans_list_index(ptr, i64, i64, ptr, ptr)\n";
     out += "declare i64 @beans_str_eq(ptr, ptr)\n";
@@ -4576,36 +7235,50 @@ std::string CodeGen::generate() {
     out += "declare ptr @beans_list_slice(ptr, i64, i64, i64, i64)\n";
     out += "declare void @beans_list_sort(ptr, i64)\n";
     out += "declare void @beans_list_sort_by(ptr, ptr, ptr)\n";
+    out += "declare void @beans_list_sort_by_key(ptr, ptr, ptr)\n";
     out += "declare i64 @beans_map_remove(ptr, i64, i64, ptr, ptr)\n";
+    out += "declare i64 @beans_map_remove_raw(ptr, i64)\n";
     out += "declare ptr @beans_map_keys(ptr)\n";
     out += "declare ptr @beans_map_values(ptr)\n";
     out += "declare void @beans_map_clear(ptr)\n";
     out += "declare i64 @beans_slot_mix(i64)\n";
     out += "declare i64 @beans_f64_hash(i64)\n";
+    out += "declare i64 @beans_f32_hash(i64)\n";
     out += "declare i64 @beans_str_hash(ptr)\n";
     out += "declare i64 @beans_dec_hash(ptr)\n";
     out += "declare i64 @beans_bytes_hash(ptr)\n";
     out += "declare i64 @beans_f64_round(double)\n";
     out += "declare double @llvm.fabs.f64(double)\n";
-    out += "declare ptr @beans_dec_new(i128, i64)\n";
-    out += "declare ptr @beans_dec_add(ptr, ptr)\n";
-    out += "declare ptr @beans_dec_sub(ptr, ptr)\n";
-    out += "declare ptr @beans_dec_mul(ptr, ptr)\n";
-    out += "declare ptr @beans_dec_div(ptr, ptr, i64, i64)\n";
-    out += "declare ptr @beans_dec_neg(ptr)\n";
-    out += "declare ptr @beans_dec_abs(ptr)\n";
-    out += "declare ptr @beans_dec_round(ptr, i64)\n";
+    out += "declare float @llvm.fabs.f32(float)\n";
     out += "declare i32 @beans_dec_cmp(ptr, ptr)\n";
     out += "declare ptr @beans_dec_str(ptr)\n";
-    out += "declare ptr @beans_dec_from_int(i64)\n";
-    out += "declare ptr @beans_dec_from_f64(double)\n";
-    out += "declare i64 @beans_dec_to_int(ptr)\n";
-    out += "declare double @beans_dec_to_f64(ptr)\n";
+    out += "declare ptr @beans_decv_box(i128)\n";
+    out += "declare i128 @beans_decv_unbox(ptr)\n";
+    out += "declare i128 @beans_decv_add(i128, i128)\n";
+    out += "declare i128 @beans_decv_sub(i128, i128)\n";
+    out += "declare i128 @beans_decv_mul(i128, i128)\n";
+    out += "declare i128 @beans_decv_div(i128, i128, i64, i64)\n";
+    out += "declare i128 @beans_decv_neg(i128)\n";
+    out += "declare i128 @beans_decv_abs(i128)\n";
+    out += "declare i128 @beans_decv_round(i128, i64)\n";
+    out += "declare i32 @beans_decv_cmp(i128, i128)\n";
+    out += "declare ptr @beans_decv_str(i128)\n";
+    out += "declare i128 @beans_decv_from_int(i64)\n";
+    out += "declare i128 @beans_decv_from_f64(double)\n";
+    out += "declare i64 @beans_decv_to_int(i128)\n";
+    out += "declare double @beans_decv_to_f64(i128)\n";
     out += "declare i64 @beans_list_max(ptr, i64, ptr)\n";
     out += "declare i64 @beans_list_contains(ptr, i64, i64, ptr)\n";
-    out += "declare ptr @beans_map_new(i64, i64)\n";
+    out += "declare ptr @beans_map_new(i64, i64, i64)\n";
+    out += "declare ptr @beans_map_clone(ptr, i64, ptr)\n";
+    out += "declare void @beans_map_reserve(ptr, i64, i64, ptr, i64, i64)\n";
     out += "declare void @beans_map_set(ptr, i64, i64, i64, ptr, ptr)\n";
+    out += "declare i64 @beans_map_insert(ptr, i64, i64, i64, ptr, ptr)\n";
     out += "declare i64 @beans_map_get(ptr, i64, i64, ptr, ptr, ptr)\n";
+    out += "declare void @beans_map_set_raw(ptr, i64, i64)\n";
+    out += "declare i64 @beans_map_insert_raw(ptr, i64, i64)\n";
+    out += "declare {i64, i64} @beans_map_get_raw(ptr, i64)\n";
+    out += "declare i64 @beans_map_contains_raw(ptr, i64)\n";
     out += "declare ptr @beans_thread_spawn(ptr, ptr)\n";
     out += "declare i64 @beans_thread_join(ptr)\n";
     out += "declare ptr @beans_mutex_new(i64, i64)\n";
@@ -4636,7 +7309,8 @@ const char* CodeGen::runtime_c() {
 //   0 leaf | 1 fixed (bitmask of pointer slots) | 2 list (elem_ptr)
 //   3 map (key_ptr | val_ptr<<1) | 4 chan (elem_ptr) | 5 mutex (inner_ptr)
 //   6 OS resource (shape bit 0: 0 = file — drop closes the fd,
-//                               1 = mmap — drop unmaps; 7 reserved)
+//                               1 = mmap — drop unmaps)
+//   7 arena (elem_ptr)
 // meta bits 61-62 = collector color, bit 63 = in the root buffer.
 // String constants carry an immortal header emitted by the compiler.
 //
@@ -4653,6 +7327,7 @@ const char* CodeGen::runtime_c() {
 #include <fcntl.h>
 #include <math.h>
 #include <pthread.h>
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -4697,6 +7372,12 @@ static BHead* head_of(void* p) { return (BHead*)((char*)p - 16); }
 // flag is 0); after that retain/release use atomic ops. The collector
 // keeps plain ops either way — it only runs with zero workers live.
 static int cc_mt;
+static int cc_is_mt(void) {
+    return __atomic_load_n(&cc_mt, __ATOMIC_RELAXED);
+}
+static void cc_enable_mt(void) {
+    __atomic_store_n(&cc_mt, 1, __ATOMIC_RELAXED);
+}
 static long long cc_color(BHead* h) { return h->meta & CC_COLOR; }
 static void cc_set_color(BHead* h, long long c) { h->meta = (h->meta & ~CC_COLOR) | c; }
 
@@ -4716,6 +7397,41 @@ extern long long beans_deinit_sel;
 // int + __atomic builtins (an _Atomic type rejects __atomic_add_fetch).
 static int beans_in_deinit;
 
+// Profile builds recompile the emitted runtime with -DBEANS_ARC_STATS.
+// Normal benchmark binaries do not contain these counters, so measuring
+// ownership traffic cannot change the timed result.
+#ifdef BEANS_ARC_STATS
+static unsigned long long arc_allocations;
+static unsigned long long arc_allocated_bytes;
+static unsigned long long arc_retain_calls;
+static unsigned long long arc_release_calls;
+static unsigned long long arc_release_nodes;
+static unsigned long long arc_freed_shells;
+static unsigned long long arc_possible_roots;
+static unsigned long long arc_collections;
+static unsigned long long arc_cycle_objects;
+#define ARC_ADD(name, value) \
+    __atomic_add_fetch(&(name), (unsigned long long)(value), __ATOMIC_RELAXED)
+static void arc_report(void) {
+    fprintf(stderr,
+            "beans arc stats: allocations=%llu allocated_bytes=%llu "
+            "retains=%llu releases=%llu release_nodes=%llu frees=%llu "
+            "possible_roots=%llu collections=%llu cycle_objects=%llu\n",
+            (unsigned long long)arc_allocations,
+            (unsigned long long)arc_allocated_bytes,
+            (unsigned long long)arc_retain_calls,
+            (unsigned long long)arc_release_calls,
+            (unsigned long long)arc_release_nodes,
+            (unsigned long long)arc_freed_shells,
+            (unsigned long long)arc_possible_roots,
+            (unsigned long long)arc_collections,
+            (unsigned long long)arc_cycle_objects);
+}
+__attribute__((constructor)) static void arc_setup(void) { atexit(arc_report); }
+#else
+#define ARC_ADD(name, value) ((void)0)
+#endif
+
 // deinit, before the children go — outlined and cold: the indirect call must
 // stay out of beans_release's hot loop or the optimizer treats every
 // iteration as clobbered (that cost 50% on the churn bench). Count up to 1
@@ -4726,13 +7442,14 @@ static int beans_in_deinit;
 // leaked a buffered object's shell once).
 __attribute__((noinline, cold, preserve_most)) static void beans_do_deinit(
     void* p, BHead* h, long long nrc) {
-    if (cc_mt) __atomic_store_n(&h->rc, (nrc + 1) & ~RC_FIN, __ATOMIC_RELAXED);
+    if (cc_is_mt()) __atomic_store_n(&h->rc, (nrc + 1) & ~RC_FIN, __ATOMIC_RELAXED);
     else h->rc = (nrc + 1) & ~RC_FIN;
-    void (**vt)(void*) = *(void (***)(void*))p;
+    void** descriptor = *(void***)p;
+    void (**methods)(void*) = (void (**)(void*))descriptor;
     __atomic_add_fetch(&beans_in_deinit, 1, __ATOMIC_RELAXED);
-    vt[beans_deinit_sel](p);
+    methods[beans_deinit_sel + 1](p);
     __atomic_sub_fetch(&beans_in_deinit, 1, __ATOMIC_RELAXED);
-    if (cc_mt) __atomic_store_n(&h->rc, nrc & ~RC_FIN, __ATOMIC_RELAXED);
+    if (cc_is_mt()) __atomic_store_n(&h->rc, nrc & ~RC_FIN, __ATOMIC_RELAXED);
     else h->rc = nrc & ~RC_FIN;
 }
 
@@ -4758,6 +7475,8 @@ __attribute__((constructor)) static void pool_setup(void) {
 
 void beans_panic(const char* msg, long long line, long long col);
 void* beans_alloc(long long size, long long meta) {
+    ARC_ADD(arc_allocations, 1);
+    ARC_ADD(arc_allocated_bytes, size);
     // allocation is the one safe point: never inside a release cascade,
     // and every stored reference is already counted (a deinit body is the
     // exception — cc_collect itself bails while one runs, so this exact
@@ -4800,8 +7519,9 @@ void* beans_alloc(long long size, long long meta) {
 
 void beans_retain(void* p) {
     if (!p) return;
+    ARC_ADD(arc_retain_calls, 1);
     BHead* h = head_of(p);
-    if (cc_mt) {
+    if (cc_is_mt()) {
         if (__atomic_load_n(&h->rc, __ATOMIC_RELAXED) >= BEANS_IMMORTAL) return;
         __atomic_add_fetch(&h->rc, 1, __ATOMIC_RELAXED);
     } else {
@@ -4817,18 +7537,21 @@ typedef struct {
     long long len, cap;
 } BList;
 typedef struct {
-    long long* data; // key,value interleaved, insertion order — len stays at
+    long long* data;
+    long long len, cap;
+} BArena;
+typedef struct {
+    long long* data; // key,value interleaved — len stays at
     long long len, cap; // offset 8: map.len() is a direct field load in IR
     // open-addressed index over data: (hash hi32 << 32) | (pos+2), 0 empty,
     // 1 tombstone. NULL until the map outgrows a linear scan.
     unsigned long long* idx;
     long long icap, tombs;
-    // remove on an indexed map zeroes the pair and sets its dead bit instead
-    // of shifting, so delete is O(1); used counts physical slots, len live
-    // ones. deadbits NULL = no holes. map_reindex compacts when holes
-    // outnumber live entries, so iteration stays O(len) amortized.
+    // OrderedMap removal leaves stable holes. Plain Map swap-removes and keeps
+    // used == len. deadbits NULL means there are no holes.
     long long used;
     unsigned long long* deadbits;
+    long long ordered;
 } BMap;
 typedef struct {
     pthread_mutex_t m;
@@ -4877,6 +7600,13 @@ static void cc_walk(void* p, long long meta, void (*fn)(void*, void*), void* ctx
     } else if (kind == 5) {
         BMutex* mu = p;
         if ((extra & 1) && mu->inner) fn((void*)mu->inner, ctx);
+    } else if (kind == 7) {
+        BArena* arena = p;
+        if (extra & 1) {
+            for (long long i = 0; i < arena->len; i++) {
+                if (arena->data[i]) fn((void*)arena->data[i], ctx);
+            }
+        }
     }
 }
 
@@ -4892,16 +7622,49 @@ typedef struct {
     long long closed;
 } BMMap;
 
+typedef struct {
+    long long strong;
+    long long weak;
+    long long value;
+    long long value_ptr;
+} BSharedCtrl;
+typedef struct { BSharedCtrl* ctrl; } BSharedHandle;
+
+// kind 6, extra 2 = strong handle, extra 3 = weak handle. The control block
+// owns exactly one payload reference while any strong handle exists. Return
+// that child when the final strong shell dies so beans_release can keep its
+// existing iterative cascade.
+static void* shared_shell_drop(void* p, long long extra) {
+    BSharedCtrl* ctrl = ((BSharedHandle*)p)->ctrl;
+    if (extra & 1) {
+        if (__atomic_fetch_sub(&ctrl->weak, 1, __ATOMIC_ACQ_REL) == 1) free(ctrl);
+        return NULL;
+    }
+    void* child = NULL;
+    if (__atomic_fetch_sub(&ctrl->strong, 1, __ATOMIC_ACQ_REL) == 1) {
+        if (ctrl->value_ptr) child = (void*)ctrl->value;
+        ctrl->value = 0;
+        if (__atomic_fetch_sub(&ctrl->weak, 1, __ATOMIC_ACQ_REL) == 1) free(ctrl);
+    }
+    return child;
+}
+
 // free the box and its side allocations WITHOUT touching child refs
-static void cc_free_shell(void* p, long long meta) {
+static void* cc_free_shell(void* p, long long meta) {
+    ARC_ADD(arc_freed_shells, 1);
     long long kind = meta & 7;
+    long long extra = (meta & CC_SHAPE) >> 3;
+    void* deferred_child = NULL;
     if (kind == 2) free(((BList*)p)->data);
+    else if (kind == 7) free(((BArena*)p)->data);
     else if (kind == 3) {
         free(((BMap*)p)->data);
         free(((BMap*)p)->idx);
         free(((BMap*)p)->deadbits);
     } else if (kind == 4) free(((BChan*)p)->q);
-    else if (kind == 6) { // OS resource — dropping the last ref is the safety
+    else if (kind == 6 && (extra & 2)) {
+        deferred_child = shared_shell_drop(p, extra);
+    } else if (kind == 6) { // OS resource — dropping the last ref is the safety
         // close whatever is still open at the OS level, whether the handle was
         // never closed or its close was deferred while threads ran (fd/p left
         // valid, the logical `closed` flag already set). The last ref is gone,
@@ -4923,24 +7686,52 @@ static void cc_free_shell(void* p, long long meta) {
     } else {
         free(h);
     }
+    return deferred_child;
 }
 
 // explicit work stack, shared by release cascades and all collector phases
 typedef struct {
     void** v;
     long long len, cap;
+    void** local;
 } CCStack;
 static void cc_push(CCStack* s, void* p) {
     if (s->len == s->cap) {
-        s->cap = s->cap ? s->cap * 2 : 4096;
-        s->v = realloc(s->v, (size_t)s->cap * sizeof(void*));
+        long long next = s->cap ? s->cap * 2 : 4096;
+        void** grown = malloc((size_t)next * sizeof(void*));
+        if (s->len) memcpy(grown, s->v, (size_t)s->len * sizeof(void*));
+        if (s->v != s->local) free(s->v);
+        s->v = grown;
+        s->cap = next;
     }
     s->v[s->len++] = p;
 }
 static void cc_visit_push(void* c, void* ctx) {
     BHead* h = head_of(c);
-    if (h->rc >= BEANS_IMMORTAL) return;
+    long long rc = cc_is_mt() ? __atomic_load_n(&h->rc, __ATOMIC_RELAXED) : h->rc;
+    if (rc >= BEANS_IMMORTAL) return;
     cc_push(ctx, c);
+}
+
+// Release cascades overwhelmingly walk fixed class objects. Keep this path
+// direct: the collector still uses the generic callback walker, but ordinary
+// ARC death should not pay an indirect call for every child.
+static inline void cc_release_children(void* p, long long meta, CCStack* st) {
+    long long kind = meta & 7;
+    long long extra = (meta & CC_SHAPE) >> 3;
+    if (kind != 1) {
+        cc_walk(p, meta, cc_visit_push, st);
+        return;
+    }
+    for (int i = 0; i < 58 && (extra >> i); i++) {
+        if (!((extra >> i) & 1)) continue;
+        void* child = *(void**)((char*)p + 8 * i);
+        if (!child) continue;
+        BHead* h = head_of(child);
+        long long rc = cc_is_mt() ? __atomic_load_n(&h->rc, __ATOMIC_RELAXED)
+                                  : h->rc;
+        if (rc < BEANS_IMMORTAL) cc_push(st, child);
+    }
 }
 
 // ---- possible-root buffer ----
@@ -4953,16 +7744,17 @@ static void cc_possible_root(void* p) {
     BHead* h = head_of(p);
     long long old = __atomic_fetch_or(&h->meta, CC_PURPLE | CC_BUF, __ATOMIC_RELAXED);
     if (old & CC_BUF) return; // already parked
+    ARC_ADD(arc_possible_roots, 1);
     // like the counts, the buffer goes unlocked until the first spawn: one
     // thread exists, and after cc_mt flips every park takes the mutex
-    if (cc_mt) pthread_mutex_lock(&cc_mu);
+    if (cc_is_mt()) pthread_mutex_lock(&cc_mu);
     if (cc_len == cc_cap) {
         cc_cap = cc_cap ? cc_cap * 2 : 1024;
         cc_roots = realloc(cc_roots, (size_t)cc_cap * sizeof(void*));
     }
     cc_roots[cc_len++] = p;
     if (cc_len >= cc_threshold) cc_pending = 1;
-    if (cc_mt) pthread_mutex_unlock(&cc_mu);
+    if (cc_is_mt()) pthread_mutex_unlock(&cc_mu);
 }
 
 // iterative: a dropped million-node chain pushes children on an explicit
@@ -4970,13 +7762,16 @@ static void cc_possible_root(void* p) {
 // unless a death actually cascades.
 void beans_release(void* p) {
     if (!p) return;
-    CCStack st = {0, 0, 0};
+    ARC_ADD(arc_release_calls, 1);
+    void* local[64];
+    CCStack st = {local, 0, 64, local};
     void* cur = p;
     for (;;) {
+        ARC_ADD(arc_release_nodes, 1);
         BHead* h = head_of(cur);
-        long long rc0 = cc_mt ? __atomic_load_n(&h->rc, __ATOMIC_RELAXED) : h->rc;
+        long long rc0 = cc_is_mt() ? __atomic_load_n(&h->rc, __ATOMIC_RELAXED) : h->rc;
         if (rc0 < BEANS_IMMORTAL) {
-            long long nrc = cc_mt ? __atomic_sub_fetch(&h->rc, 1, __ATOMIC_ACQ_REL)
+            long long nrc = cc_is_mt() ? __atomic_sub_fetch(&h->rc, 1, __ATOMIC_ACQ_REL)
                                   : (h->rc -= 1);
             if (RC_COUNT(nrc) == 0) {
                 long long meta = h->meta;
@@ -4985,13 +7780,14 @@ void beans_release(void* p) {
                     beans_do_deinit(cur, h, nrc);
                     meta = h->meta; // colors can move while user code runs
                 }
-                cc_walk(cur, meta, cc_visit_push, &st);
+                cc_release_children(cur, meta, &st);
                 if (meta & CC_BUF) {
                     // parked — the buffer still points here, so the collector
                     // frees the shell later; mark black: this is a dead husk
                     __atomic_and_fetch(&h->meta, ~CC_COLOR, __ATOMIC_RELAXED);
                 } else {
-                    cc_free_shell(cur, meta);
+                    void* child = cc_free_shell(cur, meta);
+                    if (child) cc_push(&st, child);
                 }
             } else {
                 // could this shape sit on a cycle? leaves, pointer-free
@@ -5002,14 +7798,158 @@ void beans_release(void* p) {
                 long long kind = meta & 7;
                 int cyclic = (kind == 1 && ((meta & CC_SHAPE) >> 3) != 0) ||
                              (kind == 3 && (meta & (3LL << 3))) ||
-                             ((kind == 2 || kind == 4 || kind == 5) && (meta & (1LL << 3)));
+                             ((kind == 2 || kind == 4 || kind == 5 || kind == 7) &&
+                              (meta & (1LL << 3)));
                 if (cyclic) cc_possible_root(cur);
             }
         }
         if (!st.len) break;
         cur = st.v[--st.len];
     }
-    free(st.v);
+    if (st.v != local) free(st.v);
+}
+
+// Box owns one slot. Checked Beans treats the outer handle as move-only; the
+// RC header is still used for uniform frame cleanup and cycle walking.
+void* beans_raw_alloc(long long count, long long size, long long line, long long col) {
+    if (count < 0) beans_panic("negative raw allocation count", line, col);
+    if (size <= 0 || count > (1LL << 58) / size)
+        beans_panic("raw allocation too large", line, col);
+    void* p = calloc((size_t)count, (size_t)size);
+    if (!p && count) beans_panic("out of memory", line, col);
+    return p;
+}
+void beans_raw_free(void* p) { free(p); }
+void beans_raw_copy(void* destination, void* source, long long count, long long size,
+                    long long line, long long col) {
+    if (count < 0) beans_panic("negative raw copy count", line, col);
+    if (size <= 0 || count > (1LL << 58) / size)
+        beans_panic("raw copy too large", line, col);
+    if (count && (!destination || !source))
+        beans_panic("null raw pointer copy", line, col);
+    memmove(destination, source, (size_t)count * (size_t)size);
+}
+void beans_raw_zero(void* destination, long long count, long long size,
+                    long long line, long long col) {
+    if (count < 0) beans_panic("negative raw zero count", line, col);
+    if (size <= 0 || count > (1LL << 58) / size)
+        beans_panic("raw zero too large", line, col);
+    if (count && !destination) beans_panic("null raw pointer zero", line, col);
+    memset(destination, 0, (size_t)count * (size_t)size);
+}
+
+void* beans_box_new(long long value, long long value_ptr) {
+    long long* box = beans_alloc(8, 1 | (value_ptr << 3));
+    box[0] = value;
+    return box;
+}
+long long beans_box_get(void* p) { return ((long long*)p)[0]; }
+void beans_box_set(void* p, long long value) {
+    long long* box = p;
+    if (((head_of(p)->meta & CC_SHAPE) >> 3) & 1) {
+        void* old = (void*)box[0];
+        if (old) beans_release(old);
+    }
+    box[0] = value;
+}
+
+void* beans_shared_new(long long value, long long value_ptr) {
+    BSharedCtrl* ctrl = calloc(1, sizeof(BSharedCtrl));
+    if (!ctrl) beans_panic("out of memory", 0, 0);
+    ctrl->strong = 1;
+    ctrl->weak = 1; // implicit weak held until strong reaches zero
+    ctrl->value = value;
+    ctrl->value_ptr = value_ptr;
+    BSharedHandle* handle = beans_alloc(sizeof(BSharedHandle), 6 | (2LL << 3));
+    handle->ctrl = ctrl;
+    return handle;
+}
+long long beans_shared_get(void* p) {
+    return ((BSharedHandle*)p)->ctrl->value;
+}
+void* beans_shared_downgrade(void* p) {
+    BSharedCtrl* ctrl = ((BSharedHandle*)p)->ctrl;
+    __atomic_add_fetch(&ctrl->weak, 1, __ATOMIC_RELAXED);
+    BSharedHandle* weak = beans_alloc(sizeof(BSharedHandle), 6 | (3LL << 3));
+    weak->ctrl = ctrl;
+    return weak;
+}
+void* beans_weak_upgrade(void* p) {
+    BSharedCtrl* ctrl = ((BSharedHandle*)p)->ctrl;
+    long long strong = __atomic_load_n(&ctrl->strong, __ATOMIC_ACQUIRE);
+    while (strong > 0) {
+        if (__atomic_compare_exchange_n(&ctrl->strong, &strong, strong + 1, 1,
+                                        __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
+            BSharedHandle* handle =
+                beans_alloc(sizeof(BSharedHandle), 6 | (2LL << 3));
+            handle->ctrl = ctrl;
+            return handle;
+        }
+    }
+    return NULL;
+}
+long long beans_weak_expired(void* p) {
+    BSharedCtrl* ctrl = ((BSharedHandle*)p)->ctrl;
+    return __atomic_load_n(&ctrl->strong, __ATOMIC_ACQUIRE) == 0;
+}
+
+void* beans_arena_new(long long capacity, long long elem_ptr,
+                      long long line, long long col) {
+    if (capacity < 0) {
+        char msg[96];
+        snprintf(msg, sizeof msg, "negative arena capacity %lld", capacity);
+        beans_panic(msg, line, col);
+    }
+    if (capacity > (1LL << 58)) beans_panic("arena capacity too large", line, col);
+    BArena* arena = beans_alloc(sizeof(BArena), 7 | (elem_ptr << 3));
+    if (capacity) {
+        arena->data = calloc((size_t)capacity, sizeof(long long));
+        if (!arena->data) beans_panic("out of memory", line, col);
+    }
+    arena->cap = capacity;
+    return arena;
+}
+long long beans_arena_put(void* p, long long value) {
+    BArena* arena = p;
+    if (arena->len == arena->cap) {
+        long long next = arena->cap ? arena->cap * 2 : 8;
+        long long* data = realloc(arena->data, (size_t)next * sizeof(long long));
+        if (!data) beans_panic("out of memory", 0, 0);
+        arena->data = data;
+        arena->cap = next;
+    }
+    long long handle = arena->len++;
+    arena->data[handle] = value;
+    return handle;
+}
+long long beans_arena_get(void* p, long long handle, long long* ok) {
+    BArena* arena = p;
+    if (handle < 0 || handle >= arena->len) {
+        *ok = 0;
+        return 0;
+    }
+    *ok = 1;
+    return arena->data[handle];
+}
+long long beans_arena_at(void* p, long long handle, long long line, long long col) {
+    BArena* arena = p;
+    if (handle < 0 || handle >= arena->len) {
+        char msg[112];
+        snprintf(msg, sizeof msg, "arena handle %lld out of range (len %lld)",
+                 handle, arena->len);
+        beans_panic(msg, line, col);
+    }
+    return arena->data[handle];
+}
+long long beans_arena_len(void* p) { return ((BArena*)p)->len; }
+void beans_arena_clear(void* p) {
+    BArena* arena = p;
+    if (((head_of(p)->meta & CC_SHAPE) >> 3) & 1) {
+        for (long long i = 0; i < arena->len; i++) {
+            if (arena->data[i]) beans_release((void*)arena->data[i]);
+        }
+    }
+    arena->len = 0;
 }
 
 // ---- the collector (single mutator: us) ----
@@ -5084,8 +8024,9 @@ static void cc_collect(int force) {
     // not start a collection — a mid-destroy object must never be walked.
     // cc_pending stays set, so the next allocation after the cascade retries.
     if (__atomic_load_n(&beans_in_deinit, __ATOMIC_RELAXED)) return;
+    ARC_ADD(arc_collections, 1);
     cc_collecting = 1;
-    if (cc_mt) pthread_mutex_lock(&cc_mu);
+    if (cc_is_mt()) pthread_mutex_lock(&cc_mu);
 
     // keep only live purple candidates; zombies (released while parked)
     // just need their shells freed, everything else drops out
@@ -5097,7 +8038,10 @@ static void cc_collect(int force) {
             cc_roots[n++] = p;
         } else {
             __atomic_and_fetch(&h->meta, ~CC_BUF, __ATOMIC_RELAXED);
-            if (RC_COUNT(h->rc) == 0) cc_free_shell(p, h->meta);
+            if (RC_COUNT(h->rc) == 0) {
+                void* child = cc_free_shell(p, h->meta);
+                if (child) beans_release(child);
+            }
         }
     }
     cc_len = n;
@@ -5119,10 +8063,12 @@ static void cc_collect(int force) {
             cc_collect_white(cc_roots[i], &st, &dead);
         }
         cc_len = 0;
+        ARC_ADD(arc_cycle_objects, dead.len);
         // nothing was freed while walking, so no stale pointer was ever
         // read; now the whole white set goes at once
         for (long long i = 0; i < dead.len; i++) {
-            cc_free_shell(dead.v[i], head_of(dead.v[i])->meta);
+            void* child = cc_free_shell(dead.v[i], head_of(dead.v[i])->meta);
+            if (child) beans_release(child);
         }
         cc_walk_min = dead.len ? 256
                                : (cc_walk_min * 4 > (1LL << 18) ? (1LL << 18)
@@ -5138,7 +8084,7 @@ static void cc_collect(int force) {
     // long-lived survivors)
     cc_threshold = cc_len * 2 + 256;
     cc_pending = 0;
-    if (cc_mt) pthread_mutex_unlock(&cc_mu);
+    if (cc_is_mt()) pthread_mutex_unlock(&cc_mu);
     cc_collecting = 0;
 }
 
@@ -5160,6 +8106,18 @@ void beans_panic_index(long long i, long long len, long long has_len,
     else snprintf(b, sizeof b, "list index %lld out of range", i);
     beans_panic(b, line, col);
 }
+void beans_panic_array_index(long long i, long long len,
+                             long long line, long long col) {
+    char b[96];
+    snprintf(b, sizeof b, "array index %lld out of range (len %lld)", i, len);
+    beans_panic(b, line, col);
+}
+void beans_panic_slice_index(long long i, long long len,
+                             long long line, long long col) {
+    char b[96];
+    snprintf(b, sizeof b, "slice index %lld out of range (len %lld)", i, len);
+    beans_panic(b, line, col);
+}
 
 // ---- strings (leaf allocations) ----
 // a string's byte length lives in its meta shape bits (kind 0 uses none of
@@ -5176,6 +8134,32 @@ static char* rc_strdup(const char* s) {
 // hand-rolled digits: snprintf("%lld") was ~1/3 of the string-build loop in
 // the strings bench (vfprintf machinery per call); this matches its output
 // byte for byte
+static long long uint_digits(unsigned long long v) {
+    long long n = 1;
+    while (v >= 10) { v /= 10; n += 1; }
+    return n;
+}
+static char* write_uint(char* out, unsigned long long v) {
+    long long n = uint_digits(v);
+    char* end = out + n;
+    char* p = end;
+    do {
+        *--p = (char)('0' + v % 10);
+        v /= 10;
+    } while (v);
+    return end;
+}
+static long long int_digits(long long v) {
+    unsigned long long u =
+        v < 0 ? (unsigned long long)-(v + 1) + 1 : (unsigned long long)v;
+    return uint_digits(u) + (v < 0);
+}
+static char* write_int(char* out, long long v) {
+    unsigned long long u =
+        v < 0 ? (unsigned long long)-(v + 1) + 1 : (unsigned long long)v;
+    if (v < 0) *out++ = '-';
+    return write_uint(out, u);
+}
 char* beans_from_int(long long v) {
     char b[24];
     char* e = b + sizeof b;
@@ -5189,6 +8173,16 @@ char* beans_from_int(long long v) {
     if (v < 0) *--p = '-';
     return str_make(p, e - p);
 }
+char* beans_from_uint(unsigned long long v) {
+    char b[24];
+    char* e = b + sizeof b;
+    char* p = e;
+    do {
+        *--p = (char)('0' + v % 10);
+        v /= 10;
+    } while (v);
+    return str_make(p, e - p);
+}
 char* beans_from_float(double v) {
     char b[48];
     snprintf(b, sizeof b, "%.10g", v);
@@ -5200,6 +8194,56 @@ char* beans_concat(char* a, char* b) {
     char* r = beans_alloc((long long)(la + lb + 1), (long long)(la + lb) << 3);
     memcpy(r, a, la);
     memcpy(r + la, b, lb + 1);
+    return r;
+}
+char* beans_interpolate(long long n, ...) {
+    va_list ap;
+    va_start(ap, n);
+    long long total = 0;
+    for (long long i = 0; i < n; i++) {
+        long long kind = va_arg(ap, long long);
+        if (kind == 0) {
+            total += beans_slen(va_arg(ap, char*));
+        } else if (kind == 1) {
+            total += int_digits(va_arg(ap, long long));
+        } else if (kind == 2) {
+            total += uint_digits(va_arg(ap, unsigned long long));
+        } else if (kind == 3) {
+            char b[48];
+            total += snprintf(b, sizeof b, "%.10g", va_arg(ap, double));
+        } else {
+            total += va_arg(ap, int) ? 4 : 5;
+        }
+    }
+    va_end(ap);
+    char* r = beans_alloc(total + 1, total << 3);
+    char* w = r;
+    va_start(ap, n);
+    for (long long i = 0; i < n; i++) {
+        long long kind = va_arg(ap, long long);
+        if (kind == 0) {
+            char* part = va_arg(ap, char*);
+            long long len = beans_slen(part);
+            memcpy(w, part, (size_t)len);
+            w += len;
+        } else if (kind == 1) {
+            w = write_int(w, va_arg(ap, long long));
+        } else if (kind == 2) {
+            w = write_uint(w, va_arg(ap, unsigned long long));
+        } else if (kind == 3) {
+            char b[48];
+            int len = snprintf(b, sizeof b, "%.10g", va_arg(ap, double));
+            memcpy(w, b, (size_t)len);
+            w += len;
+        } else {
+            int value = va_arg(ap, int);
+            const char* text = value ? "true" : "false";
+            long long len = value ? 4 : 5;
+            memcpy(w, text, (size_t)len);
+            w += len;
+        }
+    }
+    va_end(ap);
     return r;
 }
 // strings carry their byte length and may legally hold NUL (\0 escapes,
@@ -5469,6 +8513,21 @@ void beans_list_push(BList* l, long long v) {
     }
     l->data[l->len++] = v;
 }
+void beans_list_reserve(BList* l, long long capacity, long long line, long long col) {
+    if (capacity < 0) {
+        char b[64];
+        snprintf(b, sizeof b, "negative reserve capacity %lld", capacity);
+        beans_panic(b, line, col);
+    }
+    if (capacity > (1LL << 58)) beans_panic("reserve capacity too large", line, col);
+    if (capacity <= l->cap) return;
+    long long cap = l->cap;
+    while (cap < capacity && cap <= (1LL << 60)) cap *= 2;
+    if (cap < capacity) cap = capacity;
+    l->data = realloc(l->data, (size_t)cap * 8);
+    if (!l->data) beans_panic("out of memory", line, col);
+    l->cap = cap;
+}
 
 // ---- class hierarchy (table emitted by the compiler) ----
 extern long long beans_class_parents[];
@@ -5496,6 +8555,18 @@ static int slot_cmp(long long a, long long b, long long kind) {
     if (kind == 2) return beans_str_cmp((char*)a, (char*)b);
     if (kind == 3) return beans_dec_cmp((struct BDec*)a, (struct BDec*)b);
     if (kind == 4) return 0;
+    if (kind == 5) {
+        unsigned long long x = (unsigned long long)a;
+        unsigned long long y = (unsigned long long)b;
+        return x < y ? -1 : x > y ? 1 : 0;
+    }
+    if (kind == 6) {
+        unsigned aa = (unsigned)a, bb = (unsigned)b;
+        float x, y;
+        memcpy(&x, &aa, 4);
+        memcpy(&y, &bb, 4);
+        return x < y ? -1 : x > y ? 1 : 0;
+    }
     return a < b ? -1 : a > b ? 1 : 0;
 }
 // content equality for strings — length header first, bytes second; strcmp
@@ -5521,18 +8592,26 @@ static long long slot_eq(long long a, long long b, long long kind,
     if (kind == 2) return beans_str_eq((char*)a, (char*)b);
     if (kind == 3) return beans_dec_cmp((struct BDec*)a, (struct BDec*)b) == 0;
     if (kind == 4) return eq(a, b) != 0;
+    if (kind == 6) {
+        unsigned aa = (unsigned)a, bb = (unsigned)b;
+        float x, y;
+        memcpy(&x, &aa, 4);
+        memcpy(&y, &bb, 4);
+        return x == y;
+    }
     return 0;
 }
 // hashes for the map index, one per equality kind. The contract is only that
 // slot_eq-equal keys hash equal; the interpreter hashes differently and that
-// is fine — nothing observable depends on hash values, iteration walks the
-// insertion-ordered array.
+// is fine — nothing observable depends on hash values, iteration walks data.
 static unsigned long long beans_mix64(unsigned long long x) {
-    x ^= x >> 33;
-    x *= 0xff51afd7ed558ccdULL;
-    x ^= x >> 33;
-    x *= 0xc4ceb9fe1a85ec53ULL;
-    x ^= x >> 33;
+    // One multiply is enough for an in-process table: unlike a persisted
+    // cryptographic hash, this only needs to spread sequential integers and
+    // aligned pointers across a power-of-two index. The old Murmur finalizer
+    // used two multiplies and six dependent operations on every lookup.
+    x ^= x >> 32;
+    x *= 0xd6e8feb86659fd93ULL;
+    x ^= x >> 32;
     return x;
 }
 long long beans_slot_mix(long long v) { return (long long)beans_mix64((unsigned long long)v); }
@@ -5541,6 +8620,13 @@ long long beans_f64_hash(long long v) {
     memcpy(&x, &v, 8);
     if (x == 0.0) return (long long)beans_mix64(0); // -0.0 == 0.0
     return (long long)beans_mix64((unsigned long long)v);
+}
+long long beans_f32_hash(long long v) {
+    unsigned bits = (unsigned)v;
+    float x;
+    memcpy(&x, &bits, 4);
+    if (x == 0.0f) return (long long)beans_mix64(0);
+    return (long long)beans_mix64(bits);
 }
 long long beans_str_hash(char* s) {
     long long n = beans_slen(s);
@@ -5566,6 +8652,7 @@ static unsigned long long slot_hash(long long v, long long kind,
     if (kind == 2) return (unsigned long long)beans_str_hash((char*)v);
     if (kind == 3) return (unsigned long long)beans_dec_hash((struct BDec*)v);
     if (kind == 4) return (unsigned long long)hf(v);
+    if (kind == 6) return (unsigned long long)beans_f32_hash(v);
     return beans_mix64((unsigned long long)v); // raw, and never-equal keys
 }
 long long beans_list_max(BList* l, long long kind, long long* ok) {
@@ -5655,10 +8742,32 @@ BList* beans_list_slice(BList* l, long long from, long long to, long long line,
         beans_panic(b, line, col);
     }
     long long rc = (head_of(l)->meta & CC_SHAPE) >> 3 & 1;
-    BList* r = beans_list_new(rc);
-    for (long long i = from; i < to; i++) {
-        if (rc && l->data[i]) beans_retain((void*)l->data[i]);
-        beans_list_push(r, l->data[i]);
+    long long n = to - from;
+    BList* r = beans_alloc(sizeof(BList), 2 | (rc << 3));
+    r->len = n;
+    r->cap = n > 4 ? n : 4;
+    r->data = malloc((size_t)r->cap * sizeof(long long));
+    if (!r->data) beans_panic("out of memory", line, col);
+    memcpy(r->data, l->data + from, (size_t)n * sizeof(long long));
+    if (rc) {
+        for (long long i = 0; i < n; i++) {
+            if (r->data[i]) beans_retain((void*)r->data[i]);
+        }
+    }
+    return r;
+}
+BList* beans_list_clone(BList* l) {
+    long long rc = (head_of(l)->meta & CC_SHAPE) >> 3 & 1;
+    BList* r = beans_alloc(sizeof(BList), 2 | (rc << 3));
+    r->len = l->len;
+    r->cap = l->len > 4 ? l->len : 4;
+    r->data = malloc((size_t)r->cap * sizeof(long long));
+    if (!r->data) beans_panic("out of memory", 0, 0);
+    memcpy(r->data, l->data, (size_t)l->len * sizeof(long long));
+    if (rc) {
+        for (long long i = 0; i < r->len; i++) {
+            if (r->data[i]) beans_retain((void*)r->data[i]);
+        }
     }
     return r;
 }
@@ -5692,31 +8801,114 @@ static void list_merge_sort(long long* a, long long n, long long kind, void* thu
     }
     free(buf);
 }
+// Signed integer slots have a much cheaper stable path: four 16-bit passes,
+// with the sign bit flipped for normal two's-complement ordering.
+// This avoids a comparator branch for every merge comparison and keeps equal
+// values in input order. bool uses the same path (its slots are 0/1).
+static void list_radix_sort_int(long long* a, long long n) {
+    if (n < 2) return;
+    long long* buf = malloc((size_t)n * 8);
+    long long* src = a;
+    long long* dst = buf;
+    size_t* count = malloc(65536 * sizeof(size_t));
+    size_t* at = malloc(65536 * sizeof(size_t));
+    for (int pass = 0; pass < 4; pass++) {
+        memset(count, 0, 65536 * sizeof(size_t));
+        int shift = pass * 16;
+        for (long long i = 0; i < n; i++) {
+            unsigned long long key = (unsigned long long)src[i] ^ (1ULL << 63);
+            count[(key >> shift) & 65535]++;
+        }
+        size_t sum = 0;
+        for (int word = 0; word < 65536; word++) {
+            at[word] = sum;
+            sum += count[word];
+        }
+        for (long long i = 0; i < n; i++) {
+            unsigned long long key = (unsigned long long)src[i] ^ (1ULL << 63);
+            dst[at[(key >> shift) & 65535]++] = src[i];
+        }
+        long long* swap = src;
+        src = dst;
+        dst = swap;
+    }
+    // Four passes land back in `a`; keep this copy for defensive use if the
+    // pass count changes later.
+    if (src != a) memcpy(a, src, (size_t)n * 8);
+    free(count);
+    free(at);
+    free(buf);
+}
 void beans_list_sort(BList* l, long long kind) {
-    list_merge_sort(l->data, l->len, kind, NULL, NULL);
+    if (kind == 0) list_radix_sort_int(l->data, l->len);
+    else list_merge_sort(l->data, l->len, kind, NULL, NULL);
 }
 void beans_list_sort_by(BList* l, void* thunk, void* box) {
     list_merge_sort(l->data, l->len, 0, thunk, box);
 }
+void beans_list_sort_by_key(BList* l, void* thunk, void* box) {
+    long long n = l->len;
+    if (n < 2) return;
+    long long* keys = malloc((size_t)n * 8);
+    long long* key_buf = malloc((size_t)n * 8);
+    long long* val_buf = malloc((size_t)n * 8);
+    size_t* count = malloc(65536 * sizeof(size_t));
+    size_t* at = malloc(65536 * sizeof(size_t));
+    long long (*key_fn)(void*, long long) =
+        (long long (*)(void*, long long))thunk;
+    for (long long i = 0; i < n; i++) keys[i] = key_fn(box, l->data[i]);
+    long long* key_src = keys;
+    long long* key_dst = key_buf;
+    long long* val_src = l->data;
+    long long* val_dst = val_buf;
+    for (int pass = 0; pass < 4; pass++) {
+        memset(count, 0, 65536 * sizeof(size_t));
+        int shift = pass * 16;
+        for (long long i = 0; i < n; i++) {
+            unsigned long long key = (unsigned long long)key_src[i] ^ (1ULL << 63);
+            count[(key >> shift) & 65535]++;
+        }
+        size_t sum = 0;
+        for (int word = 0; word < 65536; word++) {
+            at[word] = sum;
+            sum += count[word];
+        }
+        for (long long i = 0; i < n; i++) {
+            unsigned long long key = (unsigned long long)key_src[i] ^ (1ULL << 63);
+            size_t out = at[(key >> shift) & 65535]++;
+            key_dst[out] = key_src[i];
+            val_dst[out] = val_src[i];
+        }
+        long long* swap = key_src; key_src = key_dst; key_dst = swap;
+        swap = val_src; val_src = val_dst; val_dst = swap;
+    }
+    if (val_src != l->data) memcpy(l->data, val_src, (size_t)n * 8);
+    free(keys);
+    free(key_buf);
+    free(val_buf);
+    free(count);
+    free(at);
+}
 
 // ---- maps ----
-// A flat insertion-ordered key/value array (keys()/values()/printing walk it,
-// cc_walk too), plus an open-addressed index so lookup is O(1). Small maps
-// have no index and scan linearly, exactly the old behaviour.
+// A flat key/value array plus an open-addressed index. OrderedMap leaves stable
+// removal holes. Map swap-removes. Small maps have no index and scan linearly.
 #define MAP_LINEAR_MAX 8
 #define IDX_POS 0xffffffffULL /* low 32: pos+2, 1 = tombstone */
 #define IDX_FRAG 0xffffffff00000000ULL /* high 32: hash fragment */
 #define MAP_DEAD(m, p) ((m)->deadbits && (m)->deadbits[(p) >> 6] >> ((p)&63) & 1)
-BMap* beans_map_new(long long key_ptr, long long val_ptr) {
+BMap* beans_map_new(long long key_ptr, long long val_ptr, long long ordered) {
     BMap* m = beans_alloc(sizeof(BMap), 3 | (key_ptr << 3) | (val_ptr << 4));
     m->cap = 4;
     m->data = calloc(8, 8); // idx/tombs/used/deadbits start zero: beans_alloc zeroes
+    m->ordered = ordered;
     return m;
 }
 // (re)build the index sized for the current entry count, dropping tombstones
 // and compacting holes. Only moves slots and writes index words — never
 // retains or releases.
-static void map_reindex(BMap* m, long long kind, long long (*hf)(long long)) {
+static void map_reindex_to(BMap* m, long long kind, long long (*hf)(long long),
+                           long long reserve) {
     if (m->deadbits) {
         long long w = 0;
         for (long long p = 0; p < m->used; p++) {
@@ -5731,8 +8923,9 @@ static void map_reindex(BMap* m, long long kind, long long (*hf)(long long)) {
         m->deadbits = NULL;
         m->used = w; // == m->len
     }
+    long long wanted = m->len > reserve ? m->len : reserve;
     long long cap = 16;
-    while (m->len * 3 >= cap * 2) cap <<= 1;
+    while (wanted * 3 >= cap * 2) cap <<= 1;
     free(m->idx);
     m->idx = calloc((size_t)cap, 8);
     m->icap = cap;
@@ -5744,6 +8937,34 @@ static void map_reindex(BMap* m, long long kind, long long (*hf)(long long)) {
         while (m->idx[i] & IDX_POS) i = (i + 1) & mask;
         m->idx[i] = (h & IDX_FRAG) | (unsigned long long)(p + 2);
     }
+}
+static void map_reindex(BMap* m, long long kind, long long (*hf)(long long)) {
+    map_reindex_to(m, kind, hf, 0);
+}
+void beans_map_reserve(BMap* m, long long capacity, long long kind, void* hash,
+                       long long line, long long col) {
+    if (capacity < 0) {
+        char b[64];
+        snprintf(b, sizeof b, "negative reserve capacity %lld", capacity);
+        beans_panic(b, line, col);
+    }
+    if (capacity > (1LL << 58)) beans_panic("reserve capacity too large", line, col);
+    if (capacity > m->cap) {
+        long long cap = m->cap;
+        while (cap < capacity && cap <= (1LL << 59)) cap *= 2;
+        if (cap < capacity) cap = capacity;
+        m->data = realloc(m->data, (size_t)cap * 16);
+        if (!m->data) beans_panic("out of memory", line, col);
+        if (m->deadbits) {
+            long long old_words = (m->cap + 63) >> 6;
+            long long new_words = (cap + 63) >> 6;
+            m->deadbits = realloc(m->deadbits, (size_t)new_words * 8);
+            memset(m->deadbits + old_words, 0,
+                   (size_t)(new_words - old_words) * 8);
+        }
+        m->cap = cap;
+    }
+    map_reindex_to(m, kind, (long long (*)(long long))hash, capacity);
 }
 // keys compare with the same equality lattice as list search (slot_eq): raw,
 // f64 value, string content, decimal value, structural thunk, never-equal.
@@ -5763,10 +8984,15 @@ static long long map_find(BMap* m, long long key, long long kind, void* eq,
     *hout = h;
     unsigned long long mask = (unsigned long long)m->icap - 1;
     unsigned long long frag = h & IDX_FRAG;
+    unsigned long long first_tomb = ~0ULL;
     for (unsigned long long i = h & mask;; i = (i + 1) & mask) {
         unsigned long long w = m->idx[i];
         unsigned long long st = w & IDX_POS;
-        if (st == 0) return -1;
+        if (st == 0) {
+            if (slot_out) *slot_out = first_tomb != ~0ULL ? first_tomb : i;
+            return -1;
+        }
+        if (st == 1 && first_tomb == ~0ULL) first_tomb = i;
         if (st >= 2 && (w & IDX_FRAG) == frag) {
             long long p = (long long)st - 2;
             if (slot_eq(m->data[p * 2], key, kind,
@@ -5777,19 +9003,44 @@ static long long map_find(BMap* m, long long key, long long kind, void* eq,
         }
     }
 }
-// note: the map owns key and value refs; the caller retains before calling
-void beans_map_set(BMap* m, long long key, long long val, long long kind, void* eq,
-                   void* hash) {
-    long long (*hf)(long long) = (long long (*)(long long))hash;
-    unsigned long long h = 0;
-    long long i = map_find(m, key, kind, eq, hf, &h, 0);
-    if (i >= 0) {
-        long long flags = (head_of(m)->meta & CC_SHAPE) >> 3;
-        if (flags & 1) beans_release((void*)key); // duplicate key not stored
-        if (flags & 2) beans_release((void*)m->data[i * 2 + 1]);
-        m->data[i * 2 + 1] = val;
-        return;
+// Raw-slot keys (integers, bools, and identity keys) are the common map case.
+// Keep their probe loop separate so every occupied bucket does not branch
+// through the full equality/hash kind lattice.
+static long long map_find_raw(BMap* m, long long key, unsigned long long* hout,
+                              unsigned long long* slot_out) {
+    if (!m->idx) {
+        for (long long i = 0; i < m->len; i++) {
+            if (m->data[i * 2] == key) return i;
+        }
+        return -1;
     }
+    unsigned long long h = beans_mix64((unsigned long long)key);
+    *hout = h;
+    unsigned long long mask = (unsigned long long)m->icap - 1;
+    unsigned long long frag = h & IDX_FRAG;
+    unsigned long long first_tomb = ~0ULL;
+    for (unsigned long long i = h & mask;; i = (i + 1) & mask) {
+        unsigned long long w = m->idx[i];
+        unsigned long long st = w & IDX_POS;
+        if (st == 0) {
+            if (slot_out) *slot_out = first_tomb != ~0ULL ? first_tomb : i;
+            return -1;
+        }
+        if (st == 1 && first_tomb == ~0ULL) first_tomb = i;
+        if (st >= 2 && (w & IDX_FRAG) == frag) {
+            long long p = (long long)st - 2;
+            if (m->data[p * 2] == key) {
+                if (slot_out) *slot_out = i;
+                return p;
+            }
+        }
+    }
+}
+
+static void map_insert_miss(BMap* m, long long key, long long val,
+                            unsigned long long h, long long kind,
+                            long long (*hf)(long long),
+                            unsigned long long insert_slot) {
     if (m->used == m->cap) {
         long long ow = (m->cap + 63) >> 6;
         m->cap *= 2;
@@ -5808,14 +9059,79 @@ void beans_map_set(BMap* m, long long key, long long val, long long kind, void* 
         if (m->len > MAP_LINEAR_MAX) map_reindex(m, kind, hf);
     } else if ((m->used + m->tombs) * 3 >= m->icap * 2) {
         map_reindex(m, kind, hf);
-    } else { // h came from the map_find miss above
-        unsigned long long mask = (unsigned long long)m->icap - 1;
-        unsigned long long i2 = h & mask;
-        while ((m->idx[i2] & IDX_POS) >= 2) i2 = (i2 + 1) & mask;
-        if ((m->idx[i2] & IDX_POS) == 1) m->tombs -= 1;
-        m->idx[i2] = (h & IDX_FRAG) | (unsigned long long)(m->used + 1);
+    } else { // the miss probe already found the insertion slot
+        if ((m->idx[insert_slot] & IDX_POS) == 1) m->tombs -= 1;
+        m->idx[insert_slot] =
+            (h & IDX_FRAG) | (unsigned long long)(m->used + 1);
     }
 }
+
+// note: the map owns key and value refs; the caller retains before calling
+void beans_map_set(BMap* m, long long key, long long val, long long kind, void* eq,
+                   void* hash) {
+    long long (*hf)(long long) = (long long (*)(long long))hash;
+    unsigned long long h = 0, slot = 0;
+    long long i = map_find(m, key, kind, eq, hf, &h, &slot);
+    if (i >= 0) {
+        long long flags = (head_of(m)->meta & CC_SHAPE) >> 3;
+        if (flags & 1) beans_release((void*)key); // duplicate key not stored
+        if (flags & 2) beans_release((void*)m->data[i * 2 + 1]);
+        m->data[i * 2 + 1] = val;
+        return;
+    }
+    map_insert_miss(m, key, val, h, kind, hf, slot);
+}
+
+void beans_map_set_raw(BMap* m, long long key, long long val) {
+    unsigned long long h = 0, slot = 0;
+    long long i = map_find_raw(m, key, &h, &slot);
+    if (i >= 0) {
+        long long flags = (head_of(m)->meta & CC_SHAPE) >> 3;
+        if (flags & 1) beans_release((void*)key);
+        if (flags & 2) beans_release((void*)m->data[i * 2 + 1]);
+        m->data[i * 2 + 1] = val;
+        return;
+    }
+    map_insert_miss(m, key, val, h, 0, NULL, slot);
+}
+
+long long beans_map_insert(BMap* m, long long key, long long val, long long kind,
+                           void* eq, void* hash) {
+    long long (*hf)(long long) = (long long (*)(long long))hash;
+    unsigned long long h = 0, slot = 0;
+    if (map_find(m, key, kind, eq, hf, &h, &slot) >= 0) {
+        long long flags = (head_of(m)->meta & CC_SHAPE) >> 3;
+        if (flags & 1) beans_release((void*)key);
+        if (flags & 2) beans_release((void*)val);
+        return 0;
+    }
+    map_insert_miss(m, key, val, h, kind, hf, slot);
+    return 1;
+}
+
+long long beans_map_insert_raw(BMap* m, long long key, long long val) {
+    unsigned long long h = 0, slot = 0;
+    if (map_find_raw(m, key, &h, &slot) >= 0) {
+        long long flags = (head_of(m)->meta & CC_SHAPE) >> 3;
+        if (flags & 1) beans_release((void*)key);
+        if (flags & 2) beans_release((void*)val);
+        return 0;
+    }
+    map_insert_miss(m, key, val, h, 0, NULL, slot);
+    return 1;
+}
+
+BOpt beans_map_get_raw(BMap* m, long long key) {
+    unsigned long long h = 0;
+    long long i = map_find_raw(m, key, &h, NULL);
+    return i >= 0 ? (BOpt){m->data[i * 2 + 1], 1} : (BOpt){0, 0};
+}
+
+long long beans_map_contains_raw(BMap* m, long long key) {
+    unsigned long long h = 0;
+    return map_find_raw(m, key, &h, NULL) >= 0;
+}
+
 long long beans_map_get(BMap* m, long long key, long long kind, long long* ok,
                         void* eq, void* hash) {
     unsigned long long h = 0;
@@ -5823,20 +9139,48 @@ long long beans_map_get(BMap* m, long long key, long long kind, long long* ok,
     *ok = i >= 0;
     return i >= 0 ? m->data[i * 2 + 1] : 0;
 }
-long long beans_map_remove(BMap* m, long long key, long long kind, void* eq,
-                           void* hash) {
-    long long (*hf)(long long) = (long long (*)(long long))hash;
-    unsigned long long h = 0, slot = 0;
-    long long i = map_find(m, key, kind, eq, hf, &h, &slot);
-    if (i < 0) return 0;
+static long long map_remove_found(BMap* m, long long i,
+                                  unsigned long long slot, long long kind,
+                                  long long (*hf)(long long)) {
     long long flags = (head_of(m)->meta & CC_SHAPE) >> 3;
     if ((flags & 1) && m->data[i * 2]) beans_release((void*)m->data[i * 2]);
     if ((flags & 2) && m->data[i * 2 + 1]) beans_release((void*)m->data[i * 2 + 1]);
-    if (!m->idx) { // small map: slide, exactly the old behaviour
-        memmove(m->data + i * 2, m->data + (i + 1) * 2,
-                (size_t)(m->used - i - 1) * 16);
+    if (!m->idx) {
+        if (m->ordered) {
+            memmove(m->data + i * 2, m->data + (i + 1) * 2,
+                    (size_t)(m->used - i - 1) * 16);
+        } else if (i != m->used - 1) {
+            m->data[i * 2] = m->data[(m->used - 1) * 2];
+            m->data[i * 2 + 1] = m->data[(m->used - 1) * 2 + 1];
+        }
         m->len -= 1;
         m->used -= 1;
+        return 1;
+    }
+    if (!m->ordered) {
+        long long last = m->used - 1;
+        m->idx[slot] = 1;
+        m->tombs += 1;
+        if (i != last) {
+            long long moved_key = m->data[last * 2];
+            unsigned long long h = slot_hash(moved_key, kind, hf);
+            unsigned long long mask = (unsigned long long)m->icap - 1;
+            for (unsigned long long at = h & mask;; at = (at + 1) & mask) {
+                unsigned long long state = m->idx[at] & IDX_POS;
+                if (state == (unsigned long long)(last + 2)) {
+                    m->idx[at] = (m->idx[at] & IDX_FRAG) |
+                                 (unsigned long long)(i + 2);
+                    break;
+                }
+            }
+            m->data[i * 2] = m->data[last * 2];
+            m->data[i * 2 + 1] = m->data[last * 2 + 1];
+        }
+        m->data[last * 2] = 0;
+        m->data[last * 2 + 1] = 0;
+        m->len -= 1;
+        m->used -= 1;
+        if (m->tombs > m->len) map_reindex(m, kind, hf);
         return 1;
     }
     // indexed: zero the pair into a hole — no entry moves, so no index
@@ -5851,6 +9195,41 @@ long long beans_map_remove(BMap* m, long long key, long long kind, void* eq,
     m->tombs += 1;
     if (m->used > m->len * 2) map_reindex(m, kind, hf);
     return 1;
+}
+long long beans_map_remove(BMap* m, long long key, long long kind, void* eq,
+                           void* hash) {
+    long long (*hf)(long long) = (long long (*)(long long))hash;
+    unsigned long long h = 0, slot = 0;
+    long long i = map_find(m, key, kind, eq, hf, &h, &slot);
+    return i < 0 ? 0 : map_remove_found(m, i, slot, kind, hf);
+}
+long long beans_map_remove_raw(BMap* m, long long key) {
+    unsigned long long h = 0, slot = 0;
+    long long i = map_find_raw(m, key, &h, &slot);
+    return i < 0 ? 0 : map_remove_found(m, i, slot, 0, NULL);
+}
+BMap* beans_map_clone(BMap* m, long long kind, void* hash) {
+    long long flags = (head_of(m)->meta & CC_SHAPE) >> 3;
+    BMap* copy = beans_map_new(flags & 1, (flags >> 1) & 1, m->ordered);
+    if (m->len > copy->cap) {
+        copy->cap = m->len;
+        copy->data = realloc(copy->data, (size_t)copy->cap * 16);
+        if (!copy->data) beans_panic("out of memory", 0, 0);
+    }
+    for (long long i = 0; i < m->used; i++) {
+        if (MAP_DEAD(m, i)) continue;
+        long long key = m->data[i * 2];
+        long long value = m->data[i * 2 + 1];
+        if ((flags & 1) && key) beans_retain((void*)key);
+        if ((flags & 2) && value) beans_retain((void*)value);
+        copy->data[copy->used * 2] = key;
+        copy->data[copy->used * 2 + 1] = value;
+        copy->used += 1;
+        copy->len += 1;
+    }
+    if (copy->len > MAP_LINEAR_MAX)
+        map_reindex(copy, kind, (long long (*)(long long))hash);
+    return copy;
 }
 BList* beans_map_keys(BMap* m) {
     long long flags = (head_of(m)->meta & CC_SHAPE) >> 3;
@@ -5962,6 +9341,37 @@ BList* beans_str_chars(char* s) {
         i += n;
     }
     return l;
+}
+long long beans_str_count_chars(char* s, long long from, long long to,
+                                long long line, long long col) {
+    long long len = beans_slen(s);
+    if (from < 0 || to < from || to > len) {
+        char m[112];
+        snprintf(m, sizeof m, "character range %lld..%lld out of range (len %lld)",
+                 from, to, len);
+        beans_panic(m, line, col);
+    }
+    long long count = 0;
+    for (long long i = from; i < to; count++) {
+        unsigned char c = (unsigned char)s[i];
+        long long n = c < 0x80           ? 1
+                      : (c >> 5) == 0x6  ? 2
+                      : (c >> 4) == 0xE  ? 3
+                      : (c >> 3) == 0x1E ? 4
+                                         : 1;
+        if (i + n > to) {
+            n = 1;
+        } else {
+            for (long long k = 1; k < n; k++) {
+                if (((unsigned char)s[i + k] >> 6) != 0x2) {
+                    n = 1;
+                    break;
+                }
+            }
+        }
+        i += n;
+    }
+    return count;
 }
 
 // ---- display through per-type show fns (emitted by the compiler) ----
@@ -6212,6 +9622,15 @@ void beans_bytes_resize(BList* b, long long n, long long line, long long col) {
     if (n > b->len) memset((char*)b->data + b->len, 0, (size_t)(n - b->len));
     b->len = n;
 }
+void beans_bytes_reserve(BList* b, long long n, long long line, long long col) {
+    if (n < 0) {
+        char m[64];
+        snprintf(m, sizeof m, "negative reserve capacity %lld", n);
+        beans_panic(m, line, col);
+    }
+    if (n > (1LL << 58)) beans_panic("reserve capacity too large", line, col);
+    bytes_grow(b, n);
+}
 void beans_bytes_fill(BList* b, long long v) {
     memset(b->data, (int)(v & 255), (size_t)b->len);
 }
@@ -6292,10 +9711,33 @@ void beans_bytes_append_str(BList* b, char* s) {
     memcpy((char*)b->data + b->len, s, (size_t)n);
     b->len += n;
 }
+void beans_bytes_append_i64(BList* b, long long value) {
+    bytes_grow(b, b->len + 8);
+    unsigned long long bits = (unsigned long long)value;
+    for (int shift = 0; shift < 64; shift += 8)
+        ((unsigned char*)b->data)[b->len++] = (unsigned char)(bits >> shift);
+}
+void beans_bytes_append_range(BList* b, BList* source, long long from, long long to,
+                              long long line, long long col) {
+    if (from < 0 || to < from || to > source->len) {
+        char m[96];
+        snprintf(m, sizeof m, "slice %lld..%lld out of range (len %lld)", from, to,
+                 source->len);
+        beans_panic(m, line, col);
+    }
+    long long count = to - from;
+    long long at = b->len;
+    bytes_grow(b, at + count);
+    memmove((char*)b->data + at, (char*)source->data + from, (size_t)count);
+    b->len += count;
+}
 char* beans_bytes_to_string(BList* b) {
     long long n = 0;
     while (n < b->len && ((char*)b->data)[n] != 0) n++; // strings are text
     return str_make((char*)b->data, n);
+}
+char* beans_bytes_to_string_full(BList* b) {
+    return str_make((char*)b->data, b->len);
 }
 
 // ---- files (kind 6 resources) -----------------------------------------------
@@ -6663,66 +10105,6 @@ BRes beans_mmap_resize(BMMap* m, long long n) {
     return (BRes){1, NULL};
 }
 
-// ---- BufReader (kind 1 fixed: slots 0/1 are the File and the buffer — the
-// generic destructor walks them; pread at its own offset, cursor untouched) --
-typedef struct {
-    BFile* f;
-    BList* buf;
-    long long off, bpos, blim, eof;
-} BBufR;
-BBufR* beans_bufr_on(BFile* f) {
-    BBufR* r = beans_alloc(sizeof(BBufR), 1 | (3 << 3));
-    beans_retain(f); // the reader owns a ref to its file
-    r->f = f;
-    r->buf = bytes_mk(8192);
-    return r;
-}
-// a line without its '\n'; a partial line at EOF comes through, then none
-BRes beans_bufr_read_line(BBufR* r) {
-    BFile* f = r->f;
-    long long cap = 16, len = 0;
-    char* acc = malloc((size_t)cap);
-    while (1) {
-        while (r->bpos < r->blim) {
-            char c = ((char*)r->buf->data)[r->bpos++];
-            if (c == '\n') {
-                char* s = str_make(acc, len);
-                free(acc);
-                return (BRes){(long long)s, NULL};
-            }
-            if (len == cap) {
-                cap *= 2;
-                acc = realloc(acc, (size_t)cap);
-            }
-            acc[len++] = c;
-        }
-        if (r->eof) break;
-        if (f->closed) {
-            free(acc);
-            return (BRes){0, closed_err()};
-        }
-        ssize_t got = pread((int)f->fd, r->buf->data, 8192, (off_t)r->off);
-        if (got < 0) {
-            free(acc);
-            return (BRes){0, op_err_obj("read", errno)};
-        }
-        if (got == 0) {
-            r->eof = 1;
-            break;
-        }
-        r->off += got;
-        r->bpos = 0;
-        r->blim = got;
-    }
-    if (len == 0) {
-        free(acc);
-        return (BRes){0, NULL}; // ok(none)
-    }
-    char* s = str_make(acc, len);
-    free(acc);
-    return (BRes){(long long)s, NULL};
-}
-
 // ---- Dir.walk: files and symlinks under root (lstat — never follows a
 // link), paths relative to root, "/"-joined, sorted at the end ----
 typedef struct {
@@ -6818,77 +10200,6 @@ BRes beans_dir_walk(char* path) {
     return (BRes){(long long)l, NULL};
 }
 
-// ---- Path (pure string math, no fs access) ----
-static long long path_base_span(char* p, long long* start) {
-    long long n = beans_slen(p);
-    long long end = n;
-    while (end > 0 && p[end - 1] == '/') end--;
-    if (end == 0) {
-        *start = 0;
-        return n ? -1 : 0; // -1: the whole thing is slashes — base is "/"
-    }
-    long long slash = -1;
-    for (long long i = end - 1; i >= 0; i--) {
-        if (p[i] == '/') {
-            slash = i;
-            break;
-        }
-    }
-    *start = slash + 1;
-    return end - (slash + 1);
-}
-char* beans_path_join(char* a, char* b) {
-    long long la = beans_slen(a), lb = beans_slen(b);
-    if (lb && b[0] == '/') return str_make(b, lb); // absolute b wins
-    if (!la) return str_make(b, lb);
-    if (!lb) return str_make(a, la);
-    long long end = la;
-    while (end > 0 && a[end - 1] == '/') end--;
-    char* r = beans_alloc(end + 1 + lb + 1, (end + 1 + lb) << 3);
-    memcpy(r, a, (size_t)end);
-    r[end] = '/';
-    memcpy(r + end + 1, b, (size_t)lb);
-    return r;
-}
-char* beans_path_parent(char* p) {
-    long long n = beans_slen(p);
-    long long end = n;
-    while (end > 0 && p[end - 1] == '/') end--;
-    if (end == 0) return str_make(n ? "/" : "", n ? 1 : 0);
-    long long slash = -1;
-    for (long long i = end - 1; i >= 0; i--) {
-        if (p[i] == '/') {
-            slash = i;
-            break;
-        }
-    }
-    if (slash < 0) return str_make("", 0);
-    if (slash == 0) return str_make("/", 1);
-    return str_make(p, slash);
-}
-char* beans_path_base(char* p) {
-    long long start, len = path_base_span(p, &start);
-    if (len < 0) return str_make("/", 1);
-    return str_make(p + start, len);
-}
-// a leading dot is a dotfile, not an extension: ext(".bashrc") is ""
-char* beans_path_ext(char* p) {
-    long long start, len = path_base_span(p, &start);
-    if (len <= 0) return str_make("", 0);
-    for (long long i = len - 1; i > 0; i--) {
-        if (p[start + i] == '.') return str_make(p + start + i, len - i);
-    }
-    return str_make("", 0);
-}
-char* beans_path_stem(char* p) {
-    long long start, len = path_base_span(p, &start);
-    if (len < 0) return str_make("/", 1);
-    for (long long i = len - 1; i > 0; i--) {
-        if (p[start + i] == '.') return str_make(p + start, i);
-    }
-    return str_make(p + start, len);
-}
-
 BRes beans_file_open(char* path, char* mode) {
     int flags;
     if (strcmp(mode, "r") == 0) flags = O_RDONLY;
@@ -6913,64 +10224,6 @@ BRes beans_file_open(char* path, char* mode) {
     return (BRes){(long long)f, NULL};
 }
 
-static BRes fs_read_all(char* path, int as_bytes) {
-    int fd = open(path, O_RDONLY);
-    if (fd < 0) return (BRes){0, fs_err_obj_rc(path, errno)};
-    BList* buf = bytes_mk(0);
-    char chunk[65536];
-    while (1) {
-        ssize_t r = read(fd, chunk, sizeof chunk);
-        if (r < 0) {
-            if (errno == EINTR) continue;
-            int e = errno;
-            close(fd);
-            beans_release(buf); // the error path must not leak the buffer
-            return (BRes){0, fs_err_obj_rc(path, e)};
-        }
-        if (r == 0) break;
-        bytes_grow(buf, buf->len + r);
-        memcpy((char*)buf->data + buf->len, chunk, (size_t)r);
-        buf->len += r;
-    }
-    close(fd);
-    if (as_bytes) return (BRes){(long long)buf, NULL};
-    char* s = str_make((char*)buf->data, buf->len);
-    beans_release(buf);
-    return (BRes){(long long)s, NULL};
-}
-BRes beans_file_read_all(char* path) { return fs_read_all(path, 0); }
-BRes beans_file_read_all_b(char* path) { return fs_read_all(path, 1); }
-
-static BRes fs_write_all(char* path, const char* p, long long n, int append) {
-    int flags = O_WRONLY | O_CREAT | (append ? O_APPEND : O_TRUNC);
-    int fd = open(path, flags, 0644);
-    if (fd < 0) return (BRes){0, fs_err_obj_rc(path, errno)};
-    long long done = 0;
-    while (done < n) {
-        ssize_t r = write(fd, p + done, (size_t)(n - done));
-        if (r < 0) {
-            if (errno == EINTR) continue;
-            int e = errno;
-            close(fd);
-            return (BRes){0, fs_err_obj_rc(path, e)};
-        }
-        done += r;
-    }
-    close(fd);
-    return (BRes){done, NULL};
-}
-BRes beans_file_write_all(char* path, char* s) {
-    return fs_write_all(path, s, beans_slen(s), 0);
-}
-BRes beans_file_append_all(char* path, char* s) {
-    return fs_write_all(path, s, beans_slen(s), 1);
-}
-BRes beans_file_write_all_b(char* path, BList* b) {
-    return fs_write_all(path, (char*)b->data, b->len, 0);
-}
-BRes beans_file_append_all_b(char* path, BList* b) {
-    return fs_write_all(path, (char*)b->data, b->len, 1);
-}
 long long beans_file_exists(char* path) {
     struct stat st;
     return stat(path, &st) == 0 && !S_ISDIR(st.st_mode);
@@ -6992,44 +10245,6 @@ BRes beans_file_rename(char* from, char* to) {
     if (rename(from, to) != 0) return (BRes){0, fs_err_obj_rc(from, errno)};
     return (BRes){1, NULL};
 }
-BRes beans_file_copy(char* from, char* to) {
-    int src = open(from, O_RDONLY);
-    if (src < 0) return (BRes){0, fs_err_obj_rc(from, errno)};
-    int dst = open(to, O_WRONLY | O_CREAT | O_TRUNC, 0644);
-    if (dst < 0) {
-        int e = errno;
-        close(src);
-        return (BRes){0, fs_err_obj_rc(to, e)};
-    }
-    char chunk[65536];
-    long long total = 0;
-    while (1) {
-        ssize_t r = read(src, chunk, sizeof chunk);
-        if (r < 0) {
-            int e = errno;
-            close(src);
-            close(dst);
-            return (BRes){0, fs_err_obj_rc(from, e)};
-        }
-        if (r == 0) break;
-        ssize_t done = 0;
-        while (done < r) {
-            ssize_t w = write(dst, chunk + done, (size_t)(r - done));
-            if (w < 0) {
-                int e = errno;
-                close(src);
-                close(dst);
-                return (BRes){0, fs_err_obj_rc(to, e)};
-            }
-            done += w;
-        }
-        total += r;
-    }
-    close(src);
-    close(dst);
-    return (BRes){total, NULL};
-}
-
 BRes beans_dir_make(char* path) {
     if (mkdir(path, 0755) != 0) return (BRes){0, fs_err_obj_rc(path, errno)};
     return (BRes){1, NULL};
@@ -7276,7 +10491,7 @@ BThread* beans_thread_spawn(void* thunk, void* env) {
     BThread* t = beans_alloc(sizeof(BThread), 0);
     t->thunk = (long long (*)(void*))thunk;
     t->env = env; // ownership of the closure box moves to the thread
-    cc_mt = 1; // from here every count op is atomic, in every thread
+    cc_enable_mt(); // from here every count op is atomic, in every thread
     beans_retain(t); // one ref for the handle, one for the running thread
     cc_threads += 1;
     pthread_create(&t->th, NULL, thread_main, t);
@@ -7362,6 +10577,27 @@ typedef struct BDec {
     __int128 c;
     long long s;
 } BDec;
+typedef unsigned __int128 BDecV;
+#define BDEC_COEFF_BITS 112
+static BDecV decv_coeff_mask(void) {
+    return (((BDecV)1) << BDEC_COEFF_BITS) - 1;
+}
+static __int128 decv_coeff(BDecV v) {
+    BDecV mask = decv_coeff_mask();
+    BDecV raw = v & mask;
+    if (raw & (((BDecV)1) << (BDEC_COEFF_BITS - 1))) raw |= ~mask;
+    return (__int128)raw;
+}
+static long long decv_scale(BDecV v) {
+    return (long long)(v >> BDEC_COEFF_BITS);
+}
+static BDecV decv_mk(__int128 c, long long s) {
+    const __int128 limit = ((__int128)1) << (BDEC_COEFF_BITS - 1);
+    if (s < 0 || s > 65535 || c < -limit || c >= limit)
+        beans_panic("decimal overflow", 0, 0);
+    return (((BDecV)(unsigned long long)s) << BDEC_COEFF_BITS) |
+           ((BDecV)c & decv_coeff_mask());
+}
 static BDec* dec_mk(__int128 c, long long s) {
     BDec* d = beans_alloc(sizeof(BDec), 0);
     d->c = c;
@@ -7375,10 +10611,76 @@ static __int128 pow10i(long long n) {
 }
 BDec* beans_dec_new(__int128 c, long long s) { return dec_mk(c, s); }
 BDec* beans_dec_from_int(long long v) { return dec_mk((__int128)v, 0); }
+BDec* beans_decv_box(BDecV v) { return dec_mk(decv_coeff(v), decv_scale(v)); }
+BDecV beans_decv_unbox(BDec* v) { return decv_mk(v->c, v->s); }
+BDecV beans_decv_from_int(long long v) { return decv_mk((__int128)v, 0); }
 static void dec_align(BDec* a, BDec* b, __int128* ca, __int128* cb, long long* s) {
     *s = a->s > b->s ? a->s : b->s;
     *ca = a->c * pow10i(*s - a->s);
     *cb = b->c * pow10i(*s - b->s);
+}
+static void decv_align(BDecV a, BDecV b, __int128* ca, __int128* cb,
+                       long long* s) {
+    long long as = decv_scale(a), bs = decv_scale(b);
+    *s = as > bs ? as : bs;
+    *ca = decv_coeff(a) * pow10i(*s - as);
+    *cb = decv_coeff(b) * pow10i(*s - bs);
+}
+__attribute__((always_inline)) BDecV beans_decv_add(BDecV a, BDecV b) {
+    if (decv_scale(a) == decv_scale(b))
+        return decv_mk(decv_coeff(a) + decv_coeff(b), decv_scale(a));
+    __int128 ca, cb;
+    long long s;
+    decv_align(a, b, &ca, &cb, &s);
+    return decv_mk(ca + cb, s);
+}
+__attribute__((always_inline)) BDecV beans_decv_sub(BDecV a, BDecV b) {
+    if (decv_scale(a) == decv_scale(b))
+        return decv_mk(decv_coeff(a) - decv_coeff(b), decv_scale(a));
+    __int128 ca, cb;
+    long long s;
+    decv_align(a, b, &ca, &cb, &s);
+    return decv_mk(ca - cb, s);
+}
+BDecV beans_decv_mul(BDecV a, BDecV b) {
+    return decv_mk(decv_coeff(a) * decv_coeff(b),
+                   decv_scale(a) + decv_scale(b));
+}
+BDecV beans_decv_div(BDecV a, BDecV b, long long ln, long long cl) {
+    __int128 bc = decv_coeff(b);
+    if (bc == 0) beans_panic("divide by zero", ln, cl);
+    long long extra = 20;
+    __int128 q = decv_coeff(a) * pow10i(extra + decv_scale(b)) / bc;
+    long long s = decv_scale(a) + extra;
+    while (s > 0 && q % 10 == 0) {
+        q /= 10;
+        s -= 1;
+    }
+    return decv_mk(q, s);
+}
+BDecV beans_decv_neg(BDecV a) {
+    return decv_mk(-decv_coeff(a), decv_scale(a));
+}
+BDecV beans_decv_abs(BDecV a) {
+    __int128 c = decv_coeff(a);
+    return decv_mk(c < 0 ? -c : c, decv_scale(a));
+}
+BDecV beans_decv_round(BDecV a, long long places) {
+    __int128 c = decv_coeff(a);
+    long long s = decv_scale(a);
+    if (places >= s) return a;
+    __int128 f = pow10i(s - places);
+    __int128 q = c / f, rem = c % f;
+    if (rem < 0) rem = -rem;
+    if (rem * 2 >= f) q += c >= 0 ? 1 : -1;
+    if (places < 0) return decv_mk(q * pow10i(-places), 0);
+    return decv_mk(q, places);
+}
+int beans_decv_cmp(BDecV a, BDecV b) {
+    __int128 ca, cb;
+    long long s;
+    decv_align(a, b, &ca, &cb, &s);
+    return ca < cb ? -1 : ca > cb ? 1 : 0;
 }
 BDec* beans_dec_add(BDec* a, BDec* b) {
     __int128 ca, cb;
@@ -7497,6 +10799,12 @@ BRes beans_str_to_decimal(char* s) {
 }
 long long beans_dec_to_int(BDec* a) { return (long long)(a->c / pow10i(a->s)); }
 double beans_dec_to_f64(BDec* a) { return (double)a->c / (double)pow10i(a->s); }
+long long beans_decv_to_int(BDecV a) {
+    return (long long)(decv_coeff(a) / pow10i(decv_scale(a)));
+}
+double beans_decv_to_f64(BDecV a) {
+    return (double)decv_coeff(a) / (double)pow10i(decv_scale(a));
+}
 BDec* beans_dec_from_f64(double v) {
     char buf[64];
     snprintf(buf, sizeof buf, "%.17g", v);
@@ -7522,6 +10830,32 @@ BDec* beans_dec_from_f64(double v) {
     }
     if (neg) c = -c;
     return dec_mk(c, s);
+}
+BDecV beans_decv_from_f64(double v) {
+    char buf[64];
+    snprintf(buf, sizeof buf, "%.17g", v);
+    __int128 c = 0;
+    long long s = 0;
+    int neg = 0, after = 0;
+    long long ex = 0;
+    for (const char* p = buf; *p; p++) {
+        if (*p == '-') { neg = 1; continue; }
+        if (*p == '+') continue;
+        if (*p == '.') { after = 1; continue; }
+        if (*p == 'e' || *p == 'E') {
+            ex = strtoll(p + 1, NULL, 10);
+            break;
+        }
+        c = c * 10 + (*p - '0');
+        if (after) s += 1;
+    }
+    s -= ex;
+    if (s < 0) {
+        c *= pow10i(-s);
+        s = 0;
+    }
+    if (neg) c = -c;
+    return decv_mk(c, s);
 }
 char* beans_dec_str(BDec* a) {
     __int128 c = a->c;
@@ -7554,6 +10888,10 @@ char* beans_dec_str(BDec* a) {
     if (digits != dsmall) free(digits);
     if (out != osmall) free(out);
     return r;
+}
+char* beans_decv_str(BDecV v) {
+    BDec d = {decv_coeff(v), decv_scale(v)};
+    return beans_dec_str(&d);
 }
 
 // ---- std.fmt (mirrors builtins.cpp byte for byte) ----
@@ -7611,45 +10949,9 @@ char* beans_fmt_dec(BDec* d, long long p) {
     beans_release(base);
     return out;
 }
-char* beans_fmt_hex(long long v) {
-    char buf[24];
-    snprintf(buf, sizeof buf, "%llx", (unsigned long long)v);
-    return rc_strdup(buf);
-}
-char* beans_fmt_bin(long long v) {
-    unsigned long long u = (unsigned long long)v;
-    if (!u) return rc_strdup("0");
-    char buf[65];
-    int n = 0, seen = 0;
-    for (int i = 63; i >= 0; i--) {
-        int bit = (int)((u >> i) & 1);
-        if (bit) seen = 1;
-        if (seen) buf[n++] = (char)('0' + bit);
-    }
-    return str_make(buf, n);
-}
-char* beans_fmt_group(long long v, char* sep) {
-    unsigned long long m = v < 0 ? 0ULL - (unsigned long long)v : (unsigned long long)v;
-    char digits[24];
-    int dn = 0;
-    if (!m) digits[dn++] = '0';
-    while (m) {
-        digits[dn++] = (char)('0' + (int)(m % 10));
-        m /= 10;
-    }
-    long long sl = beans_slen(sep);
-    long long total = (v < 0 ? 1 : 0) + dn + (long long)((dn - 1) / 3) * sl;
-    char* out = beans_alloc(total + 1, total << 3);
-    long long o = 0;
-    if (v < 0) out[o++] = '-';
-    for (int i = dn - 1; i >= 0; i--) {
-        out[o++] = digits[i];
-        if (i && i % 3 == 0) {
-            memcpy(out + o, sep, (size_t)sl);
-            o += sl;
-        }
-    }
-    return out;
+char* beans_decv_fmt(BDecV v, long long p) {
+    BDec d = {decv_coeff(v), decv_scale(v)};
+    return beans_fmt_dec(&d, p);
 }
 )RT";
 }

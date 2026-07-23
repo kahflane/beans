@@ -3,6 +3,7 @@
 // rewrites with the durable-commit pattern: temp file, sync, rename over,
 // sync the parent dir.
 import std.io
+import std.fs
 
 class KV {
     pub dir: string = ""
@@ -17,11 +18,11 @@ class KV {
         var rec: Bytes = Bytes.new(8)
         rec.put_u32(0, key.len()).put_u32(4, value.len())
         rec.append_str(key).append_str(value)
-        return File.append_bytes(self.path, rec)
+        return fs.append_bytes(self.path, rec)
     }
 
     pub fn get(self, key: string) -> Result<string> {
-        let data: Bytes = File.read_bytes(self.path)?
+        let data: Bytes = fs.read_bytes(self.path)?
         var found: string = ""
         var have: bool = false
         var pos: int = 0
@@ -52,7 +53,7 @@ class KV {
 
     // rewrite keeping only the last value per key, then commit durably
     pub fn compact(self) -> Result<int> {
-        let data: Bytes = File.read_bytes(self.path)?
+        let data: Bytes = fs.read_bytes(self.path)?
         var names: List<string> = []
         var latest: Map<string, string> = {}
         var pos: int = 0
@@ -85,7 +86,7 @@ class KV {
         }
 
         let tmp: string = "{self.path}.tmp"
-        File.write_bytes(tmp, out)?
+        fs.write_bytes(tmp, out)?
         let f: File = File.open(tmp, "rw")?
         f.sync()?
         f.close()?
@@ -124,7 +125,7 @@ fn main() {
     // tail as EOF, not slice past the end and panic.
     var torn: Bytes = Bytes.new(8)
     torn.put_u32(0, 100).put_u32(4, 100)
-    File.append_bytes(kv.path, torn).expect("torn append")
+    fs.append_bytes(kv.path, torn).expect("torn append")
     io.println(kv.get("name").expect("survives torn tail"))
     let recovered: int = kv.compact().expect("compact past torn tail")
     io.println("recovered, {recovered} bytes")

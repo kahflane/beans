@@ -1,7 +1,9 @@
 // bun mandel.js — mirror of mandel.b / mandel.go (float math, no allocation)
-const w = 1800;
-const h = 1800;
-const maxIter = 100;
+const size = Number(process.argv[2] ?? 1800);
+const seed = Number(process.argv[3] ?? 1);
+const w = size;
+const h = size;
+const maxIter = 80 + (seed % 41);
 let inside = 0;
 
 for (let y = 0; y < h; y++) {

@@ -8,10 +8,11 @@
 // that calls lock() on a description it already holds via another handle would
 // wait forever, so use try_lock when the same thread might already hold it.
 import std.io
+import std.fs
 
 fn main() {
     let p: string = "{Dir.temp()}/beans_locks_example.dat"
-    File.write(p, "guarded").expect("seed")
+    fs.write(p, "guarded").expect("seed")
 
     let writer: File = File.open(p, "rw").expect("open writer")
     let rival: File = File.open(p, "rw").expect("open rival")

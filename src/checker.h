@@ -7,6 +7,7 @@
 
 #include "ast.h"
 #include "builtins.h"
+#include "hir.h"
 #include "types.h"
 
 namespace beans {
@@ -50,6 +51,7 @@ public:
 
     void run();
     const std::vector<CheckError>& errors() const { return errors_; }
+    const HirProgram& hir() const { return hir_; }
 
 private:
     // ---- setup ----
@@ -78,6 +80,7 @@ private:
     void resolve_class_members(ClassInfo& c);
     void resolve_enum_members(EnumInfo& e);
     void resolve_supers(ClassInfo& c);
+    void check_inline_layout_cycles();
     void check_hierarchy(ClassInfo& c);
     void check_fn_body(const FnDecl& f, ClassInfo* cls, EnumInfo* en);
 
@@ -89,6 +92,25 @@ private:
     bool is_subclass_of(const std::string& cls, const std::string& super);
     bool printable(TypeId t);
     bool printable_rec(TypeId t, std::set<TypeId>& seen);
+    bool trait_satisfied(TypeId t, const std::string& trait);
+    bool trait_satisfied_rec(TypeId t, const std::string& trait,
+                             std::set<std::pair<TypeId, std::string>>& seen);
+    static std::vector<std::string> split_traits(const std::string& bounds);
+    static std::string canonical_trait(const std::string& trait);
+    void set_type_params(const std::vector<GenericParam>& params);
+    void validate_generic_params(const std::vector<GenericParam>& params,
+                                 uint32_t line, uint32_t col);
+    void check_generic_bounds(const std::vector<GenericParam>& params,
+                              const std::map<std::string, TypeId>& env,
+                              uint32_t line, uint32_t col,
+                              const std::string& what);
+    bool is_move_only(TypeId t) const;
+    bool is_wide_inline_value(TypeId t) const;
+    bool is_inline_storage_type(TypeId t, bool require_c_layout) const;
+    bool is_raw_pointee(TypeId t) const;
+    bool is_c_abi_type(TypeId t, bool allow_unit) const;
+    bool is_c_abi_callback(TypeId t) const;
+    void require_move_source(const Expr* e, TypeId t, const std::string& where);
 
     // ---- statements ----
     void check_block(const std::vector<StmtPtr>& body);
@@ -119,12 +141,14 @@ private:
 
     // ---- expressions ----
     TypeId check_expr(const Expr* e, TypeId expected);
+    TypeId check_expr_impl(const Expr* e, TypeId expected);
     TypeId check_call(const Expr* e, TypeId expected);
     TypeId check_init(const Expr* e, TypeId expected);
     TypeId check_field(const Expr* e, bool for_call, TypeId* self_type_out);
     TypeId check_match(const Expr* e, TypeId expected, bool as_stmt = false);
     TypeId check_binary(const Expr* e);
     TypeId literal_or(const Expr* e, TypeId expected, TypeId dflt);
+    void check_integer_literal(const Expr* e, TypeId type);
     bool is_adaptable_literal(const Expr* e);
     void check_interpolation(const Expr* str);
 
@@ -133,6 +157,7 @@ private:
         enum class Kind { none, field, method } kind = Kind::none;
         TypeId type = nullptr;   // field type or fn type
         bool is_static = false;
+        const FnDecl* decl = nullptr; // user method; carries ownership modes
     };
     Member lookup_member(TypeId recv, const std::string& name,
                          uint32_t line = 0, uint32_t col = 0);
@@ -141,17 +166,30 @@ private:
     TypeId class_type_of(const ClassInfo& c); // self type incl. own params
 
     // ---- scopes ----
-    struct Local { TypeId type; bool mut; };
+    enum class MoveState { available, moved, maybe_moved };
+    struct Local {
+        TypeId type;
+        bool mut;
+        bool borrowed;
+        bool inout = false;
+        MoveState move = MoveState::available;
+    };
     void push_scope() { scopes_.emplace_back(); }
     void pop_scope() { scopes_.pop_back(); }
-    void declare(const std::string& name, TypeId t, bool mut, uint32_t line, uint32_t col);
+    void declare(const std::string& name, TypeId t, bool mut, uint32_t line,
+                 uint32_t col, bool borrowed = false);
     const Local* find_local(const std::string& name) const;
+    Local* find_local_mut(const std::string& name);
+    int local_scope_index(const std::string& name) const;
+    void merge_move_states(const std::vector<std::map<std::string, Local>>& a,
+                           const std::vector<std::map<std::string, Local>>& b);
 
     void error_at(uint32_t line, uint32_t col, std::string msg);
 
     // ---- state ----
     const Program& prog_;
-    TypePool pool_;
+    HirProgram hir_;
+    TypePool& pool_;
     std::vector<CheckError> errors_;
 
     // keys are package-qualified names ("util.User"; root/builtins plain)
@@ -159,7 +197,7 @@ private:
     std::map<std::string, EnumInfo> enums_;
     std::map<std::string, TypeId> top_fns_;
     std::map<std::string, const FnDecl*> top_fn_decls_;
-    std::set<std::string> builtin_generic_classes_; // List, Map, Thread, Mutex, Channel
+    std::set<std::string> builtin_generic_classes_; // List/Map/OrderedMap + thread containers
 
     std::map<std::string, std::string> prefix_by_path_; // import path -> pkg prefix
 
@@ -175,9 +213,20 @@ private:
     bool cur_has_self_ = false;
     bool in_init_body_ = false; // super.init(...) is only meaningful here
     std::set<std::string> cur_type_params_;
+    std::map<std::string, std::set<std::string>> cur_type_bounds_;
     // block nesting inside the current fn body (1 = top level) — defer is a
     // function-exit hook and is only legal at depth 1
     int block_depth_ = 0;
+    int literal_sign_ = 1;
+    std::set<const Expr*> bad_integer_literals_;
+    int take_floor_depth_ = -1; // outer locals cannot be moved in loops/closures
+    int capture_floor_depth_ = -1;
+    bool require_send_captures_ = false;
+    std::set<std::string> bad_send_captures_;
+    bool allow_inout_expr_ = false;
+    std::set<std::string> bad_inout_captures_;
+    bool in_defer_ = false;
+    int unsafe_depth_ = 0;
 
     // shorthands
     TypeId t_int() { return pool_.prim(Type::K::int_); }

@@ -1,0 +1,14 @@
+8 2
+2 2 [red, blue, green]
+10 6
+2 [1, 2, 3] [n2, n2]
+map source 5 7 7 15 7 1 fruit:6
+wide generic 5 5
+value 42 8
+result 42 14
+3421780262 3421780262
+2 172 2 300
+append 3 300 77
+boundaries 16939 20 77
+path a/b /root /a b .gz archive.tar 
+fmt ffffffffffffffff 1010 -9_223_372_036_854_775_808

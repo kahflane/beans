@@ -3,7 +3,7 @@
 #include <string>
 #include <vector>
 
-#include "ast.h"
+#include "hir.h"
 
 namespace beans {
 
@@ -18,18 +18,21 @@ struct CGError {
 // names, so multi-package programs link into one flat module.
 class CodeGen {
 public:
-    explicit CodeGen(const Program& prog);
+    explicit CodeGen(const HirProgram& hir);
 
     // returns the .ll text; empty on failure
     std::string generate();
     const std::vector<CGError>& errors() const { return errors_; }
+    const std::string& ffi_c() const { return ffi_c_; }
 
     // the C runtime that every beans binary links against
     static const char* runtime_c();
 
 private:
+    const HirProgram& hir_;
     const Program& prog_;
     std::vector<CGError> errors_;
+    std::string ffi_c_;
 
     void error_at(uint32_t line, uint32_t col, std::string msg);
 };

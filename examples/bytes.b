@@ -37,6 +37,14 @@ fn main() {
     buf.append(Bytes.from("!")).append_str("!!")
     io.println("{buf.to_string()} {buf.len()}")
 
+    // reserve and record appends grow one unique buffer. append_range copies
+    // directly, including when the source and destination are the same value.
+    var fast: Bytes = Bytes.new(0)
+    fast.reserve(64).append_i64(0 - 123456789)
+    fast.append_range(Bytes.from("abcd"), 1, 4)
+    fast.append_range(fast, 8, 11)
+    io.println("{fast.len()} {fast.get_i64(0)} {fast.slice(8, 14).to_string()}")
+
     // to_string stops at an embedded NUL — strings are text
     let z: Bytes = Bytes.new(6)
     z.set(0, 104).set(1, 105)

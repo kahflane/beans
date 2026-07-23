@@ -1,5 +1,6 @@
 #pragma once
 
+#include <array>
 #include <atomic>
 #include <condition_variable>
 #include <cstdint>
@@ -152,24 +153,54 @@ struct AtomicVal;
 struct BytesVal;
 struct FileVal;
 struct MMapVal;
-struct BufReaderVal;
+struct BoxVal;
+struct ArenaVal;
+struct SharedVal;
+struct WeakVal;
+
+enum class RawScalar : uint8_t {
+    invalid, signed_int, unsigned_int, float_, boolean, pointer, record, array
+};
+struct RawPtrVal {
+    void* address = nullptr;
+    RawScalar scalar = RawScalar::invalid;
+    uint8_t bits = 0;
+    uint32_t size = 0;
+    uint32_t align = 1;
+    const ClassDecl* record_decl = nullptr;
+    // Pointer fields and fixed arrays carry their element layout with the raw
+    // value. This keeps nested C layouts independent from the host C++ type
+    // system and also makes RawPtr<RawPtr<T>> work in the interpreter.
+    std::shared_ptr<RawPtrVal> element;
+    uint32_t element_count = 0;
+};
 
 struct Value {
     enum class K {
         unit, int_, float_, decimal_, bool_, string_,
-        list, map, instance, enum_v, closure, fn_ref, range,
-        thread, mutex, channel, atomic, bytes, file, mmap, bufr,
+        list, map, instance, struct_v, enum_v, closure, fn_ref, range,
+        thread, mutex, channel, atomic, bytes, file, mmap, box, arena,
+        shared, weak, rawptr, simd4f32, fixed_array, slice,
     };
     K k = K::unit;
 
     int64_t i = 0;
+    // Integer values keep their Beans width/sign even though the interpreter
+    // stores the bits in one host word. This matters for u64 display/order and
+    // for wrapping narrow arithmetic exactly like native lowering.
+    uint8_t int_bits = 64;
+    bool int_unsigned = false;
     double f = 0;
+    uint8_t float_bits = 64;
     bool b = false;
     Decimal dec;
     std::shared_ptr<std::string> s;
     std::shared_ptr<ListVal> list;
     std::shared_ptr<MapVal> map;
     std::shared_ptr<InstanceVal> inst;
+    const ClassDecl* struct_decl = nullptr;
+    std::vector<Value> struct_fields;
+    std::vector<uint8_t> union_bytes;
     std::shared_ptr<EnumVal> en;
     std::shared_ptr<ClosureVal> clo;
     std::shared_ptr<FnRefVal> fnr;
@@ -181,7 +212,16 @@ struct Value {
     std::shared_ptr<BytesVal> bytes;
     std::shared_ptr<FileVal> file;
     std::shared_ptr<MMapVal> mm;
-    std::shared_ptr<BufReaderVal> br;
+    std::shared_ptr<BoxVal> box;
+    std::shared_ptr<ArenaVal> arena;
+    std::shared_ptr<SharedVal> shared;
+    std::shared_ptr<WeakVal> weak;
+    RawPtrVal raw;
+    std::array<float, 4> simd = {};
+    std::vector<Value> array;
+    RawPtrVal slice_ptr;
+    int64_t slice_len = 0;
+    Value* inout_ref = nullptr; // temporary call argument; never escapes checking
 
     static Value unit() { return {}; }
     static Value of_int(int64_t v) { Value x; x.k = K::int_; x.i = v; return x; }
@@ -219,6 +259,9 @@ inline void teardown_park(Value& v) {
         case Value::K::map:
         case Value::K::instance:
         case Value::K::enum_v:
+        case Value::K::box:
+        case Value::K::arena:
+        case Value::K::shared:
             g_teardown.values.push_back(std::move(v));
             break;
         default:
@@ -235,14 +278,14 @@ struct ListVal {
 };
 struct MapVal {
     std::vector<std::pair<Value, Value>> entries;
-    // open-addressed index over entries, so lookup is O(1) while iteration
-    // order stays insertion order. Each word is (hash high 32 << 32) | (pos+2);
+    bool ordered = false;
+    // open-addressed index over entries. OrderedMap keeps insertion order;
+    // Map may swap the last entry into a removed slot.
+    // Each word is (hash high 32 << 32) | (pos+2);
     // 0 = empty, 1 = tombstone. Empty vector = small map, linear scan.
     std::vector<uint64_t> index;
     size_t tombs = 0;
-    // remove on an indexed map resets the pair to unit and marks it dead
-    // instead of shifting, so delete is O(1); map_reindex compacts once holes
-    // outnumber live entries. Empty dead = no holes (mirrors the C runtime).
+    // OrderedMap removal marks a stable hole; plain Map never needs dead bits.
     std::vector<uint8_t> dead;
     size_t holes = 0;
     bool is_dead(size_t i) const { return !dead.empty() && dead[i]; }
@@ -254,6 +297,34 @@ struct MapVal {
         }
         drain_teardown();
     }
+};
+
+struct BoxVal {
+    Value inner;
+    ~BoxVal() {
+        teardown_park(inner);
+        drain_teardown();
+    }
+};
+
+struct ArenaVal {
+    std::vector<Value> values;
+    ~ArenaVal() {
+        for (Value& value : values) teardown_park(value);
+        drain_teardown();
+    }
+};
+
+struct SharedVal {
+    Value inner;
+    ~SharedVal() {
+        teardown_park(inner);
+        drain_teardown();
+    }
+};
+
+struct WeakVal {
+    std::weak_ptr<SharedVal> inner;
 };
 
 struct InstanceVal {
@@ -292,7 +363,12 @@ struct ClosureVal {
 
 struct FnRefVal { const FnDecl* decl = nullptr; };
 
-struct RangeVal { int64_t lo = 0, hi = 0; bool inclusive = false; };
+struct RangeVal {
+    int64_t lo = 0, hi = 0;
+    uint8_t bits = 64;
+    bool is_unsigned = false;
+    bool inclusive = false;
+};
 
 struct ThreadVal {
     std::thread th;
@@ -342,24 +418,17 @@ struct MMapVal {
     ~MMapVal();
 };
 
-// a buffered line reader over a File — reads at its own offset (pread), so
-// it never moves the file's cursor. Borrows the File; closing the File makes
-// the next read_line a closed error.
-struct BufReaderVal {
-    Value file;
-    int64_t off = 0;
-    std::vector<uint8_t> buf;
-    size_t bpos = 0, blim = 0;
-    bool eof = false;
-};
-
 // lexical scope chain — closures keep their captured chain alive
 struct Env {
     std::shared_ptr<Env> parent;
     std::vector<std::pair<std::string, Value>> vars;
+    std::vector<std::pair<std::string, Value*>> aliases;
 
     Value* find(const std::string& name) {
         for (Env* e = this; e; e = e->parent.get()) {
+            for (auto it = e->aliases.rbegin(); it != e->aliases.rend(); ++it) {
+                if (it->first == name) return it->second;
+            }
             for (auto it = e->vars.rbegin(); it != e->vars.rend(); ++it) {
                 if (it->first == name) return &it->second;
             }
@@ -368,6 +437,9 @@ struct Env {
     }
     void declare(const std::string& name, Value v) {
         vars.emplace_back(name, std::move(v));
+    }
+    void declare_alias(const std::string& name, Value* value) {
+        aliases.emplace_back(name, value);
     }
     ~Env() {
         if (parent) {

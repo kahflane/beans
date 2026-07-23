@@ -1,14 +1,16 @@
-// stdlib phase 4: BufReader — buffered lines over a File. It reads at its
+// Beans-written std.reader.Reader — buffered lines over a File. It reads at its
 // own offset (pread), so the file's cursor never moves; buffered data keeps
 // serving after close, and the closed error surfaces on the next refill.
 import std.io
+import std.fs
+import std.reader
 
 fn main() {
     let p: string = "{Dir.temp()}/beans_reader_example.txt"
-    File.write(p, "alpha\nbeta\n\ngamma with spaces\nlast no newline").expect("seed")
+    fs.write(p, "alpha\nbeta\n\ngamma with spaces\nlast no newline").expect("seed")
 
     let f: File = File.open(p, "r").expect("open")
-    let r: BufReader = BufReader.on(f)
+    let r: reader.Reader = reader.Reader(f)
     var n: int = 0
     var stop: bool = false
     for !stop {
@@ -25,7 +27,7 @@ fn main() {
     io.println("lines: {n}")
 
     // a second reader starts from the top, and the cursor never moved
-    let again: BufReader = BufReader.on(f)
+    let again: reader.Reader = reader.Reader(f)
     io.println(again.read_line().expect("first again").or("?"))
     io.println("{f.tell()}")
     f.close().expect("close")
@@ -38,9 +40,9 @@ fn main() {
         big = "{big}row number {i}\n"
         i += 1
     }
-    File.write(p, big).expect("big")
+    fs.write(p, big).expect("big")
     let fb: File = File.open(p, "r").expect("open big")
-    let rb: BufReader = BufReader.on(fb)
+    let rb: reader.Reader = reader.Reader(fb)
     io.println(rb.read_line().expect("big first").or("?"))
     fb.close().expect("close big")
     var served: int = 0
@@ -58,9 +60,9 @@ fn main() {
     }
 
     // empty file: none straight away
-    File.write(p, "").expect("empty")
+    fs.write(p, "").expect("empty")
     let fe: File = File.open(p, "r").expect("open empty")
-    match BufReader.on(fe).read_line().expect("eof") {
+    match reader.Reader(fe).read_line().expect("eof") {
         some(x) => io.println("line in empty?"),
         none => io.println("empty: none"),
     }

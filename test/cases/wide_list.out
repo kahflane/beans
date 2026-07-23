@@ -1,0 +1,7 @@
+pair 3 4 7 10 5 45 8 9 0 32
+array 15 14 16
+result wide list error
+result pair 21 22
+owned struct event1 event2 event1 event1 event2 1
+owned array event1 event4 event2
+decimal [0.75, 1.50, 1.5, 2.25] 0.75 2.25 true 3 1.50|1.5|0.75|2.25

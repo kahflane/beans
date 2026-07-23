@@ -1,11 +1,27 @@
 package main
 
-import "fmt"
+import (
+	"fmt"
+	"os"
+	"strconv"
+)
+
+func arg(at, fallback int) int {
+	if len(os.Args) <= at+1 {
+		return fallback
+	}
+	n, err := strconv.Atoi(os.Args[at+1])
+	if err != nil {
+		return fallback
+	}
+	return n
+}
 
 func main() {
-	w := 1800
-	h := 1800
-	maxIter := 100
+	size, seed := arg(0, 1800), arg(1, 1)
+	w := size
+	h := size
+	maxIter := 80 + seed%41
 	inside := 0
 
 	for y := 0; y < h; y++ {

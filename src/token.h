@@ -12,16 +12,17 @@ enum class TokenKind : uint8_t {
     float_lit,
     string_lit,
 
-    // keywords (23)
-    kw_class, kw_interface, kw_enum, kw_fn, kw_let, kw_var, kw_pub, kw_override,
+    // keywords (28)
+    kw_class, kw_struct, kw_union, kw_interface, kw_enum, kw_fn, kw_let, kw_var, kw_pub, kw_override,
     kw_if, kw_else, kw_for, kw_in, kw_match, kw_return, kw_break, kw_continue,
-    kw_import, kw_as, kw_defer, kw_unsafe, kw_self, kw_true, kw_false,
+    kw_import, kw_as, kw_defer, kw_unsafe, kw_extern, kw_take, kw_inout,
+    kw_self, kw_true, kw_false,
 
     // brackets
     lparen, rparen, lbrace, rbrace, lbracket, rbracket,
 
     // punctuation
-    comma, dot, dotdot, dotdoteq, colon, question,
+    comma, semicolon, dot, dotdot, dotdoteq, colon, question, at,
     arrow,      // ->
     fat_arrow,  // =>
 

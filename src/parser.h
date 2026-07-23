@@ -49,7 +49,9 @@ private:
     // declarations
     ImportDecl parse_import();
     void parse_decl(Module& m);
-    ClassDecl parse_class(bool is_pub, bool is_interface);
+    ClassDecl parse_class(bool is_pub, bool is_interface, bool is_move_only = false,
+                          bool is_struct = false, bool is_c_layout = false,
+                          bool is_union = false);
     EnumDecl parse_enum(bool is_pub);
     FnDecl parse_fn(bool is_pub, bool is_override, bool allow_no_body);
     std::vector<GenericParam> parse_generics();

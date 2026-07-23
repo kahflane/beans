@@ -6,6 +6,8 @@ TokenKind keyword_or_ident(std::string_view w) {
     struct Entry { std::string_view word; TokenKind kind; };
     static const Entry table[] = {
         {"class", TokenKind::kw_class},
+        {"struct", TokenKind::kw_struct},
+        {"union", TokenKind::kw_union},
         {"interface", TokenKind::kw_interface},
         {"enum", TokenKind::kw_enum},
         {"fn", TokenKind::kw_fn},
@@ -25,6 +27,9 @@ TokenKind keyword_or_ident(std::string_view w) {
         {"as", TokenKind::kw_as},
         {"defer", TokenKind::kw_defer},
         {"unsafe", TokenKind::kw_unsafe},
+        {"extern", TokenKind::kw_extern},
+        {"take", TokenKind::kw_take},
+        {"inout", TokenKind::kw_inout},
         {"self", TokenKind::kw_self},
         {"true", TokenKind::kw_true},
         {"false", TokenKind::kw_false},
@@ -42,6 +47,8 @@ const char* to_string(TokenKind k) {
         case TokenKind::float_lit:   return "float";
         case TokenKind::string_lit:  return "string";
         case TokenKind::kw_class:    return "class";
+        case TokenKind::kw_struct:   return "struct";
+        case TokenKind::kw_union:    return "union";
         case TokenKind::kw_interface:return "interface";
         case TokenKind::kw_enum:     return "enum";
         case TokenKind::kw_fn:       return "fn";
@@ -61,6 +68,9 @@ const char* to_string(TokenKind k) {
         case TokenKind::kw_as:       return "as";
         case TokenKind::kw_defer:    return "defer";
         case TokenKind::kw_unsafe:   return "unsafe";
+        case TokenKind::kw_extern:   return "extern";
+        case TokenKind::kw_take:     return "take";
+        case TokenKind::kw_inout:    return "inout";
         case TokenKind::kw_self:     return "self";
         case TokenKind::kw_true:     return "true";
         case TokenKind::kw_false:    return "false";
@@ -71,11 +81,13 @@ const char* to_string(TokenKind k) {
         case TokenKind::lbracket:    return "[";
         case TokenKind::rbracket:    return "]";
         case TokenKind::comma:       return ",";
+        case TokenKind::semicolon:   return ";";
         case TokenKind::dot:         return ".";
         case TokenKind::dotdot:      return "..";
         case TokenKind::dotdoteq:    return "..=";
         case TokenKind::colon:       return ":";
         case TokenKind::question:    return "?";
+        case TokenKind::at:          return "@";
         case TokenKind::arrow:       return "->";
         case TokenKind::fat_arrow:   return "=>";
         case TokenKind::plus:        return "+";

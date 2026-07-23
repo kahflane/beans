@@ -2,14 +2,18 @@
 // replace. Phase 1 added the string method set and O(1) length; this is the
 // bench that exercises them under load.
 import std.io
+import std.os
 
 fn main() {
-    let n: int = 800000
+    let args: List<string> = os.args()
+    let n: int = if args.len() > 0 { args[0].to_int().or(2_000_000) } else { 2_000_000 }
+    let seed: int = if args.len() > 1 { args[1].to_int().or(1) } else { 1 }
 
     var parts: List<string> = []
+    parts.reserve(n)
     var i: int = 0
     for i < n {
-        parts.push("item{i}")
+        parts.push("item{seed}_{i}")
         i += 1
     }
 

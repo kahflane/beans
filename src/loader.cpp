@@ -6,6 +6,12 @@
 #include <fstream>
 #include <sstream>
 
+#if defined(__APPLE__)
+#include <mach-o/dyld.h>
+#elif defined(__linux__)
+#include <unistd.h>
+#endif
+
 #include "lexer.h"
 #include "parser.h"
 
@@ -33,6 +39,28 @@ std::string beans_home() {
     if (const char* h = std::getenv("BEANS_HOME")) return h;
     const char* home = std::getenv("HOME");
     return std::string(home ? home : ".") + "/.beans";
+}
+
+std::string stdlib_root() {
+    if (const char* path = std::getenv("BEANS_STDLIB")) return path;
+    fs::path executable;
+#if defined(__APPLE__)
+    uint32_t size = 0;
+    _NSGetExecutablePath(nullptr, &size);
+    std::string path(size, '\0');
+    if (_NSGetExecutablePath(path.data(), &size) == 0)
+        executable = fs::weakly_canonical(path.c_str());
+#elif defined(__linux__)
+    std::error_code ec;
+    executable = fs::read_symlink("/proc/self/exe", ec);
+#endif
+    if (!executable.empty()) {
+        fs::path beside = executable.parent_path().parent_path() / "lib" / "std";
+        if (fs::exists(beside)) return beside.string();
+    }
+    fs::path local = fs::current_path() / "lib" / "std";
+    if (fs::exists(local)) return local.string();
+    return beans_home() + "/lib/std";
 }
 
 std::string shell_quote(const std::string& s) {
@@ -151,7 +179,22 @@ void Loader::resolve_imports(Package& pkg, const ModuleCtx& ctx) {
     for (auto& pf : pkg.files) {
         for (ImportDecl& imp : pf->mod.imports) {
             const std::string& p = imp.path;
-            if (p.rfind("std.", 0) == 0) continue; // builtins, no package behind them
+            if (p.rfind("std.", 0) == 0) {
+                std::string sub = p.substr(4);
+                for (char& c : sub) {
+                    if (c == '.') c = '/';
+                }
+                std::string root = stdlib_root();
+                std::string dir = root + "/" + sub;
+                if (fs::exists(dir)) {
+                    ModuleCtx stdctx;
+                    stdctx.name = "std";
+                    stdctx.root = root;
+                    load_package(p, dir, last_segment(p), stdctx,
+                                 pf->path, imp.line, imp.col);
+                }
+                continue; // missing packages may still be native std intrinsics
+            }
 
             // local: shop.util -> <root>/util/
             if (!ctx.name.empty() &&

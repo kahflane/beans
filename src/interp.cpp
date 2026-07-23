@@ -1,15 +1,28 @@
 #include "interp.h"
 
+#include <algorithm>
 #include <atomic>
 #include <cinttypes>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <dlfcn.h>
+#include <fstream>
+#include <limits>
+#include <mutex>
+#include <spawn.h>
+#include <set>
+#include <sys/wait.h>
+#include <type_traits>
+#include <unistd.h>
 #include <utility>
 
 #include "builtins.h"
+#include "c_abi.h"
 #include "lexer.h"
 #include "parser.h"
+
+extern "C" char** environ;
 
 namespace beans {
 
@@ -18,7 +31,94 @@ void beans_threads_inc() { g_live_threads.fetch_add(1, std::memory_order_relaxed
 void beans_threads_dec() { g_live_threads.fetch_sub(1, std::memory_order_relaxed); }
 bool beans_threads_live() { return g_live_threads.load(std::memory_order_relaxed) > 0; }
 
+static constexpr size_t MAP_LINEAR_MAX = 8;
+static constexpr uint64_t IDX_POS = 0xffffffffull;
+static constexpr uint64_t IDX_FRAG = ~IDX_POS;
+
 namespace {
+
+using CallbackDispatch = void (*)(void*, void*, void**);
+using AggregateBridge = void (*)(void*, void*, void**, CallbackDispatch, void**);
+
+AggregateBridge load_aggregate_bridge(const std::string& source,
+                                      std::string& error) {
+    struct Entry {
+        void* handle = nullptr;
+        AggregateBridge call = nullptr;
+    };
+    static std::mutex mutex;
+    static std::map<std::string, Entry> cache;
+    static std::atomic<unsigned long long> sequence{0};
+
+    std::lock_guard<std::mutex> lock(mutex);
+    auto found = cache.find(source);
+    if (found != cache.end()) return found->second.call;
+
+    char directory[] = "/tmp/beans-ffi-XXXXXX";
+    if (!mkdtemp(directory)) {
+        error = "cannot create temporary directory for C ABI bridge";
+        return nullptr;
+    }
+    std::string stem = std::string(directory) + "/bridge_" +
+                       std::to_string(sequence.fetch_add(1));
+    std::string c_path = stem + ".c";
+#ifdef __APPLE__
+    std::string lib_path = stem + ".dylib";
+#else
+    std::string lib_path = stem + ".so";
+#endif
+    {
+        std::ofstream output(c_path);
+        if (!output || !(output << source)) {
+            error = "cannot write C ABI bridge source";
+            rmdir(directory);
+            return nullptr;
+        }
+    }
+
+#ifdef __APPLE__
+    std::vector<char*> argv = {
+        const_cast<char*>("clang"), const_cast<char*>("-O2"),
+        const_cast<char*>("-dynamiclib"), const_cast<char*>(c_path.c_str()),
+        const_cast<char*>("-o"), const_cast<char*>(lib_path.c_str()), nullptr,
+    };
+#else
+    std::vector<char*> argv = {
+        const_cast<char*>("clang"), const_cast<char*>("-O2"),
+        const_cast<char*>("-shared"), const_cast<char*>("-fPIC"),
+        const_cast<char*>(c_path.c_str()), const_cast<char*>("-o"),
+        const_cast<char*>(lib_path.c_str()), nullptr,
+    };
+#endif
+    pid_t child = 0;
+    int spawn_status = posix_spawnp(&child, "clang", nullptr, nullptr, argv.data(),
+                                    environ);
+    int status = 0;
+    if (spawn_status != 0 || waitpid(child, &status, 0) < 0 ||
+        !WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+        error = "clang could not build the C ABI bridge";
+        std::remove(c_path.c_str());
+        std::remove(lib_path.c_str());
+        rmdir(directory);
+        return nullptr;
+    }
+
+    void* handle = dlopen(lib_path.c_str(), RTLD_NOW | RTLD_LOCAL);
+    AggregateBridge call = handle ? reinterpret_cast<AggregateBridge>(
+                                        dlsym(handle, "beans_ffi_bridge"))
+                                  : nullptr;
+    if (!call) {
+        const char* message = dlerror();
+        error = message ? message : "cannot load C ABI bridge";
+        if (handle) dlclose(handle);
+    }
+    std::remove(c_path.c_str());
+    std::remove(lib_path.c_str());
+    rmdir(directory);
+    if (!call) return nullptr;
+    cache.emplace(source, Entry{handle, call});
+    return call;
+}
 
 // per-thread frame state: defers + the return-type hint of the running fn
 struct Frame {
@@ -39,7 +139,7 @@ int64_t parse_int_text(std::string_view text) {
     if (clean.size() > 2 && clean[0] == '0' && (clean[1] == 'b' || clean[1] == 'B')) {
         return static_cast<int64_t>(std::strtoull(clean.c_str() + 2, nullptr, 2));
     }
-    return static_cast<int64_t>(std::strtoll(clean.c_str(), nullptr, 10));
+    return static_cast<int64_t>(std::strtoull(clean.c_str(), nullptr, 10));
 }
 
 std::string clean_number(std::string_view text) {
@@ -48,6 +148,108 @@ std::string clean_number(std::string_view text) {
         if (c != '_') out.push_back(c);
     }
     return out;
+}
+
+template <typename T>
+uint64_t atomic_load_raw(void* address) {
+    return static_cast<uint64_t>(std::atomic_ref<T>(*static_cast<T*>(address)).load());
+}
+
+template <typename T>
+void atomic_store_raw(void* address, uint64_t value) {
+    std::atomic_ref<T>(*static_cast<T*>(address)).store(static_cast<T>(value));
+}
+
+template <typename T>
+uint64_t atomic_fetch_add_raw(void* address, uint64_t value) {
+    return static_cast<uint64_t>(
+        std::atomic_ref<T>(*static_cast<T*>(address)).fetch_add(static_cast<T>(value)));
+}
+
+template <typename T>
+bool atomic_compare_exchange_raw(void* address, uint64_t expected, uint64_t desired) {
+    T old = static_cast<T>(expected);
+    return std::atomic_ref<T>(*static_cast<T*>(address))
+        .compare_exchange_strong(old, static_cast<T>(desired));
+}
+
+uint64_t raw_atomic_load(const RawPtrVal& pointer) {
+    switch (pointer.size) {
+        case 1: return atomic_load_raw<uint8_t>(pointer.address);
+        case 2: return atomic_load_raw<uint16_t>(pointer.address);
+        case 4: return atomic_load_raw<uint32_t>(pointer.address);
+        default: return atomic_load_raw<uint64_t>(pointer.address);
+    }
+}
+
+void raw_atomic_store(const RawPtrVal& pointer, uint64_t value) {
+    switch (pointer.size) {
+        case 1: atomic_store_raw<uint8_t>(pointer.address, value); break;
+        case 2: atomic_store_raw<uint16_t>(pointer.address, value); break;
+        case 4: atomic_store_raw<uint32_t>(pointer.address, value); break;
+        default: atomic_store_raw<uint64_t>(pointer.address, value); break;
+    }
+}
+
+uint64_t raw_atomic_fetch_add(const RawPtrVal& pointer, uint64_t value) {
+    switch (pointer.size) {
+        case 1: return atomic_fetch_add_raw<uint8_t>(pointer.address, value);
+        case 2: return atomic_fetch_add_raw<uint16_t>(pointer.address, value);
+        case 4: return atomic_fetch_add_raw<uint32_t>(pointer.address, value);
+        default: return atomic_fetch_add_raw<uint64_t>(pointer.address, value);
+    }
+}
+
+bool raw_atomic_compare_exchange(const RawPtrVal& pointer, uint64_t expected,
+                                 uint64_t desired) {
+    switch (pointer.size) {
+        case 1:
+            return atomic_compare_exchange_raw<uint8_t>(pointer.address, expected, desired);
+        case 2:
+            return atomic_compare_exchange_raw<uint16_t>(pointer.address, expected, desired);
+        case 4:
+            return atomic_compare_exchange_raw<uint32_t>(pointer.address, expected, desired);
+        default:
+            return atomic_compare_exchange_raw<uint64_t>(pointer.address, expected, desired);
+    }
+}
+
+template <typename Ret, size_t Remaining, typename... Packed>
+Ret call_c_abi_tail(void* symbol, const std::vector<Value>& args,
+                    const uint64_t* words, size_t index, Packed... packed) {
+    if constexpr (Remaining == 0) {
+        using Function = Ret (*)(Packed...);
+        if constexpr (std::is_void_v<Ret>) {
+            reinterpret_cast<Function>(symbol)(packed...);
+        } else {
+            return reinterpret_cast<Function>(symbol)(packed...);
+        }
+    } else {
+        if (args[index].k == Value::K::float_) {
+            if (args[index].float_bits == 32) {
+                return call_c_abi_tail<Ret, Remaining - 1, Packed..., float>(
+                    symbol, args, words, index + 1, packed...,
+                    static_cast<float>(args[index].f));
+            }
+            return call_c_abi_tail<Ret, Remaining - 1, Packed..., double>(
+                symbol, args, words, index + 1, packed..., args[index].f);
+        }
+        return call_c_abi_tail<Ret, Remaining - 1, Packed..., uint64_t>(
+            symbol, args, words, index + 1, packed..., words[index]);
+    }
+}
+
+template <typename Ret>
+Ret call_c_abi(void* symbol, const std::vector<Value>& args, const uint64_t* words) {
+    switch (args.size()) {
+        case 0: return call_c_abi_tail<Ret, 0>(symbol, args, words, 0);
+        case 1: return call_c_abi_tail<Ret, 1>(symbol, args, words, 0);
+        case 2: return call_c_abi_tail<Ret, 2>(symbol, args, words, 0);
+        case 3: return call_c_abi_tail<Ret, 3>(symbol, args, words, 0);
+        case 4: return call_c_abi_tail<Ret, 4>(symbol, args, words, 0);
+        case 5: return call_c_abi_tail<Ret, 5>(symbol, args, words, 0);
+        default: return call_c_abi_tail<Ret, 6>(symbol, args, words, 0);
+    }
 }
 
 } // namespace
@@ -67,10 +269,319 @@ Interp::Hint Interp::Hint::of(const TypeRef* t) {
 bool Interp::Hint::wants_dec() const { return num == NumHint::dec; }
 bool Interp::Hint::wants_float() const { return num == NumHint::flt; }
 const TypeRef* Interp::Hint::arg(size_t i) const {
+    if (tref && tref->kind == TypeRef::Kind::fixed_array && i == 0)
+        return tref->array_elem.get();
     if (tref && tref->kind == TypeRef::Kind::named && i < tref->args.size()) {
         return tref->args[i].get();
     }
     return nullptr;
+}
+
+int64_t Interp::signed_integer(uint64_t bits) {
+    int64_t value;
+    std::memcpy(&value, &bits, sizeof value);
+    return value;
+}
+
+uint64_t Interp::unsigned_integer(const Value& value) {
+    uint64_t bits;
+    std::memcpy(&bits, &value.i, sizeof bits);
+    if (value.int_bits < 64) bits &= (uint64_t{1} << value.int_bits) - 1;
+    return bits;
+}
+
+void Interp::normalize_integer(Value& value) {
+    uint64_t bits = unsigned_integer(value);
+    if (value.int_bits < 64) {
+        uint64_t mask = (uint64_t{1} << value.int_bits) - 1;
+        bits &= mask;
+        if (!value.int_unsigned && (bits & (uint64_t{1} << (value.int_bits - 1))))
+            bits |= ~mask;
+    }
+    value.i = signed_integer(bits);
+}
+
+void Interp::normalize_float(Value& value) {
+    if (value.float_bits == 32) value.f = static_cast<double>(static_cast<float>(value.f));
+}
+
+Value Interp::typed_integer(int64_t bits, TypeId type, const TypeRef* fallback) const {
+    Value value = Value::of_int(bits);
+    IntLayout layout = type ? hir_.target().integer(type->k) : IntLayout{};
+    if (!layout.bits && fallback && fallback->kind == TypeRef::Kind::named) {
+        const std::string& name = fallback->name;
+        if (name == "i8") layout = {8, true};
+        else if (name == "i16") layout = {16, true};
+        else if (name == "i32") layout = {32, true};
+        else if (name == "int" || name == "i64") layout = {64, true};
+        else if (name == "u8" || name == "byte") layout = {8, false};
+        else if (name == "u16") layout = {16, false};
+        else if (name == "u32") layout = {32, false};
+        else if (name == "u64") layout = {64, false};
+    }
+    if (layout.bits) {
+        value.int_bits = layout.bits;
+        value.int_unsigned = !layout.is_signed;
+        normalize_integer(value);
+    }
+    return value;
+}
+
+Value Interp::typed_float(double number, TypeId type, const TypeRef* fallback) const {
+    Value value = Value::of_float(number);
+    uint8_t bits = type ? hir_.target().float_bits(type->k) : 0;
+    if (!bits && fallback && fallback->kind == TypeRef::Kind::named)
+        bits = fallback->name == "f32" ? 32 : 64;
+    if (bits) value.float_bits = bits;
+    normalize_float(value);
+    return value;
+}
+
+RawPtrVal Interp::raw_spec(TypeId pointer_type) const {
+    if (!pointer_type || pointer_type->k != Type::K::class_ ||
+        pointer_type->name != "RawPtr" || pointer_type->args.size() != 1) {
+        return {};
+    }
+    return raw_value_spec(pointer_type->args[0]);
+}
+
+RawPtrVal Interp::raw_value_spec(TypeId type) const {
+    RawPtrVal spec;
+    if (!type) return spec;
+    IntLayout integer = hir_.target().integer(type->k);
+    if (integer.bits) {
+        spec.scalar = integer.is_signed ? RawScalar::signed_int : RawScalar::unsigned_int;
+        spec.bits = integer.bits;
+        spec.size = static_cast<uint8_t>(integer.bits / 8);
+    } else if (uint8_t bits = hir_.target().float_bits(type->k)) {
+        spec.scalar = RawScalar::float_;
+        spec.bits = bits;
+        spec.size = static_cast<uint8_t>(bits / 8);
+    } else if (type->k == Type::K::bool_) {
+        spec.scalar = RawScalar::boolean;
+        spec.bits = 1;
+        spec.size = 1;
+    } else if (type->k == Type::K::class_ && type->name == "RawPtr" &&
+               type->args.size() == 1) {
+        spec.scalar = RawScalar::pointer;
+        spec.size = static_cast<uint32_t>(sizeof(void*));
+        spec.align = static_cast<uint32_t>(alignof(void*));
+        spec.element = std::make_shared<RawPtrVal>(raw_value_spec(type->args[0]));
+        return spec;
+    } else if (type->k == Type::K::fixed_array && type->args.size() == 1) {
+        spec.scalar = RawScalar::array;
+        spec.element = std::make_shared<RawPtrVal>(raw_value_spec(type->args[0]));
+        spec.element_count = static_cast<uint32_t>(std::stoul(type->name));
+        spec.align = spec.element->align;
+        spec.size = spec.element->size * spec.element_count;
+        return spec;
+    } else if (type->k == Type::K::struct_) {
+        const ClassDecl* decl = find_class(type->name);
+        if (decl && (decl->is_struct || decl->is_union) && decl->is_c_layout) {
+            spec.scalar = RawScalar::record;
+            spec.record_decl = decl;
+            spec.align = 1;
+            uint32_t offset = 0;
+            for (const FieldDecl& field : decl->fields) {
+                RawPtrVal value = raw_value_spec(field.type.get());
+                if (decl->is_union) {
+                    if (value.size > offset) offset = value.size;
+                } else {
+                    offset = (offset + value.align - 1) & ~(value.align - 1);
+                    offset += value.size;
+                }
+                if (value.align > spec.align) spec.align = value.align;
+            }
+            spec.size = (offset + spec.align - 1) & ~(spec.align - 1);
+        }
+    }
+    if (spec.scalar != RawScalar::record) spec.align = spec.size ? spec.size : 1;
+    return spec;
+}
+
+RawPtrVal Interp::raw_value_spec(const TypeRef* type) const {
+    RawPtrVal spec;
+    if (!type) return spec;
+    if (type->kind == TypeRef::Kind::fixed_array && type->array_elem) {
+        spec.scalar = RawScalar::array;
+        spec.element = std::make_shared<RawPtrVal>(raw_value_spec(type->array_elem.get()));
+        spec.element_count = type->array_len;
+        spec.align = spec.element->align;
+        spec.size = spec.element->size * spec.element_count;
+        return spec;
+    }
+    if (type->kind != TypeRef::Kind::named) return spec;
+    const std::string& name = type->name;
+    if (name == "i8" || name == "i16" || name == "i32" || name == "i64" ||
+        name == "int") {
+        spec.scalar = RawScalar::signed_int;
+        spec.bits = name == "i8" ? 8 : name == "i16" ? 16 : name == "i32" ? 32 : 64;
+    } else if (name == "u8" || name == "byte" || name == "u16" || name == "u32" ||
+               name == "u64") {
+        spec.scalar = RawScalar::unsigned_int;
+        spec.bits = (name == "u8" || name == "byte") ? 8
+                    : name == "u16"                  ? 16
+                    : name == "u32"                  ? 32
+                                                       : 64;
+    } else if (name == "f32" || name == "f64" || name == "float") {
+        spec.scalar = RawScalar::float_;
+        spec.bits = name == "f32" ? 32 : 64;
+    } else if (name == "bool") {
+        spec.scalar = RawScalar::boolean;
+        spec.bits = 1;
+    } else if (name == "RawPtr" && type->args.size() == 1) {
+        spec.scalar = RawScalar::pointer;
+        spec.size = static_cast<uint32_t>(sizeof(void*));
+        spec.align = static_cast<uint32_t>(alignof(void*));
+        spec.element = std::make_shared<RawPtrVal>(raw_value_spec(type->args[0].get()));
+        return spec;
+    } else {
+        std::string key = type->resolved.empty() ? qual(name) : type->resolved;
+        const ClassDecl* decl = find_class(key);
+        if (!decl && type->resolved.empty()) decl = find_class(name);
+        if (decl && (decl->is_struct || decl->is_union) && decl->is_c_layout) {
+            spec.scalar = RawScalar::record;
+            spec.record_decl = decl;
+            spec.align = 1;
+            uint32_t offset = 0;
+            for (const FieldDecl& field : decl->fields) {
+                RawPtrVal value = raw_value_spec(field.type.get());
+                if (decl->is_union) {
+                    if (value.size > offset) offset = value.size;
+                } else {
+                    offset = (offset + value.align - 1) & ~(value.align - 1);
+                    offset += value.size;
+                }
+                if (value.align > spec.align) spec.align = value.align;
+            }
+            spec.size = (offset + spec.align - 1) & ~(spec.align - 1);
+            return spec;
+        }
+    }
+    spec.size = spec.bits == 1 ? 1 : static_cast<uint8_t>(spec.bits / 8);
+    spec.align = spec.size ? spec.size : 1;
+    return spec;
+}
+
+RawPtrVal Interp::raw_spec(const TypeRef* pointer_type) const {
+    if (!pointer_type || pointer_type->kind != TypeRef::Kind::named ||
+        pointer_type->name != "RawPtr" || pointer_type->args.size() != 1) {
+        return {};
+    }
+    return raw_value_spec(pointer_type->args[0].get());
+}
+
+Value Interp::raw_read(const RawPtrVal& pointer) const {
+    if (pointer.scalar == RawScalar::array && pointer.element) {
+        Value out;
+        out.k = Value::K::fixed_array;
+        out.array.reserve(pointer.element_count);
+        for (uint32_t i = 0; i < pointer.element_count; i++) {
+            RawPtrVal element = *pointer.element;
+            element.address = static_cast<char*>(pointer.address) + i * element.size;
+            out.array.push_back(raw_read(element));
+        }
+        return out;
+    }
+    if (pointer.scalar == RawScalar::record && pointer.record_decl) {
+        Value out;
+        out.k = Value::K::struct_v;
+        out.struct_decl = pointer.record_decl;
+        if (pointer.record_decl->is_union) {
+            out.union_bytes.resize(pointer.size);
+            std::memcpy(out.union_bytes.data(), pointer.address, pointer.size);
+            return out;
+        }
+        uint32_t offset = 0;
+        for (const FieldDecl& field : pointer.record_decl->fields) {
+            RawPtrVal value = raw_value_spec(field.type.get());
+            offset = (offset + value.align - 1) & ~(value.align - 1);
+            value.address = static_cast<char*>(pointer.address) + offset;
+            out.struct_fields.push_back(raw_read(value));
+            offset += value.size;
+        }
+        return out;
+    }
+    if (pointer.scalar == RawScalar::pointer && pointer.element) {
+        void* address = nullptr;
+        std::memcpy(&address, pointer.address, sizeof address);
+        Value out;
+        out.k = Value::K::rawptr;
+        out.raw = *pointer.element;
+        out.raw.address = address;
+        return out;
+    }
+    if (pointer.scalar == RawScalar::float_) {
+        if (pointer.bits == 32) {
+            float value = 0;
+            std::memcpy(&value, pointer.address, sizeof value);
+            Value out = Value::of_float(value);
+            out.float_bits = 32;
+            return out;
+        }
+        double value = 0;
+        std::memcpy(&value, pointer.address, sizeof value);
+        return Value::of_float(value);
+    }
+    if (pointer.scalar == RawScalar::boolean) {
+        uint8_t value = 0;
+        std::memcpy(&value, pointer.address, 1);
+        return Value::of_bool(value != 0);
+    }
+    uint64_t bits = 0;
+    std::memcpy(&bits, pointer.address, pointer.size);
+    Value out = Value::of_int(signed_integer(bits));
+    out.int_bits = pointer.bits;
+    out.int_unsigned = pointer.scalar == RawScalar::unsigned_int;
+    normalize_integer(out);
+    return out;
+}
+
+void Interp::raw_write(const RawPtrVal& pointer, const Value& value) const {
+    if (pointer.scalar == RawScalar::array && pointer.element) {
+        for (uint32_t i = 0; i < pointer.element_count; i++) {
+            RawPtrVal element = *pointer.element;
+            element.address = static_cast<char*>(pointer.address) + i * element.size;
+            raw_write(element, value.array[i]);
+        }
+        return;
+    }
+    if (pointer.scalar == RawScalar::record && pointer.record_decl) {
+        if (pointer.record_decl->is_union) {
+            std::memcpy(pointer.address, value.union_bytes.data(), pointer.size);
+            return;
+        }
+        uint32_t offset = 0;
+        for (size_t i = 0; i < pointer.record_decl->fields.size(); i++) {
+            RawPtrVal field = raw_value_spec(pointer.record_decl->fields[i].type.get());
+            offset = (offset + field.align - 1) & ~(field.align - 1);
+            field.address = static_cast<char*>(pointer.address) + offset;
+            raw_write(field, value.struct_fields[i]);
+            offset += field.size;
+        }
+        return;
+    }
+    if (pointer.scalar == RawScalar::pointer) {
+        void* address = value.raw.address;
+        std::memcpy(pointer.address, &address, sizeof address);
+        return;
+    }
+    if (pointer.scalar == RawScalar::float_) {
+        if (pointer.bits == 32) {
+            float stored = static_cast<float>(value.f);
+            std::memcpy(pointer.address, &stored, sizeof stored);
+        } else {
+            std::memcpy(pointer.address, &value.f, sizeof value.f);
+        }
+        return;
+    }
+    if (pointer.scalar == RawScalar::boolean) {
+        uint8_t stored = value.b ? 1 : 0;
+        std::memcpy(pointer.address, &stored, 1);
+        return;
+    }
+    uint64_t stored = unsigned_integer(value);
+    std::memcpy(pointer.address, &stored, pointer.size);
 }
 
 // ---- setup -----------------------------------------------------------------
@@ -91,7 +602,8 @@ struct DeinitDeleter {
     }
 };
 
-Interp::Interp(const Program& prog) {
+Interp::Interp(const HirProgram& hir) : hir_(hir) {
+    const Program& prog = hir.ast();
     for (const auto& pkg : prog.packages) {
         prefix_by_path_[pkg->import_path] = pkg->prefix;
         auto& bindings = pkg_imports_[pkg->prefix];
@@ -259,6 +771,51 @@ Value Interp::make_instance(const ClassDecl* cls,
                             const std::vector<InitEntry>& entries,
                             std::shared_ptr<Env>& env) {
     Value v;
+    if (cls->is_union) {
+        v.k = Value::K::struct_v;
+        v.struct_decl = cls;
+        uint32_t size = 0, align = 1;
+        for (const FieldDecl& field : cls->fields) {
+            RawPtrVal spec = raw_value_spec(field.type.get());
+            if (spec.size > size) size = spec.size;
+            if (spec.align > align) align = spec.align;
+        }
+        size = (size + align - 1) & ~(align - 1);
+        v.union_bytes.assign(size, 0);
+        for (const InitEntry& entry : entries) {
+            for (const FieldDecl& field : cls->fields) {
+                if (field.name != entry.name) continue;
+                Value init = eval(entry.value.get(), env, Hint::of(field.type.get()));
+                RawPtrVal spec = raw_value_spec(field.type.get());
+                spec.address = v.union_bytes.data();
+                raw_write(spec, init);
+            }
+        }
+        return v;
+    }
+    if (cls->is_struct) {
+        v.k = Value::K::struct_v;
+        v.struct_decl = cls;
+        std::string saved_pkg = g_pkg;
+        g_pkg = pkg_of(cls->qualname);
+        for (const FieldDecl& field : cls->fields) {
+            Value init = Value::unit();
+            if (field.def) {
+                std::shared_ptr<Env> empty = std::make_shared<Env>();
+                init = eval(field.def.get(), empty, Hint::of(field.type.get()));
+            }
+            v.struct_fields.push_back(std::move(init));
+        }
+        g_pkg = saved_pkg;
+        for (const InitEntry& entry : entries) {
+            for (size_t i = 0; i < cls->fields.size(); i++) {
+                if (cls->fields[i].name != entry.name) continue;
+                v.struct_fields[i] = eval(entry.value.get(), env,
+                                          Hint::of(cls->fields[i].type.get()));
+            }
+        }
+        return v;
+    }
     v.k = Value::K::instance;
     // classes with a deinit in their chain pay for the custom deleter;
     // everything else keeps the plain single-allocation shared_ptr
@@ -370,12 +927,298 @@ void Interp::run_deinit(InstanceVal* inst) {
 
 // ---- calls -----------------------------------------------------------------
 
+Value Interp::call_extern_aggregate(const FnDecl* fn,
+                                    const std::vector<Value>& args,
+                                    void* symbol) {
+    auto fail = [&](const std::string& message) -> Value {
+        g_beans_panicking = true;
+        throw BeansPanic{message, fn->line, fn->col};
+    };
+
+    auto record_lookup = [&](const TypeRef* type) -> const ClassDecl* {
+        if (!type || type->kind != TypeRef::Kind::named) return nullptr;
+        std::string key = type->resolved.empty() ? qual(type->name) : type->resolved;
+        const ClassDecl* record = find_class(key);
+        if (!record && type->resolved.empty()) record = find_class(type->name);
+        return record && (record->is_struct || record->is_union) && record->is_c_layout
+                   ? record
+                   : nullptr;
+    };
+    CAbiText abi = describe_c_abi(*fn, record_lookup);
+    std::string source = "#include <stdint.h>\n" + abi.definitions;
+    source += "typedef void (*BeansFfiDispatch)(void*, void*, void**);\n";
+    for (const CAbiCallbackText& callback : abi.callbacks) {
+        std::string prefix = "beans_ffi_cb" +
+                             std::to_string(callback.parameter_index);
+        source += "static _Thread_local BeansFfiDispatch " + prefix +
+                  "_dispatch;\n";
+        source += "static _Thread_local void* " + prefix + "_context;\n";
+        source += "static " + callback.return_type + " " + prefix + "(";
+        for (size_t i = 0; i < callback.parameter_declarations.size(); i++) {
+            if (i) source += ", ";
+            source += callback.parameter_declarations[i];
+        }
+        if (callback.parameter_declarations.empty()) source += "void";
+        source += ") {\n  void* callback_args[" +
+                  std::to_string(std::max<size_t>(callback.parameter_types.size(), 1)) +
+                  "] = {";
+        for (size_t i = 0; i < callback.parameter_types.size(); i++) {
+            if (i) source += ", ";
+            source += "&value" + std::to_string(i);
+        }
+        if (callback.parameter_types.empty()) source += "0";
+        source += "};\n";
+        if (callback.return_type == "void") {
+            source += "  " + prefix + "_dispatch(" + prefix +
+                      "_context, 0, callback_args);\n}\n";
+        } else {
+            source += "  " + callback.return_type +
+                      " callback_result = {0};\n  " + prefix + "_dispatch(" +
+                      prefix + "_context, &callback_result, callback_args);\n"
+                      "  return callback_result;\n}\n";
+        }
+    }
+    source += "typedef " + abi.return_type + " (*BeansFfiFn)(";
+    for (size_t i = 0; i < abi.parameter_declarations.size(); i++) {
+        if (i) source += ", ";
+        source += abi.parameter_declarations[i];
+    }
+    if (abi.parameter_declarations.empty()) source += "void";
+    source += ");\n__attribute__((visibility(\"default\")))\n";
+    source += "void beans_ffi_bridge(void* symbol, void* result, void** args, "
+              "BeansFfiDispatch dispatch, void** contexts) {\n";
+    source += "  BeansFfiFn fn = (BeansFfiFn)symbol;\n  ";
+    for (const CAbiCallbackText& callback : abi.callbacks) {
+        std::string prefix = "beans_ffi_cb" +
+                             std::to_string(callback.parameter_index);
+        source += "BeansFfiDispatch " + prefix + "_old_dispatch = " + prefix +
+                  "_dispatch;\n  void* " + prefix + "_old_context = " + prefix +
+                  "_context;\n  " + prefix + "_dispatch = dispatch;\n  " + prefix +
+                  "_context = contexts[" +
+                  std::to_string(callback.parameter_index) + "];\n  ";
+    }
+    if (fn->ret) source += abi.return_type + " call_result = ";
+    source += "fn(";
+    for (size_t i = 0; i < fn->params.size(); i++) {
+        if (i) source += ", ";
+        auto callback = std::find_if(
+            abi.callbacks.begin(), abi.callbacks.end(),
+            [&](const CAbiCallbackText& value) { return value.parameter_index == i; });
+        if (callback != abi.callbacks.end())
+            source += "beans_ffi_cb" + std::to_string(i);
+        else
+            source += "*(" + abi.parameter_types[i] + "*)args[" +
+                      std::to_string(i) + "]";
+    }
+    source += ");\n  ";
+    for (const CAbiCallbackText& callback : abi.callbacks) {
+        std::string prefix = "beans_ffi_cb" +
+                             std::to_string(callback.parameter_index);
+        source += prefix + "_dispatch = " + prefix +
+                  "_old_dispatch;\n  " + prefix + "_context = " + prefix +
+                  "_old_context;\n  ";
+    }
+    if (fn->ret)
+        source += "*(" + abi.return_type + "*)result = call_result;\n";
+    source += "}\n";
+
+    std::string bridge_error;
+    AggregateBridge bridge = load_aggregate_bridge(source, bridge_error);
+    if (!bridge) return fail(bridge_error);
+
+    struct AlignedStorage {
+        std::vector<std::max_align_t> words;
+        explicit AlignedStorage(size_t bytes)
+            : words((std::max<size_t>(bytes, 1) + sizeof(std::max_align_t) - 1) /
+                    sizeof(std::max_align_t)) {}
+        void* data() { return words.data(); }
+    };
+    std::vector<std::unique_ptr<AlignedStorage>> storage;
+    std::vector<void*> pointers;
+    std::vector<std::unique_ptr<FfiCallbackContext>> callback_storage;
+    std::vector<void*> callback_contexts(fn->params.size(), nullptr);
+    for (size_t i = 0; i < fn->params.size(); i++) {
+        const TypeRef* parameter = fn->params[i].type.get();
+        if (parameter && parameter->kind == TypeRef::Kind::fn) {
+            storage.push_back(std::make_unique<AlignedStorage>(sizeof(void*)));
+            pointers.push_back(storage.back()->data());
+            auto context = std::make_unique<FfiCallbackContext>();
+            context->owner = this;
+            context->callable = args[i];
+            for (const TypePtr& callback_parameter : parameter->fn_params)
+                context->parameters.push_back(
+                    raw_value_spec(callback_parameter.get()));
+            context->returns_value = parameter->fn_ret != nullptr;
+            if (context->returns_value)
+                context->result = raw_value_spec(parameter->fn_ret.get());
+            callback_contexts[i] = context.get();
+            callback_storage.push_back(std::move(context));
+            continue;
+        }
+        RawPtrVal spec = raw_value_spec(fn->params[i].type.get());
+        storage.push_back(std::make_unique<AlignedStorage>(spec.size));
+        spec.address = storage.back()->data();
+        raw_write(spec, args[i]);
+        pointers.push_back(spec.address);
+    }
+
+    if (!fn->ret) {
+        bridge(symbol, nullptr, pointers.data(), &Interp::ffi_callback_dispatch,
+               callback_contexts.data());
+        for (const auto& context : callback_storage)
+            if (context->error) std::rethrow_exception(context->error);
+        return Value::unit();
+    }
+    RawPtrVal result_spec = raw_value_spec(fn->ret.get());
+    AlignedStorage result(result_spec.size);
+    bridge(symbol, result.data(), pointers.data(), &Interp::ffi_callback_dispatch,
+           callback_contexts.data());
+    for (const auto& context : callback_storage)
+        if (context->error) std::rethrow_exception(context->error);
+    result_spec.address = result.data();
+    return raw_read(result_spec);
+}
+
+void Interp::ffi_callback_dispatch(void* raw_context, void* result,
+                                   void** arguments) {
+    FfiCallbackContext* context = static_cast<FfiCallbackContext*>(raw_context);
+    if (!context || context->error) {
+        if (context && result && context->result.size)
+            std::memset(result, 0, context->result.size);
+        return;
+    }
+    try {
+        std::vector<Value> values;
+        values.reserve(context->parameters.size());
+        for (size_t i = 0; i < context->parameters.size(); i++) {
+            RawPtrVal parameter = context->parameters[i];
+            parameter.address = arguments[i];
+            values.push_back(context->owner->raw_read(parameter));
+        }
+        Value returned;
+        if (context->callable.k == Value::K::closure) {
+            returned = context->owner->call_closure(*context->callable.clo,
+                                                    std::move(values));
+        } else if (context->callable.k == Value::K::fn_ref) {
+            const FnDecl* declaration = context->callable.fnr->decl;
+            returned = context->owner->call_fn(
+                declaration, nullptr, std::move(values),
+                pkg_of(declaration->qualname));
+        } else {
+            throw BeansPanic{"C callback value is not callable", 0, 0};
+        }
+        if (context->returns_value) {
+            RawPtrVal result_spec = context->result;
+            result_spec.address = result;
+            context->owner->raw_write(result_spec, returned);
+        }
+    } catch (...) {
+        context->error = std::current_exception();
+        if (result && context->result.size)
+            std::memset(result, 0, context->result.size);
+    }
+}
+
+Value Interp::call_extern(const FnDecl* fn, const std::vector<Value>& args) {
+    auto fail = [&](const std::string& message) -> Value {
+        g_beans_panicking = true;
+        throw BeansPanic{message, fn->line, fn->col};
+    };
+
+    dlerror();
+    void* symbol = dlsym(RTLD_DEFAULT, fn->extern_name.c_str());
+    const char* lookup_error = dlerror();
+    if (!symbol || lookup_error) {
+        return fail("C symbol not found: " + fn->extern_name);
+    }
+    if (args.size() > 6) return fail("extern C calls support at most 6 arguments for now");
+
+    bool has_aggregate = false;
+    for (const Param& param : fn->params) {
+        if (param.type && param.type->kind == TypeRef::Kind::fn) {
+            has_aggregate = true;
+            continue;
+        }
+        RawPtrVal spec = raw_value_spec(param.type.get());
+        has_aggregate |= spec.scalar == RawScalar::record ||
+                         spec.scalar == RawScalar::array;
+    }
+    if (fn->ret) {
+        RawPtrVal spec = raw_value_spec(fn->ret.get());
+        has_aggregate |= spec.scalar == RawScalar::record ||
+                         spec.scalar == RawScalar::array;
+    }
+    if (has_aggregate) return call_extern_aggregate(fn, args, symbol);
+
+    uint64_t words[6] = {};
+    for (size_t i = 0; i < args.size(); i++) {
+        switch (args[i].k) {
+            case Value::K::int_: words[i] = unsigned_integer(args[i]); break;
+            case Value::K::bool_: words[i] = args[i].b ? 1 : 0; break;
+            case Value::K::rawptr:
+                words[i] = static_cast<uint64_t>(
+                    reinterpret_cast<uintptr_t>(args[i].raw.address));
+                break;
+            case Value::K::float_: break;
+            default: return fail("unsupported value passed to extern C function");
+        }
+    }
+
+    bool returns_value = fn->ret != nullptr;
+    uint64_t raw = 0;
+    bool returns_float = fn->ret &&
+                         (fn->ret->name == "f32" || fn->ret->name == "f64" ||
+                          fn->ret->name == "float");
+    if (returns_float) {
+        Value out;
+        if (fn->ret->name == "f32") {
+            out = Value::of_float(call_c_abi<float>(symbol, args, words));
+            out.float_bits = 32;
+        } else {
+            out = Value::of_float(call_c_abi<double>(symbol, args, words));
+        }
+        return out;
+    }
+    if (returns_value) {
+        raw = call_c_abi<uint64_t>(symbol, args, words);
+    } else {
+        call_c_abi<void>(symbol, args, words);
+        return Value::unit();
+    }
+
+    const TypeRef* ret = fn->ret.get();
+    if (ret->name == "bool") return Value::of_bool(raw != 0);
+    if (ret->name == "RawPtr") {
+        Value out;
+        out.k = Value::K::rawptr;
+        out.raw = raw_spec(ret);
+        out.raw.address = reinterpret_cast<void*>(static_cast<uintptr_t>(raw));
+        return out;
+    }
+
+    Value out = Value::of_int(signed_integer(raw));
+    const std::string& name = ret->name;
+    out.int_bits = name == "i8" || name == "u8" || name == "byte" ? 8
+                   : name == "i16" || name == "u16"                 ? 16
+                   : name == "i32" || name == "u32"                 ? 32
+                                                                      : 64;
+    out.int_unsigned = name == "u8" || name == "byte" || name == "u16" ||
+                       name == "u32" || name == "u64";
+    normalize_integer(out);
+    return out;
+}
+
 Value Interp::call_fn(const FnDecl* fn, Value* self, std::vector<Value> args,
                       const std::string& pkg) {
+    if (fn->is_extern_c) return call_extern(fn, args);
     auto env = std::make_shared<Env>();
     if (self) env->declare("self", *self);
     for (size_t i = 0; i < fn->params.size() && i < args.size(); i++) {
-        env->declare(fn->params[i].name, std::move(args[i]));
+        if (fn->params[i].passing == Param::Passing::inout && args[i].inout_ref) {
+            env->declare_alias(fn->params[i].name, args[i].inout_ref);
+        } else {
+            env->declare(fn->params[i].name, std::move(args[i]));
+        }
     }
 
     std::string saved_pkg = g_pkg;
@@ -451,6 +1294,22 @@ void Interp::exec_stmt(const Stmt* s, std::shared_ptr<Env>& env) {
             break;
         }
         case Stmt::Kind::assign: {
+            if (s->op == TokenKind::assign && s->target &&
+                s->target->kind == Expr::Kind::field && s->target->object &&
+                s->target->object->kind == Expr::Kind::ident) {
+                Value* owner = env->find(std::string(s->target->object->text));
+                if (owner && owner->k == Value::K::struct_v && owner->struct_decl &&
+                    owner->struct_decl->is_union) {
+                    for (const FieldDecl& field : owner->struct_decl->fields) {
+                        if (field.name != s->target->name) continue;
+                        Value value = eval(s->value.get(), env, Hint::of(field.type.get()));
+                        RawPtrVal spec = raw_value_spec(field.type.get());
+                        spec.address = owner->union_bytes.data();
+                        raw_write(spec, value);
+                    }
+                    break;
+                }
+            }
             if (s->op == TokenKind::assign) {
                 // hint from the current slot so decimal stays decimal
                 Value* slot = lvalue_slot(s->target.get(), env);
@@ -472,19 +1331,33 @@ void Interp::exec_stmt(const Stmt* s, std::shared_ptr<Env>& env) {
             if (!slot2) break;
             switch (slot2->k) {
                 case Value::K::int_:
+                    {
+                    uint64_t lhs = unsigned_integer(*slot2);
+                    uint64_t right = unsigned_integer(rhs);
                     switch (s->op) {
-                        case TokenKind::plus_eq: slot2->i += rhs.i; break;
-                        case TokenKind::minus_eq: slot2->i -= rhs.i; break;
-                        case TokenKind::star_eq: slot2->i *= rhs.i; break;
+                        case TokenKind::plus_eq: lhs += right; break;
+                        case TokenKind::minus_eq: lhs -= right; break;
+                        case TokenKind::star_eq: lhs *= right; break;
                         case TokenKind::slash_eq:
-                            if (rhs.i == 0) panic(s->value.get(), "divide by zero");
-                            slot2->i /= rhs.i;
+                            if (right == 0) panic(s->value.get(), "divide by zero");
+                            if (slot2->int_unsigned) lhs /= right;
+                            else if (!(slot2->i == std::numeric_limits<int64_t>::min() &&
+                                       rhs.i == -1))
+                                lhs = static_cast<uint64_t>(slot2->i / rhs.i);
                             break;
                         case TokenKind::percent_eq:
-                            if (rhs.i == 0) panic(s->value.get(), "modulo by zero");
-                            slot2->i %= rhs.i;
+                            if (right == 0) panic(s->value.get(), "modulo by zero");
+                            if (slot2->int_unsigned) lhs %= right;
+                            else if (slot2->i == std::numeric_limits<int64_t>::min() &&
+                                     rhs.i == -1)
+                                lhs = 0;
+                            else
+                                lhs = static_cast<uint64_t>(slot2->i % rhs.i);
                             break;
                         default: break;
+                    }
+                    slot2->i = signed_integer(lhs);
+                    normalize_integer(*slot2);
                     }
                     break;
                 case Value::K::float_:
@@ -495,6 +1368,7 @@ void Interp::exec_stmt(const Stmt* s, std::shared_ptr<Env>& env) {
                         case TokenKind::slash_eq: slot2->f /= rhs.f; break;
                         default: break;
                     }
+                    normalize_float(*slot2);
                     break;
                 case Value::K::decimal_:
                     switch (s->op) {
@@ -573,13 +1447,34 @@ void Interp::exec_stmt(const Stmt* s, std::shared_ptr<Env>& env) {
                 return true;
             };
             if (it.k == Value::K::range) {
-                int64_t hi = it.range->hi + (it.range->inclusive ? 1 : 0);
-                for (int64_t x = it.range->lo; x < hi; x++) {
-                    if (!run_iter(Value::of_int(x))) break;
+                Value item = Value::of_int(it.range->lo);
+                item.int_bits = it.range->bits;
+                item.int_unsigned = it.range->is_unsigned;
+                while (true) {
+                    uint64_t end_bits;
+                    std::memcpy(&end_bits, &it.range->hi, sizeof end_bits);
+                    bool before = item.int_unsigned ? unsigned_integer(item) < end_bits
+                                                    : item.i < it.range->hi;
+                    bool equal = item.i == it.range->hi;
+                    if (!before && !(it.range->inclusive && equal)) break;
+                    if (!run_iter(item) || (it.range->inclusive && equal)) break;
+                    item.i = signed_integer(unsigned_integer(item) + 1);
+                    normalize_integer(item);
                 }
             } else if (it.k == Value::K::list) {
                 for (size_t idx = 0; idx < it.list->items.size(); idx++) {
                     if (!run_iter(it.list->items[idx])) break;
+                }
+            } else if (it.k == Value::K::fixed_array) {
+                for (const Value& item : it.array) {
+                    if (!run_iter(item)) break;
+                }
+            } else if (it.k == Value::K::slice) {
+                for (int64_t index = 0; index < it.slice_len; index++) {
+                    RawPtrVal element = it.slice_ptr;
+                    element.address = static_cast<void*>(
+                        static_cast<char*>(element.address) + index * element.size);
+                    if (!run_iter(raw_read(element))) break;
                 }
             }
             break;
@@ -602,6 +1497,15 @@ Value* Interp::lvalue_slot(const Expr* target, std::shared_ptr<Env>& env) {
         return env->find(std::string(target->text));
     }
     if (target->kind == Expr::Kind::field) {
+        if (target->object->kind == Expr::Kind::ident) {
+            Value* owner = env->find(std::string(target->object->text));
+            if (owner && owner->k == Value::K::struct_v && owner->struct_decl) {
+                for (size_t i = 0; i < owner->struct_decl->fields.size(); i++) {
+                    if (owner->struct_decl->fields[i].name == target->name)
+                        return &owner->struct_fields[i];
+                }
+            }
+        }
         Value obj = eval(target->object.get(), env);
         if (obj.k == Value::K::instance) {
             // instance is shared — the slot stays valid after obj dies
@@ -610,6 +1514,18 @@ Value* Interp::lvalue_slot(const Expr* target, std::shared_ptr<Env>& env) {
         panic(target, "can't assign to this field");
     }
     if (target->kind == Expr::Kind::index) {
+        if (target->object->kind == Expr::Kind::ident) {
+            Value* owner = env->find(std::string(target->object->text));
+            if (owner && owner->k == Value::K::fixed_array) {
+                Value idx = eval(target->index_expr.get(), env);
+                if (idx.i < 0 || static_cast<size_t>(idx.i) >= owner->array.size()) {
+                    panic(target, "array index " + std::to_string(idx.i) +
+                                      " out of range (len " +
+                                      std::to_string(owner->array.size()) + ")");
+                }
+                return &owner->array[static_cast<size_t>(idx.i)];
+            }
+        }
         Value obj = eval(target->object.get(), env);
         Value idx = eval(target->index_expr.get(), env,
                          obj.k == Value::K::map ? map_key_hint(*obj.map) : Hint{});
@@ -640,18 +1556,28 @@ void Interp::assign_to(const Expr* target, Value v, std::shared_ptr<Env>& env) {
 Value Interp::eval(const Expr* e, std::shared_ptr<Env>& env, Hint hint) {
     switch (e->kind) {
         case Expr::Kind::int_lit: {
-            // the checker's stamp wins; runtime hints only decide literals in
-            // re-parsed interpolation segments (numk == 0)
-            if (e->numk == 3 || (e->numk == 0 && hint.wants_dec()))
+            TypeId checked = hir_.type_of(e);
+            bool checked_dec = checked && checked->k == Type::K::decimal_;
+            bool checked_float = checked && checked->is_float();
+            // HIR wins. Runtime hints only decide literals in interpolation
+            // segments, which are parsed after checking and have no HIR row.
+            if (checked_dec || (!checked &&
+                                (e->numk == 3 || hint.wants_dec())))
                 return Value::of_dec(Decimal::parse(clean_number(e->text)));
-            if (e->numk == 2 || (e->numk == 0 && hint.wants_float()))
-                return Value::of_float(std::strtod(clean_number(e->text).c_str(), nullptr));
-            return Value::of_int(parse_int_text(e->text));
+            if (checked_float || (!checked &&
+                                  (e->numk == 2 || hint.wants_float())))
+                return typed_float(std::strtod(clean_number(e->text).c_str(), nullptr),
+                                   checked, hint.tref);
+            return typed_integer(parse_int_text(e->text), checked, hint.tref);
         }
         case Expr::Kind::float_lit: {
-            if (e->numk == 3 || (e->numk == 0 && hint.wants_dec()))
+            TypeId checked = hir_.type_of(e);
+            bool checked_dec = checked && checked->k == Type::K::decimal_;
+            if (checked_dec || (!checked &&
+                                (e->numk == 3 || hint.wants_dec())))
                 return Value::of_dec(Decimal::parse(clean_number(e->text)));
-            return Value::of_float(std::strtod(clean_number(e->text).c_str(), nullptr));
+            return typed_float(std::strtod(clean_number(e->text).c_str(), nullptr),
+                               checked, hint.tref);
         }
         case Expr::Kind::string_lit:
             return eval_string(e, env);
@@ -676,11 +1602,27 @@ Value Interp::eval(const Expr* e, std::shared_ptr<Env>& env, Hint hint) {
             panic(e, "self not bound");
         }
         case Expr::Kind::unary: {
+            if (e->op == TokenKind::kw_inout) {
+                Value out = Value::unit();
+                out.inout_ref = env->find(std::string(e->rhs->text));
+                return out;
+            }
+            if (e->op == TokenKind::kw_take) {
+                Value* slot = env->find(std::string(e->rhs->text));
+                Value moved = std::move(*slot);
+                *slot = Value::unit();
+                return moved;
+            }
             if (e->op == TokenKind::minus) {
-                Value v = eval(e->rhs.get(), env, hint);
-                switch (v.k) {
-                    case Value::K::int_: v.i = -v.i; return v;
-                    case Value::K::float_: v.f = -v.f; return v;
+                    Value v = eval(e->rhs.get(), env, hint);
+                    switch (v.k) {
+                    case Value::K::int_: {
+                        uint64_t bits = 0 - unsigned_integer(v);
+                        v.i = signed_integer(bits);
+                        normalize_integer(v);
+                        return v;
+                    }
+                    case Value::K::float_: v.f = -v.f; normalize_float(v); return v;
                     case Value::K::decimal_: v.dec = v.dec.neg(); return v;
                     default: return v;
                 }
@@ -691,6 +1633,7 @@ Value Interp::eval(const Expr* e, std::shared_ptr<Env>& env, Hint hint) {
             }
             Value v = eval(e->rhs.get(), env); // ~
             v.i = ~v.i;
+            normalize_integer(v);
             return v;
         }
         case Expr::Kind::binary:
@@ -703,6 +1646,8 @@ Value Interp::eval(const Expr* e, std::shared_ptr<Env>& env, Hint hint) {
             v.range = std::make_shared<RangeVal>();
             v.range->lo = lo.i;
             v.range->hi = hi.i;
+            v.range->bits = lo.int_bits;
+            v.range->is_unsigned = lo.int_unsigned;
             v.range->inclusive = e->inclusive;
             return v;
         }
@@ -737,6 +1682,19 @@ Value Interp::eval(const Expr* e, std::shared_ptr<Env>& env, Hint hint) {
                 if (Value* f = v.inst->field(e->name)) return *f;
                 panic(e, "no field '" + e->name + "'");
             }
+            if (v.k == Value::K::struct_v && v.struct_decl) {
+                for (size_t i = 0; i < v.struct_decl->fields.size(); i++) {
+                    if (v.struct_decl->fields[i].name != e->name) continue;
+                    if (v.struct_decl->is_union) {
+                        RawPtrVal spec = raw_value_spec(v.struct_decl->fields[i].type.get());
+                        spec.address = v.union_bytes.data();
+                        return raw_read(spec);
+                    }
+                    if (i < v.struct_fields.size())
+                        return v.struct_fields[i];
+                }
+                panic(e, "no field '" + e->name + "'");
+            }
             panic(e, "no field '" + e->name + "' on this value");
         }
         case Expr::Kind::index: {
@@ -751,6 +1709,27 @@ Value Interp::eval(const Expr* e, std::shared_ptr<Env>& env, Hint hint) {
                 }
                 return obj.list->items[static_cast<size_t>(i)];
             }
+            if (obj.k == Value::K::slice) {
+                int64_t i = idx.i;
+                if (i < 0 || i >= obj.slice_len) {
+                    panic(e, "slice index " + std::to_string(i) +
+                                 " out of range (len " +
+                                 std::to_string(obj.slice_len) + ")");
+                }
+                RawPtrVal element = obj.slice_ptr;
+                element.address = static_cast<void*>(
+                    static_cast<char*>(element.address) + i * element.size);
+                return raw_read(element);
+            }
+            if (obj.k == Value::K::fixed_array) {
+                int64_t i = idx.i;
+                if (i < 0 || static_cast<size_t>(i) >= obj.array.size()) {
+                    panic(e, "array index " + std::to_string(i) +
+                                 " out of range (len " +
+                                 std::to_string(obj.array.size()) + ")");
+                }
+                return obj.array[static_cast<size_t>(i)];
+            }
             if (obj.k == Value::K::map) {
                 uint64_t h = 0;
                 size_t i = map_find(*obj.map, idx, h);
@@ -761,6 +1740,15 @@ Value Interp::eval(const Expr* e, std::shared_ptr<Env>& env, Hint hint) {
         }
         case Expr::Kind::list_lit: {
             Value v;
+            TypeId checked = hir_.type_of(e);
+            if ((hint.tref && hint.tref->kind == TypeRef::Kind::fixed_array) ||
+                (checked && checked->k == Type::K::fixed_array)) {
+                v.k = Value::K::fixed_array;
+                Hint elem = Hint::of(hint.arg(0));
+                for (const ExprPtr& el : e->args)
+                    v.array.push_back(eval(el.get(), env, elem));
+                return v;
+            }
             v.k = Value::K::list;
             v.list = std::make_shared<ListVal>();
             Hint elem = Hint::of(hint.arg(0));
@@ -792,22 +1780,27 @@ Value Interp::eval(const Expr* e, std::shared_ptr<Env>& env, Hint hint) {
                 return v;
             }
             if (tn == "float" || tn == "f64" || tn == "f32") {
-                if (v.k == Value::K::int_) return Value::of_float(static_cast<double>(v.i));
-                if (v.k == Value::K::decimal_) return Value::of_float(v.dec.to_double());
+                TypeId to = hir_.type_of(e);
+                if (v.k == Value::K::int_) {
+                    double number = v.int_unsigned
+                                        ? static_cast<double>(unsigned_integer(v))
+                                        : static_cast<double>(v.i);
+                    return typed_float(number, to, e->type.get());
+                }
+                if (v.k == Value::K::decimal_)
+                    return typed_float(v.dec.to_double(), to, e->type.get());
+                v.float_bits = tn == "f32" ? 32 : 64;
+                normalize_float(v);
                 return v;
             }
-            if (tn == "int" || tn == "i64") {
-                if (v.k == Value::K::float_) return Value::of_int(static_cast<int64_t>(v.f));
-                if (v.k == Value::K::decimal_) return Value::of_int(v.dec.to_int());
-                return v;
+            if (tn == "int" || tn == "i64" || tn == "i8" || tn == "i16" ||
+                tn == "i32" || tn == "u8" || tn == "byte" || tn == "u16" ||
+                tn == "u32" || tn == "u64") {
+                int64_t bits = v.i;
+                if (v.k == Value::K::float_) bits = static_cast<int64_t>(v.f);
+                if (v.k == Value::K::decimal_) bits = v.dec.to_int();
+                return typed_integer(bits, hir_.type_of(e), e->type.get());
             }
-            if (tn == "i8") { v.i = static_cast<int8_t>(v.i); return v; }
-            if (tn == "i16") { v.i = static_cast<int16_t>(v.i); return v; }
-            if (tn == "i32") { v.i = static_cast<int32_t>(v.i); return v; }
-            if (tn == "u8" || tn == "byte") { v.i = static_cast<uint8_t>(v.i); return v; }
-            if (tn == "u16") { v.i = static_cast<uint16_t>(v.i); return v; }
-            if (tn == "u32") { v.i = static_cast<uint32_t>(v.i); return v; }
-            if (tn == "u64") return v;
             return v; // upcasts are free
         }
         case Expr::Kind::try_: {
@@ -884,33 +1877,75 @@ Value Interp::eval_binary(const Expr* e, std::shared_ptr<Env>& env) {
     switch (l.k) {
         case Value::K::int_: {
             int64_t a = l.i, b = r.i;
+            uint64_t ua = unsigned_integer(l), ub = unsigned_integer(r);
+            auto result = [&](uint64_t bits) {
+                Value value = l;
+                value.i = signed_integer(bits);
+                normalize_integer(value);
+                return value;
+            };
+            auto compare = [&]() {
+                if (l.int_unsigned)
+                    return cmp_result(ua < ub ? -1 : ua > ub ? 1 : 0);
+                return cmp_result(a < b ? -1 : a > b ? 1 : 0);
+            };
             switch (op) {
-                case TokenKind::plus: return Value::of_int(a + b);
-                case TokenKind::minus: return Value::of_int(a - b);
-                case TokenKind::star: return Value::of_int(a * b);
+                case TokenKind::plus: return result(ua + ub);
+                case TokenKind::minus: return result(ua - ub);
+                case TokenKind::star: return result(ua * ub);
                 case TokenKind::slash:
-                    if (b == 0) panic(e, "divide by zero");
-                    return Value::of_int(a / b);
+                    if (ub == 0) panic(e, "divide by zero");
+                    if (l.int_unsigned) return result(ua / ub);
+                    if (b == -1 && a == std::numeric_limits<int64_t>::min())
+                        return result(ua);
+                    return result(static_cast<uint64_t>(a / b));
                 case TokenKind::percent:
-                    if (b == 0) panic(e, "modulo by zero");
-                    return Value::of_int(a % b);
-                case TokenKind::shl: return Value::of_int(a << b);
-                case TokenKind::shr: return Value::of_int(a >> b);
-                case TokenKind::amp: return Value::of_int(a & b);
-                case TokenKind::pipe: return Value::of_int(a | b);
-                case TokenKind::caret: return Value::of_int(a ^ b);
-                default: return cmp_result(a < b ? -1 : a > b ? 1 : 0);
+                    if (ub == 0) panic(e, "modulo by zero");
+                    if (l.int_unsigned) return result(ua % ub);
+                    if (b == -1 && a == std::numeric_limits<int64_t>::min()) return result(0);
+                    return result(static_cast<uint64_t>(a % b));
+                case TokenKind::shl:
+                    return result(ua << (ub & ((l.int_bits ? l.int_bits : 64) - 1)));
+                case TokenKind::shr:
+                    return l.int_unsigned
+                               ? result(ua >> (ub & ((l.int_bits ? l.int_bits : 64) - 1)))
+                               : result(static_cast<uint64_t>(
+                                     a >> (ub & ((l.int_bits ? l.int_bits : 64) - 1))));
+                case TokenKind::amp: return result(ua & ub);
+                case TokenKind::pipe: return result(ua | ub);
+                case TokenKind::caret: return result(ua ^ ub);
+                default: return compare();
             }
         }
         case Value::K::float_: {
             double a = l.f, b = r.f;
+            auto result = [&](double number) {
+                Value value = l;
+                value.f = number;
+                normalize_float(value);
+                return value;
+            };
             switch (op) {
-                case TokenKind::plus: return Value::of_float(a + b);
-                case TokenKind::minus: return Value::of_float(a - b);
-                case TokenKind::star: return Value::of_float(a * b);
-                case TokenKind::slash: return Value::of_float(a / b);
+                case TokenKind::plus: return result(a + b);
+                case TokenKind::minus: return result(a - b);
+                case TokenKind::star: return result(a * b);
+                case TokenKind::slash: return result(a / b);
                 default: return cmp_result(a < b ? -1 : a > b ? 1 : 0);
             }
+        }
+        case Value::K::simd4f32: {
+            Value out;
+            out.k = Value::K::simd4f32;
+            for (size_t lane = 0; lane < out.simd.size(); lane++) {
+                switch (op) {
+                    case TokenKind::plus: out.simd[lane] = l.simd[lane] + r.simd[lane]; break;
+                    case TokenKind::minus: out.simd[lane] = l.simd[lane] - r.simd[lane]; break;
+                    case TokenKind::star: out.simd[lane] = l.simd[lane] * r.simd[lane]; break;
+                    case TokenKind::slash: out.simd[lane] = l.simd[lane] / r.simd[lane]; break;
+                    default: break;
+                }
+            }
+            return out;
         }
         case Value::K::decimal_: {
             switch (op) {
@@ -931,12 +1966,22 @@ Value Interp::eval_binary(const Expr* e, std::shared_ptr<Env>& env) {
             switch (op) {
                 case TokenKind::eq: return Value::of_bool(l.b == r.b);
                 case TokenKind::neq: return Value::of_bool(l.b != r.b);
+                case TokenKind::lt: return Value::of_bool(!l.b && r.b);
+                case TokenKind::le: return Value::of_bool(l.b == r.b || (!l.b && r.b));
+                case TokenKind::gt: return Value::of_bool(l.b && !r.b);
+                case TokenKind::ge: return Value::of_bool(l.b == r.b || (l.b && !r.b));
                 default: break;
             }
             return Value::of_bool(false);
         }
         case Value::K::enum_v:
-        case Value::K::bytes: {
+        case Value::K::bytes:
+        case Value::K::rawptr:
+        case Value::K::fixed_array: {
+            bool same = value_eq(l, r);
+            return Value::of_bool(op == TokenKind::eq ? same : !same);
+        }
+        case Value::K::struct_v: {
             bool same = value_eq(l, r);
             return Value::of_bool(op == TokenKind::eq ? same : !same);
         }
@@ -949,10 +1994,11 @@ Value Interp::eval_init(const Expr* e, std::shared_ptr<Env>& env, Hint hint) {
     std::string cname = e->resolved.empty() ? e->name : e->resolved;
     bool pinned = !e->resolved.empty();
     if (cname.empty() && hint.tref && hint.tref->kind == TypeRef::Kind::named) {
-        if (hint.tref->name == "Map") {
+        if (hint.tref->name == "Map" || hint.tref->name == "OrderedMap") {
             Value v;
             v.k = Value::K::map;
             v.map = std::make_shared<MapVal>();
+            v.map->ordered = hint.tref->name == "OrderedMap";
             Hint kh = Hint::of(hint.arg(0));
             Hint vh = Hint::of(hint.arg(1));
             for (const InitEntry& en : e->entries) {
@@ -981,10 +2027,11 @@ Value Interp::eval_init(const Expr* e, std::shared_ptr<Env>& env, Hint hint) {
         }
     }
     // map literal with string keys, no hint needed at runtime
-    if (cname.empty() || cname == "Map") {
+    if (cname.empty() || cname == "Map" || cname == "OrderedMap") {
         Value v;
         v.k = Value::K::map;
         v.map = std::make_shared<MapVal>();
+        v.map->ordered = cname == "OrderedMap";
         for (const InitEntry& en : e->entries) {
             Value key = en.key ? eval(en.key.get(), env) : Value::of_str(en.name);
             map_set(*v.map, std::move(key), eval(en.value.get(), env));
@@ -1213,6 +2260,91 @@ Value Interp::eval_call(const Expr* e, std::shared_ptr<Env>& env, Hint hint) {
                 return x;
             }
 
+            if (n == "Slice" && mname == "from_raw") {
+                Value pointer = eval(e->args[0].get(), env);
+                Value length = eval(e->args[1].get(), env);
+                if (length.i < 0) panic(e, "negative slice length");
+                if (length.i > 0 && !pointer.raw.address)
+                    panic(e, "null pointer with non-empty slice");
+                Value value;
+                value.k = Value::K::slice;
+                value.slice_ptr = pointer.raw;
+                value.slice_len = length.i;
+                return value;
+            }
+
+            if (n == "Simd4f32") {
+                Value value;
+                value.k = Value::K::simd4f32;
+                if (mname == "splat") {
+                    Value scalar = eval(e->args[0].get(), env, Hint::floating());
+                    value.simd.fill(static_cast<float>(scalar.f));
+                    return value;
+                }
+                if (mname == "of") {
+                    for (size_t i = 0; i < value.simd.size(); i++) {
+                        Value scalar = eval(e->args[i].get(), env, Hint::floating());
+                        value.simd[i] = static_cast<float>(scalar.f);
+                    }
+                    return value;
+                }
+                if (mname == "load") {
+                    Value pointer = eval(e->args[0].get(), env);
+                    if (!pointer.raw.address) panic(e, "null SIMD load");
+                    std::memcpy(value.simd.data(), pointer.raw.address,
+                                sizeof(float) * value.simd.size());
+                    return value;
+                }
+            }
+
+            if (n == "RawPtr") {
+                Value value;
+                value.k = Value::K::rawptr;
+                value.raw = raw_spec(hir_.type_of(e));
+                if (mname == "alloc") {
+                    Value count = eval(e->args[0].get(), env);
+                    if (count.i < 0) panic(e, "negative raw allocation count");
+                    uint64_t amount = static_cast<uint64_t>(count.i);
+                    if (!value.raw.size || amount > (uint64_t{1} << 58) / value.raw.size)
+                        panic(e, "raw allocation too large");
+                    value.raw.address = std::calloc(static_cast<size_t>(amount),
+                                                    value.raw.size);
+                    if (!value.raw.address && amount) panic(e, "out of memory");
+                    return value;
+                }
+                if (mname == "from_address") {
+                    Value address = eval(e->args[0].get(), env);
+                    value.raw.address = reinterpret_cast<void*>(
+                        static_cast<uintptr_t>(unsigned_integer(address)));
+                    return value;
+                }
+                if (mname == "null") return value;
+            }
+
+            if (n == "Arena" && mname == "new") {
+                Value cap = eval(e->args[0].get(), env);
+                if (cap.i < 0) panic(e, "negative arena capacity " + std::to_string(cap.i));
+                if (cap.i > (1LL << 58)) panic(e, "arena capacity too large");
+                Value v;
+                v.k = Value::K::arena;
+                v.arena = std::make_shared<ArenaVal>();
+                v.arena->values.reserve(static_cast<size_t>(cap.i));
+                return v;
+            }
+            if (n == "Box" && mname == "new") {
+                Value v;
+                v.k = Value::K::box;
+                v.box = std::make_shared<BoxVal>();
+                v.box->inner = eval(e->args[0].get(), env, Hint::of(hint.arg(0)));
+                return v;
+            }
+            if (n == "Shared" && mname == "new") {
+                Value v;
+                v.k = Value::K::shared;
+                v.shared = std::make_shared<SharedVal>();
+                v.shared->inner = eval(e->args[0].get(), env, Hint::of(hint.arg(0)));
+                return v;
+            }
             if (n == "Mutex" && mname == "new") {
                 Value inner = eval(e->args[0].get(), env, Hint::of(hint.arg(0)));
                 Value v;
@@ -1237,8 +2369,7 @@ Value Interp::eval_call(const Expr* e, std::shared_ptr<Env>& env, Hint hint) {
                 v.atomic->v = init.i;
                 return v;
             }
-            if (n == "Bytes" || n == "File" || n == "Dir" || n == "MMap" || n == "Path" ||
-                n == "BufReader") {
+            if (n == "Bytes" || n == "File" || n == "Dir" || n == "MMap") {
                 for (const BuiltinStatic& b : builtin_statics()) {
                     if (n == b.cls && mname == b.name) {
                         std::vector<Value> args;
@@ -1328,7 +2459,13 @@ Value Interp::eval_call(const Expr* e, std::shared_ptr<Env>& env, Hint hint) {
 // ordering for sort/min/max — the checker only lets ordered element types in
 static bool value_less(const Value& a, const Value& b) {
     switch (a.k) {
-        case Value::K::int_: return a.i < b.i;
+        case Value::K::int_: {
+            if (!a.int_unsigned) return a.i < b.i;
+            uint64_t ua, ub;
+            std::memcpy(&ua, &a.i, sizeof ua);
+            std::memcpy(&ub, &b.i, sizeof ub);
+            return ua < ub;
+        }
         case Value::K::float_: return a.f < b.f;
         case Value::K::decimal_: return a.dec.cmp(b.dec) < 0;
         case Value::K::string_: return *a.s < *b.s;
@@ -1399,7 +2536,6 @@ std::vector<Value> Interp::eval_method_args(const Expr* e, std::shared_ptr<Env>&
         case Value::K::bytes: row_hints(BT::bytes); break;
         case Value::K::file: row_hints(BT::file); break;
         case Value::K::mmap: row_hints(BT::mmap); break;
-        case Value::K::bufr: row_hints(BT::bufr); break;
         case Value::K::list: {
             const auto& items = recv.list->items;
             if (!items.empty() && n >= 1) {
@@ -1409,6 +2545,7 @@ std::vector<Value> Interp::eval_method_args(const Expr* e, std::shared_ptr<Env>&
             }
             break;
         }
+        case Value::K::fixed_array: break;
         case Value::K::map: {
             const MapVal& mv = *recv.map;
             const auto& es = mv.entries;
@@ -1436,7 +2573,13 @@ Value Interp::eval_builtin_method(const Expr* e, Value& recv, const std::string&
                                   std::vector<Value>& args) {
     switch (recv.k) {
         case Value::K::int_:
-            if (name == "abs") return Value::of_int(recv.i < 0 ? -recv.i : recv.i);
+            if (name == "abs") {
+                if (recv.int_unsigned || recv.i >= 0) return recv;
+                Value out = recv;
+                out.i = signed_integer(0 - unsigned_integer(recv));
+                normalize_integer(out);
+                return out;
+            }
             break;
         case Value::K::float_:
             if (name == "abs") return Value::of_float(std::fabs(recv.f));
@@ -1480,16 +2623,15 @@ Value Interp::eval_builtin_method(const Expr* e, Value& recv, const std::string&
             }
             break;
         }
-        case Value::K::bufr: {
-            for (const BuiltinMethod& b : builtin_methods()) {
-                if (b.recv == BT::bufr && name == b.name) {
-                    return b.run(e->line, e->col, recv, args);
-                }
-            }
-            break;
-        }
         case Value::K::list: {
             auto& items = recv.list->items;
+            if (name == "clone") {
+                Value out;
+                out.k = Value::K::list;
+                out.list = std::make_shared<ListVal>();
+                out.list->items = items;
+                return out;
+            }
             if (name == "push") { items.push_back(args[0]); return Value::unit(); }
             if (name == "pop") {
                 if (items.empty()) return none();
@@ -1529,6 +2671,14 @@ Value Interp::eval_builtin_method(const Expr* e, Value& recv, const std::string&
                     out += display(items[i]);
                 }
                 return Value::of_str(std::move(out));
+            }
+            if (name == "reserve") {
+                if (args[0].i < 0) {
+                    panic(e, "negative reserve capacity " + std::to_string(args[0].i));
+                }
+                if (args[0].i > (1LL << 58)) panic(e, "reserve capacity too large");
+                items.reserve(static_cast<size_t>(args[0].i));
+                return Value::unit();
             }
             if (name == "first") {
                 if (items.empty()) return none();
@@ -1609,11 +2759,42 @@ Value Interp::eval_builtin_method(const Expr* e, Value& recv, const std::string&
                 });
                 return Value::unit();
             }
+            if (name == "sort_by_key") {
+                Value f = args[0];
+                std::vector<std::pair<int64_t, Value>> keyed;
+                keyed.reserve(items.size());
+                for (Value& item : items) {
+                    Value key = f.k == Value::K::closure
+                                    ? call_closure(*f.clo, {item})
+                                    : call_fn(f.fnr->decl, nullptr, {item},
+                                              pkg_of(f.fnr->decl->qualname));
+                    keyed.emplace_back(key.i, std::move(item));
+                }
+                std::stable_sort(keyed.begin(), keyed.end(),
+                                 [](const auto& left, const auto& right) {
+                                     return left.first < right.first;
+                                 });
+                for (size_t i = 0; i < keyed.size(); i++)
+                    items[i] = std::move(keyed[i].second);
+                return Value::unit();
+            }
             break;
         }
         case Value::K::map: {
             MapVal& mv = *recv.map;
             auto& entries = mv.entries;
+            if (name == "clone") {
+                Value out;
+                out.k = Value::K::map;
+                out.map = std::make_shared<MapVal>();
+                out.map->entries = mv.entries;
+                out.map->index = mv.index;
+                out.map->tombs = mv.tombs;
+                out.map->dead = mv.dead;
+                out.map->holes = mv.holes;
+                out.map->ordered = mv.ordered;
+                return out;
+            }
             if (name == "get") {
                 uint64_t h = 0;
                 size_t i = map_find(mv, args[0], h);
@@ -1622,6 +2803,23 @@ Value Interp::eval_builtin_method(const Expr* e, Value& recv, const std::string&
             }
             if (name == "set") {
                 map_set(mv, args[0], args[1]);
+                return Value::unit();
+            }
+            if (name == "insert") {
+                uint64_t h = 0;
+                if (map_find(mv, args[0], h) != SIZE_MAX)
+                    return Value::of_bool(false);
+                map_append(mv, h, args[0], args[1]);
+                return Value::of_bool(true);
+            }
+            if (name == "reserve") {
+                if (args[0].i < 0) {
+                    panic(e, "negative reserve capacity " + std::to_string(args[0].i));
+                }
+                if (args[0].i > (1LL << 58)) panic(e, "reserve capacity too large");
+                const size_t capacity = static_cast<size_t>(args[0].i);
+                entries.reserve(capacity);
+                map_reindex(mv, capacity);
                 return Value::unit();
             }
             if (name == "len") return Value::of_int(static_cast<int64_t>(mv.live()));
@@ -1653,6 +2851,62 @@ Value Interp::eval_builtin_method(const Expr* e, Value& recv, const std::string&
             }
             break;
         }
+        case Value::K::box:
+            if (name == "get") return recv.box->inner;
+            if (name == "set") {
+                recv.box->inner = std::move(args[0]);
+                return Value::unit();
+            }
+            break;
+        case Value::K::arena:
+            if (name == "put") {
+                int64_t handle = static_cast<int64_t>(recv.arena->values.size());
+                recv.arena->values.push_back(std::move(args[0]));
+                return Value::of_int(handle);
+            }
+            if (name == "get") {
+                int64_t handle = args[0].i;
+                if (handle < 0 || static_cast<size_t>(handle) >= recv.arena->values.size())
+                    return none();
+                return some(recv.arena->values[static_cast<size_t>(handle)]);
+            }
+            if (name == "at") {
+                int64_t handle = args[0].i;
+                if (handle < 0 || static_cast<size_t>(handle) >= recv.arena->values.size()) {
+                    panic(e, "arena handle " + std::to_string(handle) +
+                                 " out of range (len " +
+                                 std::to_string(recv.arena->values.size()) + ")");
+                }
+                return recv.arena->values[static_cast<size_t>(handle)];
+            }
+            if (name == "len")
+                return Value::of_int(static_cast<int64_t>(recv.arena->values.size()));
+            if (name == "clear") {
+                recv.arena->values.clear();
+                return Value::unit();
+            }
+            break;
+        case Value::K::shared:
+            if (name == "get") return recv.shared->inner;
+            if (name == "downgrade") {
+                Value out;
+                out.k = Value::K::weak;
+                out.weak = std::make_shared<WeakVal>();
+                out.weak->inner = recv.shared;
+                return out;
+            }
+            break;
+        case Value::K::weak:
+            if (name == "upgrade") {
+                std::shared_ptr<SharedVal> strong = recv.weak->inner.lock();
+                if (!strong) return none();
+                Value out;
+                out.k = Value::K::shared;
+                out.shared = std::move(strong);
+                return some(std::move(out));
+            }
+            if (name == "expired") return Value::of_bool(recv.weak->inner.expired());
+            break;
         case Value::K::enum_v: {
             const std::string& variant = recv.en->variant;
             bool has = variant == "some" || variant == "ok";
@@ -1726,6 +2980,162 @@ Value Interp::eval_builtin_method(const Expr* e, Value& recv, const std::string&
             if (name == "set") { recv.atomic->v.store(args[0].i); return Value::unit(); }
             break;
         }
+        case Value::K::slice: {
+            auto element_at = [&](int64_t index) {
+                if (index < 0 || index >= recv.slice_len) {
+                    panic(e, "slice index " + std::to_string(index) +
+                                 " out of range (len " +
+                                 std::to_string(recv.slice_len) + ")");
+                }
+                RawPtrVal pointer = recv.slice_ptr;
+                pointer.address = static_cast<void*>(
+                    static_cast<char*>(pointer.address) + index * pointer.size);
+                return pointer;
+            };
+            if (name == "len") return Value::of_int(recv.slice_len);
+            if (name == "get") return raw_read(element_at(args[0].i));
+            if (name == "set") {
+                raw_write(element_at(args[0].i), args[1]);
+                return Value::unit();
+            }
+            if (name == "subslice") {
+                int64_t from = args[0].i, to = args[1].i;
+                if (from < 0 || to < from || to > recv.slice_len)
+                    panic(e, "slice range out of bounds");
+                Value out = recv;
+                out.slice_ptr.address = static_cast<void*>(
+                    static_cast<char*>(recv.slice_ptr.address) + from * recv.slice_ptr.size);
+                out.slice_len = to - from;
+                return out;
+            }
+            if (name == "as_ptr") {
+                Value out;
+                out.k = Value::K::rawptr;
+                out.raw = recv.slice_ptr;
+                return out;
+            }
+            break;
+        }
+        case Value::K::rawptr: {
+            auto require_atomic_alignment = [&] {
+                uintptr_t address = reinterpret_cast<uintptr_t>(recv.raw.address);
+                if (recv.raw.align > 1 && address % recv.raw.align != 0)
+                    panic(e, "unaligned raw pointer atomic access");
+            };
+            auto word = [](const Value& value) {
+                return value.k == Value::K::bool_ ? uint64_t(value.b ? 1 : 0)
+                                                   : unsigned_integer(value);
+            };
+            auto scalar = [&](uint64_t bits) {
+                if (recv.raw.scalar == RawScalar::boolean)
+                    return Value::of_bool(bits != 0);
+                Value out = Value::of_int(signed_integer(bits));
+                out.int_bits = recv.raw.bits;
+                out.int_unsigned = recv.raw.scalar == RawScalar::unsigned_int;
+                normalize_integer(out);
+                return out;
+            };
+            if (name == "read" || name == "read_volatile") {
+                if (!recv.raw.address) panic(e, "null raw pointer read");
+                return raw_read(recv.raw);
+            }
+            if (name == "write" || name == "write_volatile") {
+                if (!recv.raw.address) panic(e, "null raw pointer write");
+                raw_write(recv.raw, args[0]);
+                return Value::unit();
+            }
+            if (name == "offset") {
+                Value out = recv;
+                out.raw.address = static_cast<void*>(
+                    static_cast<char*>(recv.raw.address) + args[0].i * recv.raw.size);
+                return out;
+            }
+            if (name == "address") {
+                uint64_t bits = static_cast<uint64_t>(
+                    reinterpret_cast<uintptr_t>(recv.raw.address));
+                Value out = Value::of_int(signed_integer(bits));
+                out.int_unsigned = true;
+                return out;
+            }
+            if (name == "is_null") return Value::of_bool(!recv.raw.address);
+            if (name == "element_size") return Value::of_int(recv.raw.size);
+            if (name == "element_align") return Value::of_int(recv.raw.align);
+            if (name == "copy_from") {
+                if (args[1].i < 0) panic(e, "negative raw copy count");
+                uint64_t count = static_cast<uint64_t>(args[1].i);
+                if (!recv.raw.size || count > (uint64_t{1} << 58) / recv.raw.size)
+                    panic(e, "raw copy too large");
+                if (count && (!recv.raw.address || !args[0].raw.address))
+                    panic(e, "null raw pointer copy");
+                std::memmove(recv.raw.address, args[0].raw.address,
+                             static_cast<size_t>(count * recv.raw.size));
+                return Value::unit();
+            }
+            if (name == "fill_zero") {
+                if (args[0].i < 0) panic(e, "negative raw zero count");
+                uint64_t count = static_cast<uint64_t>(args[0].i);
+                if (!recv.raw.size || count > (uint64_t{1} << 58) / recv.raw.size)
+                    panic(e, "raw zero too large");
+                if (count && !recv.raw.address) panic(e, "null raw pointer zero");
+                std::memset(recv.raw.address, 0,
+                            static_cast<size_t>(count * recv.raw.size));
+                return Value::unit();
+            }
+            if (name == "atomic_load") {
+                if (!recv.raw.address) panic(e, "null raw pointer atomic load");
+                require_atomic_alignment();
+                return scalar(raw_atomic_load(recv.raw));
+            }
+            if (name == "atomic_store") {
+                if (!recv.raw.address) panic(e, "null raw pointer atomic store");
+                require_atomic_alignment();
+                raw_atomic_store(recv.raw, word(args[0]));
+                return Value::unit();
+            }
+            if (name == "atomic_fetch_add") {
+                if (!recv.raw.address) panic(e, "null raw pointer atomic fetch_add");
+                require_atomic_alignment();
+                return scalar(raw_atomic_fetch_add(recv.raw, word(args[0])));
+            }
+            if (name == "atomic_compare_exchange") {
+                if (!recv.raw.address)
+                    panic(e, "null raw pointer atomic compare_exchange");
+                require_atomic_alignment();
+                return Value::of_bool(raw_atomic_compare_exchange(
+                    recv.raw, word(args[0]), word(args[1])));
+            }
+            if (name == "free") {
+                std::free(recv.raw.address);
+                return Value::unit();
+            }
+            break;
+        }
+        case Value::K::simd4f32: {
+            if (name == "lane") {
+                if (args[0].i < 0 || args[0].i >= 4)
+                    panic(e, "SIMD lane out of range");
+                Value out = Value::of_float(recv.simd[static_cast<size_t>(args[0].i)]);
+                out.float_bits = 32;
+                return out;
+            }
+            if (name == "sum") {
+                float first = recv.simd[0] + recv.simd[1];
+                float second = recv.simd[2] + recv.simd[3];
+                Value out = Value::of_float(first + second);
+                out.float_bits = 32;
+                return out;
+            }
+            if (name == "store") {
+                if (!args[0].raw.address) panic(e, "null SIMD store");
+                std::memcpy(args[0].raw.address, recv.simd.data(),
+                            sizeof(float) * recv.simd.size());
+                return Value::unit();
+            }
+            break;
+        }
+        case Value::K::fixed_array:
+            if (name == "len") return Value::of_int(static_cast<int64_t>(recv.array.size()));
+            break;
         default:
             break;
     }
@@ -1920,19 +3330,32 @@ bool Interp::value_eq(const Value& a, const Value& b) {
         }
         case Value::K::instance: return a.inst == b.inst;
         case Value::K::list: return a.list == b.list;
+        case Value::K::box: return a.box == b.box;
+        case Value::K::arena: return a.arena == b.arena;
+        case Value::K::shared: return a.shared == b.shared;
+        case Value::K::weak: return a.weak == b.weak;
+        case Value::K::rawptr: return a.raw.address == b.raw.address;
+        case Value::K::fixed_array:
+            if (a.array.size() != b.array.size()) return false;
+            for (size_t i = 0; i < a.array.size(); i++)
+                if (!value_eq(a.array[i], b.array[i])) return false;
+            return true;
+        case Value::K::struct_v:
+            if (a.struct_decl != b.struct_decl ||
+                a.struct_fields.size() != b.struct_fields.size())
+                return false;
+            for (size_t i = 0; i < a.struct_fields.size(); i++)
+                if (!value_eq(a.struct_fields[i], b.struct_fields[i])) return false;
+            return true;
         case Value::K::bytes: return a.bytes->data == b.bytes->data;
         default: return false;
     }
 }
 
 // ---- map index ---------------------------------------------------------------
-// Entries stay a flat insertion-ordered vector (keys()/values()/printing walk
-// it); the index vector only maps hash -> position. Small maps skip the index
-// and scan, exactly the old behaviour.
-
-static constexpr size_t MAP_LINEAR_MAX = 8;
-static constexpr uint64_t IDX_POS = 0xffffffffull;     // low 32: pos+2, 1 = tomb
-static constexpr uint64_t IDX_FRAG = ~IDX_POS;         // high 32: hash fragment
+// Entries stay flat and the index maps hash -> position. OrderedMap preserves
+// this vector's insertion order. Plain Map may swap-remove. Small maps skip
+// the index and scan.
 
 static uint64_t mix64(uint64_t x) {
     x ^= x >> 33;
@@ -1989,6 +3412,16 @@ uint64_t Interp::value_hash(const Value& v) {
             return mix64(reinterpret_cast<uintptr_t>(v.inst.get()));
         case Value::K::list:
             return mix64(reinterpret_cast<uintptr_t>(v.list.get()));
+        case Value::K::box:
+            return mix64(reinterpret_cast<uintptr_t>(v.box.get()));
+        case Value::K::arena:
+            return mix64(reinterpret_cast<uintptr_t>(v.arena.get()));
+        case Value::K::shared:
+            return mix64(reinterpret_cast<uintptr_t>(v.shared.get()));
+        case Value::K::weak:
+            return mix64(reinterpret_cast<uintptr_t>(v.weak.get()));
+        case Value::K::rawptr:
+            return mix64(reinterpret_cast<uintptr_t>(v.raw.address));
         case Value::K::bytes:
             return fnv_hash(v.bytes->data.data(), v.bytes->data.size());
         default: return 0; // value_eq's never-equal arm: any hash is consistent
@@ -2025,7 +3458,7 @@ size_t Interp::map_find(MapVal& m, const Value& key, uint64_t& h,
 
 // (re)build the index sized for the current entry count, dropping tombstones
 // and compacting holes
-void Interp::map_reindex(MapVal& m) {
+void Interp::map_reindex(MapVal& m, size_t reserve) {
     if (!m.dead.empty()) {
         size_t w = 0;
         for (size_t p = 0; p < m.entries.size(); p++) {
@@ -2038,7 +3471,8 @@ void Interp::map_reindex(MapVal& m) {
         m.holes = 0;
     }
     size_t cap = 16;
-    while (m.entries.size() * 3 >= cap * 2) cap <<= 1;
+    const size_t wanted = std::max(m.entries.size(), reserve);
+    while (wanted * 3 >= cap * 2) cap <<= 1;
     m.index.assign(cap, 0);
     m.tombs = 0;
     uint64_t mask = cap - 1;
@@ -2097,8 +3531,35 @@ bool Interp::map_remove_key(MapVal& m, const Value& key) {
     size_t slot = 0;
     size_t i = map_find(m, key, h, &slot);
     if (i == SIZE_MAX) return false;
-    if (m.index.empty()) { // small map: slide, exactly the old behaviour
-        m.entries.erase(m.entries.begin() + static_cast<ptrdiff_t>(i));
+    if (m.index.empty()) {
+        if (m.ordered) {
+            m.entries.erase(m.entries.begin() + static_cast<ptrdiff_t>(i));
+        } else {
+            size_t last = m.entries.size() - 1;
+            if (i != last) m.entries[i] = std::move(m.entries[last]);
+            m.entries.pop_back();
+        }
+        return true;
+    }
+    if (!m.ordered) {
+        size_t last = m.entries.size() - 1;
+        m.index[slot] = 1;
+        m.tombs += 1;
+        if (i != last) {
+            uint64_t moved_hash = value_hash(m.entries[last].first);
+            uint64_t mask = m.index.size() - 1;
+            for (uint64_t at = moved_hash & mask;; at = (at + 1) & mask) {
+                uint64_t state = m.index[at] & IDX_POS;
+                if (state == static_cast<uint64_t>(last + 2)) {
+                    m.index[at] = (m.index[at] & IDX_FRAG) |
+                                  static_cast<uint64_t>(i + 2);
+                    break;
+                }
+            }
+            m.entries[i] = std::move(m.entries[last]);
+        }
+        m.entries.pop_back();
+        if (m.tombs > m.entries.size()) map_reindex(m);
         return true;
     }
     // indexed: reset the pair into a hole — no entry moves, so no index
@@ -2179,7 +3640,9 @@ std::string Interp::display_scalar(const Value& v) { // static
         case Value::K::list:
             return "?"; // handled iteratively in display(); never reached
         case Value::K::unit: return "()";
-        case Value::K::int_: return std::to_string(v.i);
+        case Value::K::int_:
+            return v.int_unsigned ? std::to_string(unsigned_integer(v))
+                                  : std::to_string(v.i);
         case Value::K::float_: {
             char buf[64];
             std::snprintf(buf, sizeof buf, "%.10g", v.f);
@@ -2190,11 +3653,12 @@ std::string Interp::display_scalar(const Value& v) { // static
         case Value::K::string_: return *v.s;
         case Value::K::instance:
             return v.inst->cls ? v.inst->cls->name : "Error";
+        case Value::K::struct_v:
+            return v.struct_decl ? v.struct_decl->name : "{struct}";
         case Value::K::map: return "{map}";
         case Value::K::bytes: return "{bytes}";
         case Value::K::file: return "{file}";
         case Value::K::mmap: return "{mmap}";
-        case Value::K::bufr: return "{bufreader}";
         case Value::K::closure: return "{fn}";
         case Value::K::fn_ref: return "{fn}";
         case Value::K::range: return "{range}";
@@ -2202,6 +3666,21 @@ std::string Interp::display_scalar(const Value& v) { // static
         case Value::K::mutex: return "{mutex}";
         case Value::K::channel: return "{channel}";
         case Value::K::atomic: return "{atomic}";
+        case Value::K::box: return "{box}";
+        case Value::K::arena: return "{arena}";
+        case Value::K::shared: return "{shared}";
+        case Value::K::weak: return "{weak}";
+        case Value::K::rawptr: return "{raw pointer}";
+        case Value::K::simd4f32: return "{simd4f32}";
+        case Value::K::fixed_array: {
+            std::string out = "[";
+            for (size_t i = 0; i < v.array.size(); i++) {
+                if (i) out += ", ";
+                out += display(v.array[i]);
+            }
+            return out + "]";
+        }
+        case Value::K::slice: return "{slice}";
     }
     return "?";
 }
