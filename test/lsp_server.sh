@@ -69,5 +69,28 @@ sh = next((o for o in objs if o.get("id") == 2), None)
 if not sh or "result" not in sh:
     fail("shutdown did not reply")
 
-print("ok lsp server: initialize, overlay check, diagnostics, hover")
+# signature help: cursor inside a call's argument list
+callsrc = ("fn add(a: int, b: int) -> int {\n    return a + b\n}\n"
+           "fn main() {\n    let y: int = add(1, 2)\n}\n")
+curi = "file:///tmp/beans_lsp_sig.b"
+rc2, objs2 = run([
+    frame({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"capabilities":{}}}),
+    frame({"jsonrpc":"2.0","method":"textDocument/didOpen",
+           "params":{"textDocument":{"uri":curi,"text":callsrc}}}),
+    # 'add(1, 2)' is on line 4; the first argument sits at character 21
+    frame({"jsonrpc":"2.0","id":7,"method":"textDocument/signatureHelp",
+           "params":{"textDocument":{"uri":curi},"position":{"line":4,"character":21}}}),
+    frame({"jsonrpc":"2.0","id":2,"method":"shutdown"}),
+    frame({"jsonrpc":"2.0","method":"exit"}),
+])
+sig = next((o for o in objs2 if o.get("id") == 7), None)
+res = sig and sig.get("result")
+if not res or not res.get("signatures"):
+    fail(f"signature help returned nothing: {sig!r}")
+if "add(a: int, b: int)" not in res["signatures"][0]["label"]:
+    fail(f"unexpected signature label: {res['signatures'][0]['label']!r}")
+if res.get("activeParameter") != 0:
+    fail(f"expected activeParameter 0, got {res.get('activeParameter')}")
+
+print("ok lsp server: initialize, overlay, diagnostics, hover, signature help")
 PY

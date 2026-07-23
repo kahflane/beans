@@ -811,6 +811,89 @@ bool find_member_of(const Program& prog, const std::string& type_name,
     return false;
 }
 
+// the declaration of a method named `member` on `type_name` (+ supers)
+const FnDecl* find_method_decl(const Program& prog, const std::string& type_name,
+                               const std::string& member, int depth = 0) {
+    if (depth > 8) return nullptr;
+    if (const ClassDecl* c = find_class(prog, type_name)) {
+        for (const FnDecl& m : c->methods)
+            if (m.name == member) return &m;
+        if (!c->base.empty())
+            if (const FnDecl* r = find_method_decl(prog, c->base, member, depth + 1))
+                return r;
+        for (const std::string& i : c->interfaces)
+            if (const FnDecl* r = find_method_decl(prog, i, member, depth + 1))
+                return r;
+    }
+    if (const EnumDecl* e = find_enum(prog, type_name))
+        for (const FnDecl& m : e->methods)
+            if (m.name == member) return &m;
+    return nullptr;
+}
+
+// ---- enclosing-call finder (signature help) ------------------------------
+
+bool pos_ge(Cursor p, uint32_t l, uint32_t c) {
+    return p.line > l || (p.line == l && p.col >= c);
+}
+
+struct CallHit {
+    const Expr* call = nullptr;
+    const FnDecl* fn = nullptr;
+    const ClassDecl* cls = nullptr;
+};
+
+void find_call(const Expr* e, Cursor cur, const FnDecl* fn, const ClassDecl* cls,
+               CallHit& out);
+
+void find_call_stmt(const Stmt* s, Cursor cur, const FnDecl* fn,
+                    const ClassDecl* cls, CallHit& out) {
+    if (!s) return;
+    find_call(s->init.get(), cur, fn, cls, out);
+    find_call(s->target.get(), cur, fn, cls, out);
+    find_call(s->value.get(), cur, fn, cls, out);
+    find_call(s->expr.get(), cur, fn, cls, out);
+    find_call(s->cond.get(), cur, fn, cls, out);
+    find_call(s->iterable.get(), cur, fn, cls, out);
+    for (const auto& b : s->body) find_call_stmt(b.get(), cur, fn, cls, out);
+    for (const auto& b : s->else_body) find_call_stmt(b.get(), cur, fn, cls, out);
+}
+
+void find_call(const Expr* e, Cursor cur, const FnDecl* fn, const ClassDecl* cls,
+               CallHit& out) {
+    if (!e) return;
+    find_call(e->lhs.get(), cur, fn, cls, out);
+    find_call(e->rhs.get(), cur, fn, cls, out);
+    find_call(e->callee.get(), cur, fn, cls, out);
+    for (const auto& a : e->args) find_call(a.get(), cur, fn, cls, out);
+    find_call(e->object.get(), cur, fn, cls, out);
+    find_call(e->index_expr.get(), cur, fn, cls, out);
+    for (const auto& en : e->entries) {
+        find_call(en.key.get(), cur, fn, cls, out);
+        find_call(en.value.get(), cur, fn, cls, out);
+    }
+    for (const auto& b : e->body) find_call_stmt(b.get(), cur, fn, cls, out);
+    find_call(e->cond.get(), cur, fn, cls, out);
+    find_call(e->then_e.get(), cur, fn, cls, out);
+    find_call(e->else_e.get(), cur, fn, cls, out);
+    find_call(e->subject.get(), cur, fn, cls, out);
+    for (const auto& arm : e->arms) {
+        find_call(arm.value.get(), cur, fn, cls, out);
+        for (const auto& b : arm.body) find_call_stmt(b.get(), cur, fn, cls, out);
+    }
+    if (out.call) return; // a deeper call already claimed the cursor
+
+    bool inside = within(cur, e->line, e->col, e->end_line, e->end_col);
+    if (inside && e->kind == Expr::Kind::call) {
+        const Expr* callee = e->callee.get();
+        // only when the cursor is in the argument region, past the callee
+        if (callee && pos_ge(cur, callee->end_line, callee->end_col))
+            out = {e, fn, cls};
+    } else if (inside && e->kind == Expr::Kind::new_) {
+        out = {e, fn, cls};
+    }
+}
+
 } // namespace
 
 std::string hover_at(const Program& prog, const std::string& file,
@@ -986,6 +1069,88 @@ std::vector<ScopeName> scope_at(const Program& prog, const std::string& file,
         "unsafe", "self", "true", "false", "new", "as"};
     for (const char* kw : kws) out.push_back({kw, "keyword", "", ""});
     return out;
+}
+
+SignatureInfo signature_at(const Program& prog, const std::string& file,
+                           uint32_t line, uint32_t col) {
+    SignatureInfo si;
+    const PFile* cur = find_pfile(prog, file);
+    if (!cur) return si;
+    Cursor cursor{line, col};
+
+    CallHit hit;
+    for (const FnDecl& f : cur->mod.fns) {
+        for (const auto& s : f.body) find_call_stmt(s.get(), cursor, &f, nullptr, hit);
+        if (hit.call) break;
+    }
+    if (!hit.call)
+        for (const ClassDecl& c : cur->mod.classes) {
+            for (const FnDecl& m : c.methods)
+                for (const auto& s : m.body)
+                    find_call_stmt(s.get(), cursor, &m, &c, hit);
+            if (hit.call) break;
+        }
+    if (!hit.call)
+        for (const EnumDecl& e : cur->mod.enums) {
+            for (const FnDecl& m : e.methods)
+                for (const auto& s : m.body)
+                    find_call_stmt(s.get(), cursor, &m, nullptr, hit);
+            if (hit.call) break;
+        }
+    if (!hit.call) return si;
+
+    const Expr* call = hit.call;
+    const FnDecl* target = nullptr;
+    std::string name;
+    bool ctor = false;
+    if (call->kind == Expr::Kind::new_) {
+        ctor = true;
+        name = call->name;
+        target = find_method_decl(prog, call->name, "init");
+    } else {
+        const Expr* callee = call->callee.get();
+        if (callee && callee->kind == Expr::Kind::ident) {
+            name = std::string(callee->text);
+            target = find_fn(prog, name);
+        } else if (callee && callee->kind == Expr::Kind::field) {
+            name = callee->name;
+            std::string recv = type_name_of(prog, hit.fn, hit.cls, callee->object.get());
+            if (!recv.empty()) target = find_method_decl(prog, recv, name);
+        }
+    }
+
+    // active parameter: how many arguments are already complete before the cursor
+    int active = 0;
+    for (const auto& a : call->args) {
+        if (within(cursor, a->line, a->col, a->end_line, a->end_col)) break;
+        if (pos_ge(cursor, a->end_line, a->end_col)) active++;
+        else break;
+    }
+    si.active = active;
+
+    if (target) {
+        for (const Param& p : target->params) {
+            std::string pl = p.name;
+            if (p.type) pl += ": " + type_str(p.type.get());
+            si.params.push_back(pl);
+        }
+        std::string label = (ctor ? "new " : "") + name + "(";
+        for (size_t i = 0; i < si.params.size(); i++) {
+            if (i) label += ", ";
+            label += si.params[i];
+        }
+        label += ")";
+        if (target->ret) label += " -> " + type_str(target->ret.get());
+        si.label = label;
+        si.doc = target->doc;
+        if (!si.params.empty() && si.active >= static_cast<int>(si.params.size()))
+            si.active = static_cast<int>(si.params.size()) - 1;
+        si.ok = true;
+    } else if (!name.empty()) {
+        si.label = (ctor ? "new " : "") + name + "(…)";
+        si.ok = true;
+    }
+    return si;
 }
 
 } // namespace beans

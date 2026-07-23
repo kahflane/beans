@@ -57,4 +57,15 @@ struct ScopeName {
 std::vector<ScopeName> scope_at(const Program& prog, const std::string& file,
                                 uint32_t line, uint32_t col);
 
+// Signature help for a call/constructor whose argument list holds the cursor.
+struct SignatureInfo {
+    bool ok = false;
+    std::string label;               // e.g. "add(a: int, b: int) -> int"
+    std::vector<std::string> params; // per-parameter labels, e.g. "a: int"
+    int active = 0;                  // 0-based active parameter
+    std::string doc;                 // raw /// block (may be empty)
+};
+SignatureInfo signature_at(const Program& prog, const std::string& file,
+                           uint32_t line, uint32_t col);
+
 } // namespace beans

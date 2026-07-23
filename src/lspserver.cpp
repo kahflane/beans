@@ -197,6 +197,7 @@ private:
         if (method == "textDocument/didChange") { on_did_change(p); return; }
         if (method == "textDocument/didClose") { on_did_close(p); return; }
         if (method == "textDocument/hover") { on_hover(id, p); return; }
+        if (method == "textDocument/signatureHelp") { on_signature_help(id, p); return; }
 
         // unknown request -> method-not-found; unknown notification -> ignore
         if (id) reply_error(*id, -32601, "method not found: " + method);
@@ -206,6 +207,12 @@ private:
         Json caps = Json::object();
         caps.set("textDocumentSync", Json::number(1)); // 1 = full document sync
         caps.set("hoverProvider", Json::boolean(true));
+        Json sig = Json::object();
+        Json trig = Json::array();
+        trig.push(Json::string("("));
+        trig.push(Json::string(","));
+        sig.set("triggerCharacters", std::move(trig));
+        caps.set("signatureHelpProvider", std::move(sig));
 
         Json result = Json::object();
         result.set("capabilities", std::move(caps));
@@ -324,6 +331,51 @@ private:
         contents.set("value", Json::string(md));
         Json result = Json::object();
         result.set("contents", std::move(contents));
+        reply(*id, std::move(result));
+    }
+
+    // ---- signature help ---------------------------------------------------
+    void on_signature_help(const Json* id, const Json& p) {
+        if (!id) return;
+        const Json* td = p.find("textDocument");
+        const Json* pos = p.find("position");
+        auto it = td ? docs_.find(td->get_str("uri")) : docs_.end();
+        if (!td || !pos || it == docs_.end()) { reply(*id, Json::null()); return; }
+
+        uint32_t line = 0, col = 0;
+        from_lsp(it->second.text,
+                 {static_cast<uint32_t>(pos->get_num("line")),
+                  static_cast<uint32_t>(pos->get_num("character"))},
+                 line, col);
+        std::string path = uri_to_path(td->get_str("uri"));
+
+        std::map<std::string, std::string> overlay = overlay_map();
+        set_loader_overlay(&overlay);
+        Loader loader;
+        SignatureInfo si;
+        if (loader.load(path)) si = signature_at(loader.program(), path, line, col);
+        set_loader_overlay(nullptr);
+
+        if (!si.ok) { reply(*id, Json::null()); return; }
+
+        Json params = Json::array();
+        for (const std::string& pl : si.params) {
+            Json pj = Json::object();
+            pj.set("label", Json::string(pl));
+            params.push(std::move(pj));
+        }
+        Json signature = Json::object();
+        signature.set("label", Json::string(si.label));
+        signature.set("parameters", std::move(params));
+        if (!si.doc.empty())
+            signature.set("documentation", Json::string(si.doc));
+
+        Json sigs = Json::array();
+        sigs.push(std::move(signature));
+        Json result = Json::object();
+        result.set("signatures", std::move(sigs));
+        result.set("activeSignature", Json::number(0));
+        result.set("activeParameter", Json::number(si.active));
         reply(*id, std::move(result));
     }
 
