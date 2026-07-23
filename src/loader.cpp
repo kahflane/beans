@@ -21,7 +21,19 @@ namespace beans {
 
 namespace {
 
+// LSP buffer overlay: when set, reads for these paths come from memory (unsaved
+// editor buffers) instead of disk. Single-threaded server, so a file-static
+// pointer is enough; the server sets it around each load and clears it after.
+const std::map<std::string, std::string>* g_overlay = nullptr;
+
 bool read_file(const std::string& path, std::string& out) {
+    if (g_overlay) {
+        auto it = g_overlay->find(path);
+        if (it != g_overlay->end()) {
+            out = it->second;
+            return true;
+        }
+    }
     std::ifstream in(path, std::ios::binary);
     if (!in) return false;
     std::ostringstream buf;
@@ -322,7 +334,8 @@ std::string Loader::load_package(const std::string& import_path, const std::stri
 // ---- entry ------------------------------------------------------------------
 
 bool Loader::load(const std::string& entry) {
-    if (!fs::exists(entry)) {
+    bool overlaid = g_overlay && g_overlay->count(entry);
+    if (!overlaid && !fs::exists(entry)) {
         error(entry, 0, 0, "can't open file");
         return false;
     }
@@ -380,6 +393,10 @@ bool Loader::load(const std::string& entry) {
     prog_.packages.push_back(std::move(pkg));
     state_[ctx.name] = 2;
     return errors_.empty();
+}
+
+void set_loader_overlay(const std::map<std::string, std::string>* overlay) {
+    g_overlay = overlay;
 }
 
 } // namespace beans

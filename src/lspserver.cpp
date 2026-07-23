@@ -11,9 +11,13 @@
 #include <cstdlib>
 #include <cstring>
 #include <map>
+#include <memory>
 #include <string>
 
+#include "checker.h"
 #include "json.h"
+#include "loader.h"
+#include "lsppos.h"
 
 namespace beans {
 
@@ -43,6 +47,60 @@ namespace {
         out += p[i];
     }
     return out;
+}
+
+bool is_ident_char(char c) {
+    return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+           (c >= '0' && c <= '9') || c == '_';
+}
+
+// byte columns [start,end) of the identifier at (line,col), else a 1-char span
+void word_cols(const std::string& text, uint32_t line, uint32_t col,
+               uint32_t& start_col, uint32_t& end_col) {
+    size_t p = byte_offset(text, line, col);
+    if (p >= text.size() || !is_ident_char(text[p])) {
+        start_col = col;
+        end_col = col + 1;
+        return;
+    }
+    size_t a = p, b = p;
+    while (a > 0 && is_ident_char(text[a - 1])) a--;
+    while (b < text.size() && is_ident_char(text[b])) b++;
+    start_col = col - static_cast<uint32_t>(p - a);
+    end_col = col + static_cast<uint32_t>(b - p);
+}
+
+Json lsp_pos_json(LspPos p) {
+    Json o = Json::object();
+    o.set("line", Json::number(p.line));
+    o.set("character", Json::number(p.character));
+    return o;
+}
+
+// an LSP diagnostic for an error at (line,col) in `text`
+Json make_diag(const std::string& text, uint32_t line, uint32_t col,
+               const std::string& msg) {
+    uint32_t l = line ? line : 1, c = col ? col : 1;
+    uint32_t sc, ec;
+    word_cols(text, l, c, sc, ec);
+    Json range = Json::object();
+    range.set("start", lsp_pos_json(to_lsp(text, l, sc)));
+    range.set("end", lsp_pos_json(to_lsp(text, l, ec)));
+    Json d = Json::object();
+    d.set("range", std::move(range));
+    d.set("severity", Json::number(1)); // 1 = Error
+    d.set("source", Json::string("beansc"));
+    d.set("message", Json::string(msg));
+    return d;
+}
+
+// does an error tagged for `file` belong to the document at `path`?
+bool belongs(const std::string& file, const std::string& path) {
+    if (file.empty() || file == path) return true;
+    if (path.size() >= file.size() &&
+        path.compare(path.size() - file.size(), file.size(), file) == 0)
+        return true;
+    return false;
 }
 
 class LspServer {
@@ -161,7 +219,8 @@ private:
         const Json* doc = p.find("textDocument");
         if (!doc) return;
         std::string uri = doc->get_str("uri");
-        docs_[uri] = doc->get_str("text");
+        docs_[uri].text = doc->get_str("text");
+        check_and_publish(uri);
     }
 
     void on_did_change(const Json& p) {
@@ -170,7 +229,8 @@ private:
         if (!doc || !changes || !changes->is_array() || changes->arr.empty()) return;
         // full sync: the last change carries the whole document text
         std::string uri = doc->get_str("uri");
-        docs_[uri] = changes->arr.back().get_str("text");
+        docs_[uri].text = changes->arr.back().get_str("text");
+        check_and_publish(uri);
     }
 
     void on_did_close(const Json& p) {
@@ -178,7 +238,59 @@ private:
         if (doc) docs_.erase(doc->get_str("uri"));
     }
 
-    std::map<std::string, std::string> docs_; // uri -> current text (overlay)
+    // ---- checking + diagnostics -------------------------------------------
+    // Load the document (with every open buffer overlaid over disk), type-check
+    // it, and publish diagnostics. A successful parse is kept as the doc's
+    // "last good" load so later features survive a mid-edit broken buffer.
+    void check_and_publish(const std::string& uri) {
+        auto it = docs_.find(uri);
+        if (it == docs_.end()) return;
+        const std::string& text = it->second.text;
+        std::string path = uri_to_path(uri);
+
+        std::map<std::string, std::string> overlay;
+        for (const auto& [u, d] : docs_) overlay[uri_to_path(u)] = d.text;
+        set_loader_overlay(&overlay);
+
+        auto loader = std::make_shared<Loader>();
+        bool loaded = loader->load(path);
+
+        std::vector<Json> diags;
+        for (const LoadError& e : loader->errors())
+            if (belongs(e.file, path))
+                diags.push_back(make_diag(text, e.line, e.col, e.msg));
+
+        if (loaded) {
+            Checker checker(loader->program());
+            checker.run();
+            for (const CheckError& e : checker.errors())
+                if (belongs(e.file, path))
+                    diags.push_back(make_diag(text, e.line, e.col, e.msg));
+            it->second.good = loader; // keep the last good load alive
+        }
+
+        set_loader_overlay(nullptr);
+        publish_diagnostics(uri, diags);
+    }
+
+    void publish_diagnostics(const std::string& uri, const std::vector<Json>& diags) {
+        Json params = Json::object();
+        params.set("uri", Json::string(uri));
+        Json arr = Json::array();
+        for (const Json& d : diags) arr.push(d);
+        params.set("diagnostics", std::move(arr));
+        Json m = Json::object();
+        m.set("jsonrpc", Json::string("2.0"));
+        m.set("method", Json::string("textDocument/publishDiagnostics"));
+        m.set("params", std::move(params));
+        write_message(m);
+    }
+
+    struct DocState {
+        std::string text;             // current buffer contents
+        std::shared_ptr<Loader> good; // last successful load (keeps its AST alive)
+    };
+    std::map<std::string, DocState> docs_; // uri -> state
     bool shutdown_requested_ = false;
     bool exit_now_ = false;
     int exit_code_ = 0;

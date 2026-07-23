@@ -8,6 +8,12 @@
 
 namespace beans {
 
+// Route the loader's source reads through an in-memory overlay (the LSP's
+// unsaved editor buffers), keyed by filesystem path. Pass nullptr to clear.
+// The pointer must outlive the Loader::load() call it applies to.
+void set_loader_overlay(const std::map<std::string, std::string>* overlay);
+
+
 struct LoadError {
     std::string file; // empty = module-level problem (bad beans.mod, fetch failure)
     std::string msg;

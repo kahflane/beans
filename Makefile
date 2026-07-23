@@ -37,6 +37,7 @@ test: $(BIN)
 	bash ./test/closure_captures.sh
 	./test/stdlib_source.sh
 	./test/lsp_probe.sh
+	./test/lsp_server.sh
 	./test/fs_source.sh
 	./test/reader_source.sh
 	./test/inline_options.sh
