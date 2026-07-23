@@ -1155,6 +1155,161 @@ SignatureInfo signature_at(const Program& prog, const std::string& file,
 
 std::string render_doc_markdown(const std::string& raw) { return render_doc(raw); }
 
+// ---- definition / references / outline internals -------------------------
+
+namespace {
+
+void set_def(DefLoc& d, const std::string& path, uint32_t nl, uint32_t nc,
+             size_t len) {
+    d.ok = true;
+    d.file = path;
+    d.line = nl;
+    d.col = nc;
+    d.end_line = nl;
+    d.end_col = nc + static_cast<uint32_t>(len);
+}
+
+bool fn_def(const Program& prog, const std::string& name, DefLoc& d) {
+    for (const auto& pkg : prog.packages)
+        for (const auto& pf : pkg->files)
+            for (const FnDecl& f : pf->mod.fns)
+                if (f.name == name && f.name_line) {
+                    set_def(d, pf->path, f.name_line, f.name_col, name.size());
+                    return true;
+                }
+    return false;
+}
+
+bool type_def(const Program& prog, const std::string& name, DefLoc& d) {
+    for (const auto& pkg : prog.packages)
+        for (const auto& pf : pkg->files) {
+            for (const ClassDecl& c : pf->mod.classes)
+                if (c.name == name && c.name_line) {
+                    set_def(d, pf->path, c.name_line, c.name_col, name.size());
+                    return true;
+                }
+            for (const EnumDecl& e : pf->mod.enums)
+                if (e.name == name && e.name_line) {
+                    set_def(d, pf->path, e.name_line, e.name_col, name.size());
+                    return true;
+                }
+        }
+    return false;
+}
+
+bool member_def(const Program& prog, const std::string& type_name,
+                const std::string& member, DefLoc& d, int depth = 0) {
+    if (depth > 8) return false;
+    for (const auto& pkg : prog.packages)
+        for (const auto& pf : pkg->files) {
+            for (const ClassDecl& c : pf->mod.classes) {
+                if (c.name != type_name) continue;
+                for (const FnDecl& m : c.methods)
+                    if (m.name == member && m.name_line) {
+                        set_def(d, pf->path, m.name_line, m.name_col, member.size());
+                        return true;
+                    }
+                for (const FieldDecl& f : c.fields)
+                    if (f.name == member && f.name_line) {
+                        set_def(d, pf->path, f.name_line, f.name_col, member.size());
+                        return true;
+                    }
+                if (!c.base.empty() && member_def(prog, c.base, member, d, depth + 1))
+                    return true;
+                for (const std::string& i : c.interfaces)
+                    if (member_def(prog, i, member, d, depth + 1)) return true;
+            }
+            for (const EnumDecl& e : pf->mod.enums) {
+                if (e.name != type_name) continue;
+                for (const FnDecl& m : e.methods)
+                    if (m.name == member && m.name_line) {
+                        set_def(d, pf->path, m.name_line, m.name_col, member.size());
+                        return true;
+                    }
+            }
+        }
+    return false;
+}
+
+bool local_def(const FnDecl* fn, const std::string& name, const std::string& path,
+               DefLoc& d);
+
+bool local_def_stmts(const std::vector<StmtPtr>& body, const std::string& name,
+                     const std::string& path, DefLoc& d) {
+    for (const StmtPtr& s : body) {
+        if (s->kind == Stmt::Kind::let_ && s->name == name) {
+            set_def(d, path, s->line, s->col, name.size());
+            return true;
+        }
+        if (s->kind == Stmt::Kind::for_in && s->loop_var == name) {
+            set_def(d, path, s->line, s->col, name.size());
+            return true;
+        }
+        if (local_def_stmts(s->body, name, path, d)) return true;
+        if (local_def_stmts(s->else_body, name, path, d)) return true;
+    }
+    return false;
+}
+
+bool local_def(const FnDecl* fn, const std::string& name, const std::string& path,
+               DefLoc& d) {
+    if (!fn) return false;
+    for (const Param& p : fn->params)
+        if (p.name == name) {
+            set_def(d, path, p.line, p.col, name.size());
+            return true;
+        }
+    return local_def_stmts(fn->body, name, path, d);
+}
+
+// if the cursor sits on a declaration's name, return that definition
+bool decl_name_at(const std::string& path, const Module& mod, Cursor cur,
+                  DefLoc& d) {
+    auto on = [&](uint32_t nl, uint32_t nc, const std::string& nm) {
+        return nl && within(cur, nl, nc, nl, nc + static_cast<uint32_t>(nm.size()));
+    };
+    for (const FnDecl& f : mod.fns)
+        if (on(f.name_line, f.name_col, f.name)) {
+            set_def(d, path, f.name_line, f.name_col, f.name.size());
+            return true;
+        }
+    for (const ClassDecl& c : mod.classes) {
+        if (on(c.name_line, c.name_col, c.name)) {
+            set_def(d, path, c.name_line, c.name_col, c.name.size());
+            return true;
+        }
+        for (const FnDecl& m : c.methods)
+            if (on(m.name_line, m.name_col, m.name)) {
+                set_def(d, path, m.name_line, m.name_col, m.name.size());
+                return true;
+            }
+        for (const FieldDecl& f : c.fields)
+            if (on(f.name_line, f.name_col, f.name)) {
+                set_def(d, path, f.name_line, f.name_col, f.name.size());
+                return true;
+            }
+    }
+    for (const EnumDecl& e : mod.enums) {
+        if (on(e.name_line, e.name_col, e.name)) {
+            set_def(d, path, e.name_line, e.name_col, e.name.size());
+            return true;
+        }
+        for (const FnDecl& m : e.methods)
+            if (on(m.name_line, m.name_col, m.name)) {
+                set_def(d, path, m.name_line, m.name_col, m.name.size());
+                return true;
+            }
+        for (const EnumVariant& v : e.variants)
+            if (on(v.line, v.col, v.name)) {
+                set_def(d, path, v.line, v.col, v.name.size());
+                return true;
+            }
+    }
+    return false;
+}
+
+} // namespace
+
 std::vector<Completion> completions_at(const Program& prog, const std::string& file,
                                        uint32_t line, uint32_t col) {
     std::vector<Completion> out;
@@ -1189,6 +1344,228 @@ std::vector<Completion> completions_at(const Program& prog, const std::string& f
     for (const ScopeName& s : scope_at(prog, file, line, col))
         if (matches(s.name))
             out.push_back({s.name, s.kind, s.signature, s.doc});
+    return out;
+}
+
+DefLoc definition_at(const Program& prog, const std::string& file, uint32_t line,
+                     uint32_t col) {
+    DefLoc d;
+    const PFile* cur = find_pfile(prog, file);
+    if (!cur) return d;
+    Cursor cursor{line, col};
+    if (decl_name_at(cur->path, cur->mod, cursor, d)) return d; // on a definition
+
+    Hit hit = find_in_module(cur->path, cur->mod, cursor);
+    switch (hit.kind) {
+        case Hit::Type:
+            type_def(prog, hit.name, d);
+            break;
+        case Hit::Member: {
+            std::string t;
+            if (hit.recv) t = type_name_of(prog, hit.fn, hit.cls, hit.recv);
+            if (!t.empty()) member_def(prog, t, hit.name, d);
+            break;
+        }
+        case Hit::Ident:
+            if (!local_def(hit.fn, hit.name, cur->path, d) &&
+                !fn_def(prog, hit.name, d))
+                type_def(prog, hit.name, d);
+            break;
+        default:
+            break;
+    }
+    return d;
+}
+
+// ---- references ----------------------------------------------------------
+
+namespace {
+
+void refs_type(const TypeRef* t, const std::string& name, const std::string& path,
+               std::vector<RefLoc>& out) {
+    if (!t) return;
+    for (const auto& a : t->args) refs_type(a.get(), name, path, out);
+    for (const auto& a : t->fn_params) refs_type(a.get(), name, path, out);
+    refs_type(t->fn_ret.get(), name, path, out);
+    refs_type(t->array_elem.get(), name, path, out);
+    if (t->kind == TypeRef::Kind::named && t->name == name && t->line)
+        out.push_back({path, t->line, t->col, t->line,
+                       t->col + static_cast<uint32_t>(name.size())});
+}
+
+void refs_expr(const Expr* e, const std::string& name, const std::string& path,
+               std::vector<RefLoc>& out);
+
+void refs_stmt(const Stmt* s, const std::string& name, const std::string& path,
+               std::vector<RefLoc>& out) {
+    if (!s) return;
+    if (s->kind == Stmt::Kind::let_ && s->name == name && s->line)
+        out.push_back({path, s->line, s->col, s->line,
+                       s->col + static_cast<uint32_t>(name.size())});
+    refs_type(s->type.get(), name, path, out);
+    refs_type(s->loop_type.get(), name, path, out);
+    refs_expr(s->init.get(), name, path, out);
+    refs_expr(s->target.get(), name, path, out);
+    refs_expr(s->value.get(), name, path, out);
+    refs_expr(s->expr.get(), name, path, out);
+    refs_expr(s->cond.get(), name, path, out);
+    refs_expr(s->iterable.get(), name, path, out);
+    for (const auto& b : s->body) refs_stmt(b.get(), name, path, out);
+    for (const auto& b : s->else_body) refs_stmt(b.get(), name, path, out);
+}
+
+void refs_expr(const Expr* e, const std::string& name, const std::string& path,
+               std::vector<RefLoc>& out) {
+    if (!e) return;
+    if (e->kind == Expr::Kind::ident && e->text == name && e->line)
+        out.push_back({path, e->line, e->col, e->line,
+                       e->col + static_cast<uint32_t>(name.size())});
+    if (e->kind == Expr::Kind::field && e->name == name && e->end_col >= name.size())
+        out.push_back({path, e->end_line,
+                       e->end_col - static_cast<uint32_t>(name.size()), e->end_line,
+                       e->end_col});
+    if ((e->kind == Expr::Kind::new_ || e->kind == Expr::Kind::init) &&
+        e->name == name && e->line)
+        out.push_back({path, e->line, e->col, e->line,
+                       e->col + static_cast<uint32_t>(name.size())});
+    refs_expr(e->lhs.get(), name, path, out);
+    refs_expr(e->rhs.get(), name, path, out);
+    refs_expr(e->callee.get(), name, path, out);
+    for (const auto& a : e->args) refs_expr(a.get(), name, path, out);
+    refs_expr(e->object.get(), name, path, out);
+    refs_expr(e->index_expr.get(), name, path, out);
+    for (const auto& en : e->entries) {
+        refs_expr(en.key.get(), name, path, out);
+        refs_expr(en.value.get(), name, path, out);
+    }
+    refs_type(e->type.get(), name, path, out);
+    for (const auto& t : e->type_args) refs_type(t.get(), name, path, out);
+    for (const auto& b : e->body) refs_stmt(b.get(), name, path, out);
+    refs_expr(e->cond.get(), name, path, out);
+    refs_expr(e->then_e.get(), name, path, out);
+    refs_expr(e->else_e.get(), name, path, out);
+    refs_expr(e->subject.get(), name, path, out);
+    for (const auto& arm : e->arms) {
+        refs_expr(arm.value.get(), name, path, out);
+        for (const auto& b : arm.body) refs_stmt(b.get(), name, path, out);
+    }
+}
+
+void refs_fn(const FnDecl& f, const std::string& name, const std::string& path,
+             std::vector<RefLoc>& out) {
+    if (f.name == name && f.name_line)
+        out.push_back({path, f.name_line, f.name_col, f.name_line,
+                       f.name_col + static_cast<uint32_t>(name.size())});
+    for (const Param& p : f.params) {
+        if (p.name == name && p.line)
+            out.push_back({path, p.line, p.col, p.line,
+                           p.col + static_cast<uint32_t>(name.size())});
+        refs_type(p.type.get(), name, path, out);
+    }
+    refs_type(f.ret.get(), name, path, out);
+    for (const auto& s : f.body) refs_stmt(s.get(), name, path, out);
+}
+
+} // namespace
+
+std::vector<RefLoc> references_at(const Program& prog, const std::string& file,
+                                  uint32_t line, uint32_t col) {
+    std::vector<RefLoc> out;
+    const PFile* cur = find_pfile(prog, file);
+    if (!cur) return out;
+    Hit hit = find_in_module(cur->path, cur->mod, {line, col});
+    std::string name = hit.name.empty() ? word_at(cur->source, line, col) : hit.name;
+    if (name.empty()) return out;
+
+    for (const auto& pkg : prog.packages)
+        for (const auto& pf : pkg->files) {
+            const std::string& path = pf->path;
+            for (const FnDecl& f : pf->mod.fns) refs_fn(f, name, path, out);
+            for (const ClassDecl& c : pf->mod.classes) {
+                if (c.name == name && c.name_line)
+                    out.push_back({path, c.name_line, c.name_col, c.name_line,
+                                   c.name_col + static_cast<uint32_t>(name.size())});
+                for (const FieldDecl& fl : c.fields) {
+                    if (fl.name == name && fl.name_line)
+                        out.push_back({path, fl.name_line, fl.name_col, fl.name_line,
+                                       fl.name_col + static_cast<uint32_t>(name.size())});
+                    refs_type(fl.type.get(), name, path, out);
+                }
+                for (const FnDecl& m : c.methods) refs_fn(m, name, path, out);
+            }
+            for (const EnumDecl& e : pf->mod.enums) {
+                if (e.name == name && e.name_line)
+                    out.push_back({path, e.name_line, e.name_col, e.name_line,
+                                   e.name_col + static_cast<uint32_t>(name.size())});
+                for (const EnumVariant& v : e.variants)
+                    if (v.name == name && v.line)
+                        out.push_back({path, v.line, v.col, v.line,
+                                       v.col + static_cast<uint32_t>(name.size())});
+                for (const FnDecl& m : e.methods) refs_fn(m, name, path, out);
+            }
+        }
+    return out;
+}
+
+// ---- document symbols ----------------------------------------------------
+
+std::vector<DocSymbol> document_symbols(const Program& prog, const std::string& file) {
+    std::vector<DocSymbol> out;
+    const PFile* cur = find_pfile(prog, file);
+    if (!cur) return out;
+    const Module& mod = cur->mod;
+
+    auto sym = [](const std::string& name, const std::string& detail, int kind,
+                  uint32_t l, uint32_t c, uint32_t el, uint32_t ec, uint32_t nl,
+                  uint32_t nc) {
+        DocSymbol s;
+        s.name = name;
+        s.detail = detail;
+        s.kind = kind;
+        s.line = l ? l : 1;
+        s.col = c ? c : 1;
+        s.end_line = el ? el : s.line;
+        s.end_col = ec ? ec : s.col;
+        s.sel_line = nl ? nl : s.line;
+        s.sel_col = nc ? nc : s.col;
+        s.sel_end_line = s.sel_line;
+        s.sel_end_col = s.sel_col + static_cast<uint32_t>(name.size());
+        return s;
+    };
+
+    for (const auto& [kind, idx] : mod.order) {
+        if (kind == Module::DeclKind::fn) {
+            const FnDecl& f = mod.fns[idx];
+            out.push_back(sym(f.name, fn_sig(f), 12, f.line, f.col, f.end_line,
+                              f.end_col, f.name_line, f.name_col));
+        } else if (kind == Module::DeclKind::class_) {
+            const ClassDecl& c = mod.classes[idx];
+            int k = c.is_interface ? 11 : c.is_struct ? 23 : 5; // Interface/Struct/Class
+            DocSymbol s = sym(c.name, class_sig(c), k, c.line, c.col, c.end_line,
+                              c.end_col, c.name_line, c.name_col);
+            for (const FieldDecl& f : c.fields)
+                s.children.push_back(sym(f.name, field_sig(f), 8, f.line, f.col,
+                                         f.end_line, f.end_col, f.name_line,
+                                         f.name_col));
+            for (const FnDecl& m : c.methods)
+                s.children.push_back(sym(m.name, fn_sig(m), 6, m.line, m.col,
+                                         m.end_line, m.end_col, m.name_line,
+                                         m.name_col));
+            out.push_back(std::move(s));
+        } else {
+            const EnumDecl& e = mod.enums[idx];
+            DocSymbol s = sym(e.name, enum_sig(e), 10, e.line, e.col, e.end_line,
+                              e.end_col, e.name_line, e.name_col);
+            for (const EnumVariant& v : e.variants)
+                s.children.push_back(sym(v.name, v.name, 22, v.line, v.col,
+                                         v.end_line, v.end_col, v.line, v.col));
+            for (const FnDecl& m : e.methods)
+                s.children.push_back(sym(m.name, fn_sig(m), 6, m.line, m.col,
+                                         m.end_line, m.end_col, m.name_line,
+                                         m.name_col));
+            out.push_back(std::move(s));
+        }
+    }
     return out;
 }
 

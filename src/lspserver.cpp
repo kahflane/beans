@@ -107,6 +107,46 @@ int completion_kind(const std::string& k) {
     return 1;                      // Text
 }
 
+std::string path_to_uri(const std::string& path) { return "file://" + path; }
+
+const std::string* program_file_text(const Program& prog, const std::string& path) {
+    for (const auto& pkg : prog.packages)
+        for (const auto& pf : pkg->files)
+            if (pf->path == path) return &pf->source;
+    return nullptr;
+}
+
+Json range_json(const std::string& text, uint32_t l, uint32_t c, uint32_t el,
+                uint32_t ec) {
+    Json r = Json::object();
+    r.set("start", lsp_pos_json(to_lsp(text, l ? l : 1, c ? c : 1)));
+    r.set("end", lsp_pos_json(to_lsp(text, el ? el : (l ? l : 1), ec ? ec : (c ? c : 1))));
+    return r;
+}
+
+Json location_json(const std::string& path, Json range) {
+    Json loc = Json::object();
+    loc.set("uri", Json::string(path_to_uri(path)));
+    loc.set("range", std::move(range));
+    return loc;
+}
+
+Json docsym_json(const DocSymbol& s, const std::string& text) {
+    Json j = Json::object();
+    j.set("name", Json::string(s.name));
+    if (!s.detail.empty()) j.set("detail", Json::string(s.detail));
+    j.set("kind", Json::number(s.kind));
+    j.set("range", range_json(text, s.line, s.col, s.end_line, s.end_col));
+    j.set("selectionRange",
+          range_json(text, s.sel_line, s.sel_col, s.sel_end_line, s.sel_end_col));
+    if (!s.children.empty()) {
+        Json ch = Json::array();
+        for (const DocSymbol& c : s.children) ch.push(docsym_json(c, text));
+        j.set("children", std::move(ch));
+    }
+    return j;
+}
+
 // does an error tagged for `file` belong to the document at `path`?
 bool belongs(const std::string& file, const std::string& path) {
     if (file.empty() || file == path) return true;
@@ -212,6 +252,9 @@ private:
         if (method == "textDocument/hover") { on_hover(id, p); return; }
         if (method == "textDocument/signatureHelp") { on_signature_help(id, p); return; }
         if (method == "textDocument/completion") { on_completion(id, p); return; }
+        if (method == "textDocument/definition") { on_definition(id, p); return; }
+        if (method == "textDocument/references") { on_references(id, p); return; }
+        if (method == "textDocument/documentSymbol") { on_document_symbol(id, p); return; }
 
         // unknown request -> method-not-found; unknown notification -> ignore
         if (id) reply_error(*id, -32601, "method not found: " + method);
@@ -232,6 +275,9 @@ private:
         ctrig.push(Json::string("."));
         comp.set("triggerCharacters", std::move(ctrig));
         caps.set("completionProvider", std::move(comp));
+        caps.set("definitionProvider", Json::boolean(true));
+        caps.set("referencesProvider", Json::boolean(true));
+        caps.set("documentSymbolProvider", Json::boolean(true));
 
         Json result = Json::object();
         result.set("capabilities", std::move(caps));
@@ -439,6 +485,85 @@ private:
         result.set("isIncomplete", Json::boolean(false));
         result.set("items", std::move(arr));
         reply(*id, std::move(result));
+    }
+
+    // ---- definition / references / document symbols -----------------------
+    // resolve the request's (uri, position) into a doc, beans line/col, and a
+    // loaded program (overlay applied). Returns false if there's no such doc.
+    bool locate(const Json& p, std::string& path, uint32_t& line, uint32_t& col,
+                Loader& loader, std::map<std::string, std::string>& overlay) {
+        const Json* td = p.find("textDocument");
+        const Json* pos = p.find("position");
+        auto it = td ? docs_.find(td->get_str("uri")) : docs_.end();
+        if (!td || it == docs_.end()) return false;
+        path = uri_to_path(td->get_str("uri"));
+        if (pos)
+            from_lsp(it->second.text,
+                     {static_cast<uint32_t>(pos->get_num("line")),
+                      static_cast<uint32_t>(pos->get_num("character"))},
+                     line, col);
+        overlay = overlay_map();
+        set_loader_overlay(&overlay);
+        loader.load(path);
+        return true;
+    }
+
+    void on_definition(const Json* id, const Json& p) {
+        if (!id) return;
+        std::string path;
+        uint32_t line = 0, col = 0;
+        Loader loader;
+        std::map<std::string, std::string> overlay;
+        if (!locate(p, path, line, col, loader, overlay)) { reply(*id, Json::null()); return; }
+        DefLoc d = definition_at(loader.program(), path, line, col);
+        Json result = Json::null();
+        if (d.ok) {
+            const std::string* t = program_file_text(loader.program(), d.file);
+            std::string txt = t ? *t : "";
+            result = location_json(
+                d.file, range_json(txt, d.line, d.col, d.end_line, d.end_col));
+        }
+        set_loader_overlay(nullptr);
+        reply(*id, std::move(result));
+    }
+
+    void on_references(const Json* id, const Json& p) {
+        if (!id) return;
+        std::string path;
+        uint32_t line = 0, col = 0;
+        Loader loader;
+        std::map<std::string, std::string> overlay;
+        if (!locate(p, path, line, col, loader, overlay)) { reply(*id, Json::null()); return; }
+        std::vector<RefLoc> refs = references_at(loader.program(), path, line, col);
+        Json arr = Json::array();
+        for (const RefLoc& r : refs) {
+            const std::string* t = program_file_text(loader.program(), r.file);
+            if (!t) continue;
+            arr.push(location_json(
+                r.file, range_json(*t, r.line, r.col, r.end_line, r.end_col)));
+        }
+        set_loader_overlay(nullptr);
+        reply(*id, std::move(arr));
+    }
+
+    void on_document_symbol(const Json* id, const Json& p) {
+        if (!id) return;
+        const Json* td = p.find("textDocument");
+        auto it = td ? docs_.find(td->get_str("uri")) : docs_.end();
+        if (!td || it == docs_.end()) { reply(*id, Json::array()); return; }
+        std::string path = uri_to_path(td->get_str("uri"));
+        const std::string& text = it->second.text;
+
+        std::map<std::string, std::string> overlay = overlay_map();
+        set_loader_overlay(&overlay);
+        Loader loader;
+        loader.load(path);
+        std::vector<DocSymbol> syms = document_symbols(loader.program(), path);
+        set_loader_overlay(nullptr);
+
+        Json arr = Json::array();
+        for (const DocSymbol& s : syms) arr.push(docsym_json(s, text));
+        reply(*id, std::move(arr));
     }
 
     struct DocState {

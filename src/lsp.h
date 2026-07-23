@@ -84,4 +84,32 @@ std::vector<Completion> completions_at(const Program& prog, const std::string& f
 // Render a raw `///` doc block to Markdown (strips the markers).
 std::string render_doc_markdown(const std::string& raw);
 
+// The definition site of the symbol under the cursor.
+struct DefLoc {
+    bool ok = false;
+    std::string file;
+    uint32_t line = 0, col = 0, end_line = 0, end_col = 0;
+};
+DefLoc definition_at(const Program& prog, const std::string& file,
+                     uint32_t line, uint32_t col);
+
+// Every occurrence of the name under the cursor across the program.
+struct RefLoc {
+    std::string file;
+    uint32_t line = 0, col = 0, end_line = 0, end_col = 0;
+};
+std::vector<RefLoc> references_at(const Program& prog, const std::string& file,
+                                  uint32_t line, uint32_t col);
+
+// One entry of a file's outline (declarations, with members nested).
+struct DocSymbol {
+    std::string name;
+    std::string detail; // signature
+    int kind = 0;       // LSP SymbolKind
+    uint32_t line = 0, col = 0, end_line = 0, end_col = 0;             // full range
+    uint32_t sel_line = 0, sel_col = 0, sel_end_line = 0, sel_end_col = 0; // name
+    std::vector<DocSymbol> children;
+};
+std::vector<DocSymbol> document_symbols(const Program& prog, const std::string& file);
+
 } // namespace beans

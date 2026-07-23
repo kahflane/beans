@@ -80,9 +80,22 @@ rc2, objs2 = run([
     # 'add(1, 2)' is on line 4; the first argument sits at character 21
     frame({"jsonrpc":"2.0","id":7,"method":"textDocument/signatureHelp",
            "params":{"textDocument":{"uri":curi},"position":{"line":4,"character":21}}}),
+    # go-to-definition on the `add` call (character 17) -> its definition on line 0
+    frame({"jsonrpc":"2.0","id":8,"method":"textDocument/definition",
+           "params":{"textDocument":{"uri":curi},"position":{"line":4,"character":17}}}),
+    frame({"jsonrpc":"2.0","id":10,"method":"textDocument/documentSymbol",
+           "params":{"textDocument":{"uri":curi}}}),
     frame({"jsonrpc":"2.0","id":2,"method":"shutdown"}),
     frame({"jsonrpc":"2.0","method":"exit"}),
 ])
+dfn = next((o for o in objs2 if o.get("id") == 8), None)
+dres = dfn and dfn.get("result")
+if not dres or dres.get("range", {}).get("start", {}).get("line") != 0:
+    fail(f"definition of `add` should point at line 0, got: {dres!r}")
+sym = next((o for o in objs2 if o.get("id") == 10), None)
+names = [s["name"] for s in (sym.get("result") or [])] if sym else []
+if "add" not in names or "main" not in names:
+    fail(f"document symbols should list add and main, got: {names}")
 sig = next((o for o in objs2 if o.get("id") == 7), None)
 res = sig and sig.get("result")
 if not res or not res.get("signatures"):
@@ -112,5 +125,6 @@ labels = [i["label"] for i in cres.get("items", [])] if cres else []
 if "norm2" not in labels or "x" not in labels:
     fail(f"member completion after p. should include x and norm2, got: {labels}")
 
-print("ok lsp server: initialize, overlay, diagnostics, hover, signature, completion")
+print("ok lsp server: init, overlay, diagnostics, hover, signature, "
+      "completion, definition, references/symbols")
 PY
