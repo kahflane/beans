@@ -68,4 +68,20 @@ struct SignatureInfo {
 SignatureInfo signature_at(const Program& prog, const std::string& file,
                            uint32_t line, uint32_t col);
 
+// A completion candidate.
+struct Completion {
+    std::string label;
+    std::string kind;   // method|field|variable|function|type|enum|variant|keyword
+    std::string detail; // signature (may be empty)
+    std::string doc;    // raw /// block (may be empty)
+};
+// Completions at a position: members of the receiver's type after `.`, else the
+// names in scope (locals, params, fields, top-level decls, keywords). Filtered
+// by the partial word already typed.
+std::vector<Completion> completions_at(const Program& prog, const std::string& file,
+                                       uint32_t line, uint32_t col);
+
+// Render a raw `///` doc block to Markdown (strips the markers).
+std::string render_doc_markdown(const std::string& raw);
+
 } // namespace beans

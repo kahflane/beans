@@ -94,6 +94,19 @@ Json make_diag(const std::string& text, uint32_t line, uint32_t col,
     return d;
 }
 
+// map a beans completion kind to an LSP CompletionItemKind number
+int completion_kind(const std::string& k) {
+    if (k == "method") return 2;
+    if (k == "function") return 3;
+    if (k == "field") return 5;
+    if (k == "variable" || k == "local" || k == "parameter") return 6;
+    if (k == "type") return 7;     // Class
+    if (k == "enum") return 10;    // Enum
+    if (k == "variant") return 20; // EnumMember
+    if (k == "keyword") return 14; // Keyword
+    return 1;                      // Text
+}
+
 // does an error tagged for `file` belong to the document at `path`?
 bool belongs(const std::string& file, const std::string& path) {
     if (file.empty() || file == path) return true;
@@ -198,6 +211,7 @@ private:
         if (method == "textDocument/didClose") { on_did_close(p); return; }
         if (method == "textDocument/hover") { on_hover(id, p); return; }
         if (method == "textDocument/signatureHelp") { on_signature_help(id, p); return; }
+        if (method == "textDocument/completion") { on_completion(id, p); return; }
 
         // unknown request -> method-not-found; unknown notification -> ignore
         if (id) reply_error(*id, -32601, "method not found: " + method);
@@ -213,6 +227,11 @@ private:
         trig.push(Json::string(","));
         sig.set("triggerCharacters", std::move(trig));
         caps.set("signatureHelpProvider", std::move(sig));
+        Json comp = Json::object();
+        Json ctrig = Json::array();
+        ctrig.push(Json::string("."));
+        comp.set("triggerCharacters", std::move(ctrig));
+        caps.set("completionProvider", std::move(comp));
 
         Json result = Json::object();
         result.set("capabilities", std::move(caps));
@@ -321,8 +340,8 @@ private:
         std::map<std::string, std::string> overlay = overlay_map();
         set_loader_overlay(&overlay);
         Loader loader;
-        std::string md;
-        if (loader.load(path)) md = hover_at(loader.program(), path, line, col);
+        loader.load(path); // partial AST is fine — editing buffers have errors
+        std::string md = hover_at(loader.program(), path, line, col);
         set_loader_overlay(nullptr);
 
         if (md.empty()) { reply(*id, Json::null()); return; }
@@ -352,8 +371,8 @@ private:
         std::map<std::string, std::string> overlay = overlay_map();
         set_loader_overlay(&overlay);
         Loader loader;
-        SignatureInfo si;
-        if (loader.load(path)) si = signature_at(loader.program(), path, line, col);
+        loader.load(path);
+        SignatureInfo si = signature_at(loader.program(), path, line, col);
         set_loader_overlay(nullptr);
 
         if (!si.ok) { reply(*id, Json::null()); return; }
@@ -376,6 +395,49 @@ private:
         result.set("signatures", std::move(sigs));
         result.set("activeSignature", Json::number(0));
         result.set("activeParameter", Json::number(si.active));
+        reply(*id, std::move(result));
+    }
+
+    // ---- completion -------------------------------------------------------
+    void on_completion(const Json* id, const Json& p) {
+        if (!id) return;
+        const Json* td = p.find("textDocument");
+        const Json* pos = p.find("position");
+        auto it = td ? docs_.find(td->get_str("uri")) : docs_.end();
+        if (!td || !pos || it == docs_.end()) { reply(*id, Json::null()); return; }
+
+        uint32_t line = 0, col = 0;
+        from_lsp(it->second.text,
+                 {static_cast<uint32_t>(pos->get_num("line")),
+                  static_cast<uint32_t>(pos->get_num("character"))},
+                 line, col);
+        std::string path = uri_to_path(td->get_str("uri"));
+
+        std::map<std::string, std::string> overlay = overlay_map();
+        set_loader_overlay(&overlay);
+        Loader loader;
+        loader.load(path);
+        std::vector<Completion> items =
+            completions_at(loader.program(), path, line, col);
+        set_loader_overlay(nullptr);
+
+        Json arr = Json::array();
+        for (const Completion& c : items) {
+            Json ci = Json::object();
+            ci.set("label", Json::string(c.label));
+            ci.set("kind", Json::number(completion_kind(c.kind)));
+            if (!c.detail.empty()) ci.set("detail", Json::string(c.detail));
+            if (!c.doc.empty()) {
+                Json d = Json::object();
+                d.set("kind", Json::string("markdown"));
+                d.set("value", Json::string(render_doc_markdown(c.doc)));
+                ci.set("documentation", std::move(d));
+            }
+            arr.push(std::move(ci));
+        }
+        Json result = Json::object();
+        result.set("isIncomplete", Json::boolean(false));
+        result.set("items", std::move(arr));
         reply(*id, std::move(result));
     }
 

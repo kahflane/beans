@@ -1153,4 +1153,43 @@ SignatureInfo signature_at(const Program& prog, const std::string& file,
     return si;
 }
 
+std::string render_doc_markdown(const std::string& raw) { return render_doc(raw); }
+
+std::vector<Completion> completions_at(const Program& prog, const std::string& file,
+                                       uint32_t line, uint32_t col) {
+    std::vector<Completion> out;
+    const PFile* cur = find_pfile(prog, file);
+    if (!cur) return out;
+    const std::string& text = cur->source;
+
+    size_t p = offset_of(text, line, col);
+    if (p > text.size()) p = text.size();
+    size_t q = p;
+    while (q > 0 && is_ident_char(text[q - 1])) q--; // skip the partial word
+    std::string prefix = text.substr(q, p - q);
+    auto matches = [&](const std::string& n) {
+        return prefix.empty() ||
+               (n.size() >= prefix.size() && n.compare(0, prefix.size(), prefix) == 0);
+    };
+
+    if (q > 0 && text[q - 1] == '.') {
+        // member completion: resolve the receiver just before the '.'
+        if (col > prefix.size() + 2) {
+            uint32_t recv_col = col - static_cast<uint32_t>(prefix.size()) - 2;
+            std::string ty = type_at(prog, file, line, recv_col);
+            if (!ty.empty())
+                for (const MemberInfo& m : members_of(prog, ty))
+                    if (matches(m.name))
+                        out.push_back({m.name, m.kind, m.signature, m.doc});
+        }
+        return out;
+    }
+
+    // scope completion: names visible here
+    for (const ScopeName& s : scope_at(prog, file, line, col))
+        if (matches(s.name))
+            out.push_back({s.name, s.kind, s.signature, s.doc});
+    return out;
+}
+
 } // namespace beans

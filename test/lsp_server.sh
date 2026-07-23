@@ -92,5 +92,25 @@ if "add(a: int, b: int)" not in res["signatures"][0]["label"]:
 if res.get("activeParameter") != 0:
     fail(f"expected activeParameter 0, got {res.get('activeParameter')}")
 
-print("ok lsp server: initialize, overlay, diagnostics, hover, signature help")
+# completion: members after `.` on a half-typed line
+compsrc = ("class Point {\n    x: int\n    fn norm2() -> int { return self.x }\n}\n"
+           "fn main() {\n    let p: Point = new Point(1, 2)\n    p.\n}\n")
+kuri = "file:///tmp/beans_lsp_comp.b"
+rc3, objs3 = run([
+    frame({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"capabilities":{}}}),
+    frame({"jsonrpc":"2.0","method":"textDocument/didOpen",
+           "params":{"textDocument":{"uri":kuri,"text":compsrc}}}),
+    # 'p.' is on line 6; the cursor sits just after the dot at character 6
+    frame({"jsonrpc":"2.0","id":9,"method":"textDocument/completion",
+           "params":{"textDocument":{"uri":kuri},"position":{"line":6,"character":6}}}),
+    frame({"jsonrpc":"2.0","id":2,"method":"shutdown"}),
+    frame({"jsonrpc":"2.0","method":"exit"}),
+])
+comp = next((o for o in objs3 if o.get("id") == 9), None)
+cres = comp and comp.get("result")
+labels = [i["label"] for i in cres.get("items", [])] if cres else []
+if "norm2" not in labels or "x" not in labels:
+    fail(f"member completion after p. should include x and norm2, got: {labels}")
+
+print("ok lsp server: initialize, overlay, diagnostics, hover, signature, completion")
 PY
