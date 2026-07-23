@@ -19,6 +19,7 @@
 #include "interp.h"
 #include "lexer.h"
 #include "loader.h"
+#include "lsp.h"
 #include "parser.h"
 
 namespace {
@@ -289,6 +290,45 @@ int cmd_build(const char* path, const char* out_path, const BuildOptions& option
     return 0;
 }
 
+// lsp-probe <file.b>:<line>:<col> — print the Markdown a hover would show at
+// that position. A debug window into the language server's hover, testable from
+// the shell before any editor is wired up.
+int cmd_lsp_probe(const char* arg) {
+    std::string spec(arg);
+    // split from the right so file paths may contain colons
+    size_t c2 = spec.rfind(':');
+    size_t c1 = (c2 == std::string::npos || c2 == 0)
+                    ? std::string::npos
+                    : spec.rfind(':', c2 - 1);
+    if (c1 == std::string::npos || c2 == std::string::npos) {
+        std::fprintf(stderr, "usage: %s lsp-probe <file.b>:<line>:<col>\n",
+                     compiler_executable.c_str());
+        return 2;
+    }
+    std::string file = spec.substr(0, c1);
+    long line = std::strtol(spec.c_str() + c1 + 1, nullptr, 10);
+    long col = std::strtol(spec.c_str() + c2 + 1, nullptr, 10);
+    if (line <= 0 || col <= 0) {
+        std::fprintf(stderr, "lsp-probe: line and col are 1-based positive integers\n");
+        return 2;
+    }
+
+    beans::Loader loader;
+    if (!load_program(file.c_str(), loader)) {
+        std::fprintf(stderr, "%s: stopped before hover\n", file.c_str());
+        return 1;
+    }
+    std::string md = beans::hover_at(loader.program(), file,
+                                     static_cast<uint32_t>(line),
+                                     static_cast<uint32_t>(col));
+    if (md.empty()) {
+        std::fprintf(stderr, "no symbol at %s:%ld:%ld\n", file.c_str(), line, col);
+        return 1;
+    }
+    std::printf("%s\n", md.c_str());
+    return 0;
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -297,8 +337,9 @@ int main(int argc, char** argv) {
         std::fprintf(stderr,
                      "usage: %s <lex|parse|check|run> <file.b>...\n"
                      "       %s build [--release] [--lto] [--cpu generic|native] "
-                     "<file.b> [-o out]\n",
-                     argv[0], argv[0]);
+                     "<file.b> [-o out]\n"
+                     "       %s lsp-probe <file.b>:<line>:<col>\n",
+                     argv[0], argv[0], argv[0]);
         return 2;
     }
     const char* cmd = argv[1];
@@ -334,6 +375,14 @@ int main(int argc, char** argv) {
             return 2;
         }
         return cmd_build(file, out, options);
+    }
+
+    if (std::strcmp(cmd, "lsp-probe") == 0) {
+        if (argc < 3) {
+            std::fprintf(stderr, "usage: %s lsp-probe <file.b>:<line>:<col>\n", argv[0]);
+            return 2;
+        }
+        return cmd_lsp_probe(argv[2]);
     }
 
     // `run f.b -- a b` hands everything after -- to the program (os.args)

@@ -1,8 +1,8 @@
 CXX      := clang++
 CXXFLAGS := -std=c++20 -Wall -Wextra -O2 -pthread
 
-SRC := src/token.cpp src/lexer.cpp src/parser.cpp src/ast_print.cpp src/loader.cpp src/mir.cpp src/c_abi.cpp src/checker.cpp src/builtins.cpp src/codegen.cpp src/interp.cpp src/main.cpp
-HDR := src/token.h src/lexer.h src/ast.h src/parser.h src/types.h src/target.h src/mir.h src/hir.h src/c_abi.h src/loader.h src/checker.h src/value.h src/builtins.h src/interp.h src/codegen.h
+SRC := src/token.cpp src/lexer.cpp src/parser.cpp src/ast_print.cpp src/loader.cpp src/mir.cpp src/c_abi.cpp src/checker.cpp src/builtins.cpp src/codegen.cpp src/interp.cpp src/lsp.cpp src/main.cpp
+HDR := src/token.h src/lexer.h src/ast.h src/parser.h src/types.h src/target.h src/mir.h src/hir.h src/c_abi.h src/loader.h src/checker.h src/value.h src/builtins.h src/interp.h src/codegen.h src/lsp.h
 BIN := build/beansc
 RUNTIME_SRC := runtime/beans_rt.c
 RUNTIME_COPY := build/beans_rt.c
@@ -36,6 +36,7 @@ test: $(BIN)
 	./test/c_callbacks.sh
 	bash ./test/closure_captures.sh
 	./test/stdlib_source.sh
+	./test/lsp_probe.sh
 	./test/fs_source.sh
 	./test/reader_source.sh
 	./test/inline_options.sh
