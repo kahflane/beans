@@ -1,0 +1,54 @@
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+# Cancel superseded runs on the same ref.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-test:
+    name: build + test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install clang (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y clang
+
+      - name: Toolchain versions
+        run: |
+          clang++ --version
+          make --version | head -1
+
+      - name: Build the compiler
+        run: make
+
+      - name: Smoke — parse the examples
+        run: make run
+
+      # The reference platform runs the whole interpreter-vs-native differential
+      # suite (every example must produce byte-identical output on both backends).
+      - name: Differential test suite
+        if: runner.os == 'macOS'
+        run: make test
+
+      # The native backend is developed on macOS; this probes it on Linux without
+      # failing the build. Flip to a blocking step once Linux native is verified.
+      - name: Native backend probe (Linux, non-blocking)
+        if: runner.os == 'Linux'
+        continue-on-error: true
+        run: |
+          ./build/beansc build examples/hello.b -o /tmp/beans_hello
+          out=$(/tmp/beans_hello)
+          echo "native output: $out"
+          test "$out" = "hello from beans"

@@ -18,27 +18,82 @@ A small OOP language: Java-style objects, Go-sized grammar, with C++-class perfo
 | interpreter | done (v2) — `beansc run` |
 | LLVM native backend | v6 — whole language native, RC + cycle collector |
 
-## Build
+## Install
+
+The only hard dependency is a C++20 compiler to build the toolchain. `clang` is
+needed at runtime **only** for `beansc build` (native compilation) — `run`,
+`check`, `parse`, and `lex` need nothing else.
+
+```bash
+git clone https://github.com/kahflane/beans
+cd beans
+make                              # builds build/beansc
+export PATH="$PWD/build:$PATH"    # add to your shell rc to make it stick
+beansc run examples/hello.b       # hello from beans
+```
+
+Prefer a prebuilt binary? Each [release](https://github.com/kahflane/beans/releases)
+attaches a self-contained tarball for macOS (arm64) and Linux (x64): extract it
+and add its `bin/` directory to your `PATH`.
+
+## Use
+
+A first program, `hello.b`:
 
 ```
-make        # builds build/beansc
-make run    # parses the example files
-make test   # interpreter/native differential suite
-make test-sanitize
-make bench-quick
-make bench-verify
-make bench-full
+import std.io
+
+fn main() {
+    let name: string = "beans"
+    io.println("hello from {name}")
+}
+```
+
+Run it on the reference interpreter, or compile it to a native binary:
+
+```bash
+beansc run hello.b                # hello from beans   (no clang needed)
+beansc build hello.b -o hello     # needs clang on PATH
+./hello                           # hello from beans
+```
+
+The subcommands:
+
+| command | what it does |
+|---|---|
+| `beansc lex file.b` | dump the token stream |
+| `beansc parse file.b` | parse and print the AST |
+| `beansc check file.b` | type-check; prints `ok` or `file:line:col: error: …` |
+| `beansc run file.b` | check, then run on the reference interpreter |
+| `beansc build file.b [-o out]` | compile to a native binary via LLVM |
+| `beansc build --release --lto --cpu native file.b` | optimized native build |
+
+`check` / `run` / `build` load the whole program: if a `beans.mod` sits next to
+the file, every `.b` file in that directory joins the root package,
+`import shop.util` pulls in `util/`, and `import github.com/owner/repo` clones the
+repo into `~/.beans/src` on first use (`require <path> <tag>` in `beans.mod` pins a
+git tag). No `beans.mod` means a plain single file.
+[examples/shop/](examples/shop/) is a working three-package program.
+
+### Editor support
+
+Syntax highlighting, live diagnostics, hover docs, and completion for **VS Code**
+and **Zed** live in
+[beans-ide-support](https://github.com/kahflane/beans-ide-support) — thin editor
+clients over the compiler's built-in language server (`beansc lsp`).
+
+## Developing
+
+```bash
+make test              # interpreter/native differential suite
+make test-sanitize     # ASan, TSan, and (macOS) leak checks
+make bench-quick       # quick benchmark pass (not claim-eligible)
+make bench-verify      # checksum + output-parity over every benchmark
+make bench-full        # the full, claim-eligible benchmark run
 make bench-profile NAME=trees
 ```
 
-- `beansc lex file.b` — dump the token stream
-- `beansc parse file.b` — parse and dump the AST
-- `beansc check file.b` — full type check (prints `ok` or errors)
-- `beansc run file.b` — check, then execute (reference interpreter)
-- `beansc build file.b [-o out]` — compile to a native binary via LLVM
-- `beansc build --release --lto --cpu native file.b [-o out]` — optimized native build
-
-`check`/`run`/`build` load the whole program: if a `beans.mod` sits next to the file, every `.b` file in that directory joins the root package, `import shop.util` pulls `util/`, and `import github.com/owner/repo` clones the repo into `~/.beans/src` on first use (`require <path> <tag>` in beans.mod pins a git tag). No beans.mod = plain single file, as before. [examples/shop/](examples/shop/) is a working three-package program.
+See [CLAUDE.md](CLAUDE.md) for the architecture and the contributor test loop.
 
 The interpreter is the reference implementation: exact `decimal` math, real OS threads for `thread.spawn`, real mutexes and blocking channels, `defer`, dynamic dispatch, and runtime panics with line numbers.
 

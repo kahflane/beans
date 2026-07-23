@@ -1,0 +1,65 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  package:
+    name: package (${{ matrix.name }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+            name: macos-arm64
+          - os: ubuntu-latest
+            name: linux-x64
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install clang (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y clang
+
+      - name: Build the compiler
+        run: make
+
+      # Self-contained layout the binary resolves on its own:
+      #   bin/beansc         the compiler
+      #   bin/beans_rt.c     C runtime, found beside the binary (or via BEANS_RUNTIME)
+      #   lib/std/           stdlib packages, found at <exe_dir>/../lib/std (or BEANS_STDLIB)
+      - name: Assemble release tree
+        run: |
+          set -eux
+          dist="beans-${GITHUB_REF_NAME}-${MATRIX_NAME}"
+          mkdir -p "$dist/bin" "$dist/lib"
+          cp build/beansc "$dist/bin/"
+          cp runtime/beans_rt.c "$dist/bin/"
+          cp -R lib/std "$dist/lib/std"
+          cp -R examples "$dist/examples"
+          cp README.md SYNTAX.md "$dist/"
+          tar czf "$dist.tar.gz" "$dist"
+          echo "DIST=$dist" >> "$GITHUB_ENV"
+          echo "ASSET=$dist.tar.gz" >> "$GITHUB_ENV"
+        env:
+          MATRIX_NAME: ${{ matrix.name }}
+
+      # Prove the packaged tree runs on its own: `run` is the interpreter, so it
+      # needs neither clang nor an install step — it only needs the layout above.
+      - name: Smoke test the package
+        run: |
+          set -eux
+          out=$("./${DIST}/bin/beansc" run "./${DIST}/examples/hello.b")
+          test "$out" = "hello from beans"
+
+      - name: Attach to the GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ env.ASSET }}
+          generate_release_notes: true
+          fail_on_unmatched_files: true
