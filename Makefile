@@ -36,6 +36,7 @@ test: $(BIN)
 	./test/c_callbacks.sh
 	bash ./test/closure_captures.sh
 	./test/stdlib_source.sh
+	./test/parse_recovery.sh
 	./test/lsp_probe.sh
 	./test/lsp_server.sh
 	./test/fs_source.sh

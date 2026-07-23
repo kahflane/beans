@@ -37,6 +37,26 @@ bool is_assign_op(TokenKind k) {
     }
 }
 
+// tokens that unambiguously begin a new statement — used for error recovery so
+// a malformed line (e.g. a half-typed `x.` during editing) does not devour the
+// statement that follows it
+bool starts_stmt(TokenKind k) {
+    switch (k) {
+        case TokenKind::kw_let:
+        case TokenKind::kw_var:
+        case TokenKind::kw_return:
+        case TokenKind::kw_break:
+        case TokenKind::kw_continue:
+        case TokenKind::kw_if:
+        case TokenKind::kw_for:
+        case TokenKind::kw_defer:
+        case TokenKind::kw_unsafe:
+            return true;
+        default:
+            return false;
+    }
+}
+
 } // namespace
 
 Parser::Parser(std::vector<Token> tokens) : tokens_(std::move(tokens)) {
@@ -72,6 +92,7 @@ void Parser::end_stmt() {
     if (check(TokenKind::newline)) { skip_newlines(); return; }
     if (check(TokenKind::rbrace) || at_eof()) return;
     error_at(cur(), "expected end of statement");
+    if (starts_stmt(cur().kind)) return; // leave the next statement to parse
     sync_stmt();
 }
 
@@ -659,7 +680,10 @@ std::vector<StmtPtr> Parser::parse_block() {
         size_t before = errors_.size();
         StmtPtr s = parse_stmt();
         if (s) { stamp_end(*s); out.push_back(std::move(s)); }
-        if (errors_.size() > before) sync_stmt();
+        // recover, but don't skip a token that already begins the next statement
+        if (errors_.size() > before && !check(TokenKind::newline) &&
+            !check(TokenKind::rbrace) && !starts_stmt(cur().kind))
+            sync_stmt();
         skip_newlines();
     }
     expect(TokenKind::rbrace, "'}'");
