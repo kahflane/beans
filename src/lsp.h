@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <string>
+#include <vector>
 
 #include "ast.h"
 
@@ -19,5 +20,37 @@ namespace beans {
 // contract here stays the same.
 std::string hover_at(const Program& prog, const std::string& file,
                      uint32_t line, uint32_t col);
+
+// ---- semantic query facade (for hover, completion, goto) -----------------
+// Built from the checked Program's AST. beans requires written types on lets,
+// params, fields, and returns, so these resolve from declared types rather than
+// full inference — enough for the overwhelming majority of real code.
+
+// A member of a type.
+struct MemberInfo {
+    std::string name;
+    std::string kind;      // "field" | "method" | "variant"
+    std::string signature; // rendered, e.g. "fn norm2(self) -> int"
+    std::string doc;       // raw /// block (may be empty)
+    std::string where;     // "path:line"
+};
+
+// Fields + methods of the class/enum named `type_name`, following `extends`,
+// plus builtin methods when it names a builtin type. Empty if unknown.
+std::vector<MemberInfo> members_of(const Program& prog, const std::string& type_name);
+
+// The declared type name of the expression under the cursor ("" if unknown).
+std::string type_at(const Program& prog, const std::string& file,
+                    uint32_t line, uint32_t col);
+
+// A name visible at a position, for completion.
+struct ScopeName {
+    std::string name;
+    std::string kind;      // parameter|local|field|function|type|enum|keyword
+    std::string signature; // rendered (may be empty)
+    std::string doc;       // raw /// block (may be empty)
+};
+std::vector<ScopeName> scope_at(const Program& prog, const std::string& file,
+                                uint32_t line, uint32_t col);
 
 } // namespace beans

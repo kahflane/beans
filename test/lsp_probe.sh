@@ -54,6 +54,9 @@ expect "$fixture:42:9"  'let p: Point'
 expect "$fixture:42:9"  'local'
 # a type annotation resolves as a type, not a same-named value
 expect "$fixture:42:12" 'class Point'
+# member access resolves through the receiver's declared type: self.x -> Point.x
+expect "$fixture:29:21" 'Point.x: int'
+expect "$fixture:29:21" 'The horizontal coordinate.'
 # builtin method: signature comes from the registry, not a hardcoded list
 expect "examples/tour.b:87:21" 'fn string.to_int() -> Result<int>'
 # stdlib symbol: signature comes from the real beans source in lib/std

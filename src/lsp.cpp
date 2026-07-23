@@ -15,6 +15,7 @@
 #include "lsp.h"
 
 #include <cstddef>
+#include <set>
 #include <string_view>
 
 #include "builtins.h"
@@ -337,8 +338,11 @@ bool within(Cursor p, uint32_t sl, uint32_t sc, uint32_t el, uint32_t ec) {
 struct Hit {
     enum K { None, Type, Member, Ident, Decl } kind = None;
     std::string name;
-    const FnDecl* fn = nullptr; // enclosing fn (Ident) for local/param lookup
-    Found decl;                 // pre-rendered result when kind == Decl
+    const FnDecl* fn = nullptr;      // enclosing fn (Ident) for local/param lookup
+    const ClassDecl* cls = nullptr;  // enclosing class (self / method context)
+    const Expr* recv = nullptr;      // receiver expr for a Member hit
+    const Expr* expr = nullptr;      // the leaf expr the cursor landed on
+    Found decl;                      // pre-rendered result when kind == Decl
 };
 
 void find_in_type(const TypeRef* t, Cursor cur, Hit& out) {
@@ -354,9 +358,11 @@ void find_in_type(const TypeRef* t, Cursor cur, Hit& out) {
     }
 }
 
-void find_in_expr(const Expr* e, Cursor cur, const FnDecl* fn, Hit& out);
+void find_in_expr(const Expr* e, Cursor cur, const FnDecl* fn,
+                  const ClassDecl* cls, Hit& out);
 
-void find_in_stmt(const Stmt* s, Cursor cur, const FnDecl* fn, Hit& out) {
+void find_in_stmt(const Stmt* s, Cursor cur, const FnDecl* fn,
+                  const ClassDecl* cls, Hit& out) {
     if (!s) return;
     // a `let`/`var` binding name (the stmt's line/col is the name token)
     if (s->kind == Stmt::Kind::let_ && !s->name.empty() &&
@@ -365,43 +371,45 @@ void find_in_stmt(const Stmt* s, Cursor cur, const FnDecl* fn, Hit& out) {
         out.kind = Hit::Ident; // resolved as a local via the enclosing fn
         out.name = s->name;
         out.fn = fn;
+        out.cls = cls;
         return;
     }
     find_in_type(s->type.get(), cur, out);
     find_in_type(s->loop_type.get(), cur, out);
-    find_in_expr(s->init.get(), cur, fn, out);
-    find_in_expr(s->target.get(), cur, fn, out);
-    find_in_expr(s->value.get(), cur, fn, out);
-    find_in_expr(s->expr.get(), cur, fn, out);
-    find_in_expr(s->cond.get(), cur, fn, out);
-    find_in_expr(s->iterable.get(), cur, fn, out);
-    for (const auto& b : s->body) find_in_stmt(b.get(), cur, fn, out);
-    for (const auto& b : s->else_body) find_in_stmt(b.get(), cur, fn, out);
+    find_in_expr(s->init.get(), cur, fn, cls, out);
+    find_in_expr(s->target.get(), cur, fn, cls, out);
+    find_in_expr(s->value.get(), cur, fn, cls, out);
+    find_in_expr(s->expr.get(), cur, fn, cls, out);
+    find_in_expr(s->cond.get(), cur, fn, cls, out);
+    find_in_expr(s->iterable.get(), cur, fn, cls, out);
+    for (const auto& b : s->body) find_in_stmt(b.get(), cur, fn, cls, out);
+    for (const auto& b : s->else_body) find_in_stmt(b.get(), cur, fn, cls, out);
 }
 
-void find_in_expr(const Expr* e, Cursor cur, const FnDecl* fn, Hit& out) {
+void find_in_expr(const Expr* e, Cursor cur, const FnDecl* fn,
+                  const ClassDecl* cls, Hit& out) {
     if (!e) return;
     // descend into children first, so the innermost node wins
-    find_in_expr(e->lhs.get(), cur, fn, out);
-    find_in_expr(e->rhs.get(), cur, fn, out);
-    find_in_expr(e->callee.get(), cur, fn, out);
-    for (const auto& a : e->args) find_in_expr(a.get(), cur, fn, out);
-    find_in_expr(e->object.get(), cur, fn, out);
-    find_in_expr(e->index_expr.get(), cur, fn, out);
+    find_in_expr(e->lhs.get(), cur, fn, cls, out);
+    find_in_expr(e->rhs.get(), cur, fn, cls, out);
+    find_in_expr(e->callee.get(), cur, fn, cls, out);
+    for (const auto& a : e->args) find_in_expr(a.get(), cur, fn, cls, out);
+    find_in_expr(e->object.get(), cur, fn, cls, out);
+    find_in_expr(e->index_expr.get(), cur, fn, cls, out);
     for (const auto& en : e->entries) {
-        find_in_expr(en.key.get(), cur, fn, out);
-        find_in_expr(en.value.get(), cur, fn, out);
+        find_in_expr(en.key.get(), cur, fn, cls, out);
+        find_in_expr(en.value.get(), cur, fn, cls, out);
     }
     find_in_type(e->type.get(), cur, out);
     for (const auto& t : e->type_args) find_in_type(t.get(), cur, out);
-    for (const auto& b : e->body) find_in_stmt(b.get(), cur, fn, out);
-    find_in_expr(e->cond.get(), cur, fn, out);
-    find_in_expr(e->then_e.get(), cur, fn, out);
-    find_in_expr(e->else_e.get(), cur, fn, out);
-    find_in_expr(e->subject.get(), cur, fn, out);
+    for (const auto& b : e->body) find_in_stmt(b.get(), cur, fn, cls, out);
+    find_in_expr(e->cond.get(), cur, fn, cls, out);
+    find_in_expr(e->then_e.get(), cur, fn, cls, out);
+    find_in_expr(e->else_e.get(), cur, fn, cls, out);
+    find_in_expr(e->subject.get(), cur, fn, cls, out);
     for (const auto& arm : e->arms) {
-        find_in_expr(arm.value.get(), cur, fn, out);
-        for (const auto& b : arm.body) find_in_stmt(b.get(), cur, fn, out);
+        find_in_expr(arm.value.get(), cur, fn, cls, out);
+        for (const auto& b : arm.body) find_in_stmt(b.get(), cur, fn, cls, out);
     }
     if (out.kind != Hit::None) return; // a deeper node already claimed the cursor
 
@@ -410,6 +418,8 @@ void find_in_expr(const Expr* e, Cursor cur, const FnDecl* fn, Hit& out) {
         out.kind = Hit::Ident;
         out.name = std::string(e->text);
         out.fn = fn;
+        out.cls = cls;
+        out.expr = e;
     } else if (e->kind == Expr::Kind::field && !e->name.empty() &&
                e->end_col >= static_cast<uint32_t>(e->name.size())) {
         // the member name occupies [end_col - name.size(), end_col) on end_line
@@ -417,6 +427,10 @@ void find_in_expr(const Expr* e, Cursor cur, const FnDecl* fn, Hit& out) {
         if (within(cur, e->end_line, nsc, e->end_line, e->end_col)) {
             out.kind = Hit::Member;
             out.name = e->name;
+            out.fn = fn;
+            out.cls = cls;
+            out.recv = e->object.get();
+            out.expr = e;
         }
     } else if ((e->kind == Expr::Kind::new_ || e->kind == Expr::Kind::init) &&
                !e->name.empty() &&
@@ -424,6 +438,7 @@ void find_in_expr(const Expr* e, Cursor cur, const FnDecl* fn, Hit& out) {
         // `new Point(...)` / `Point { ... }` — the type name
         out.kind = Hit::Type;
         out.name = e->name;
+        out.expr = e;
     }
 }
 
@@ -528,25 +543,25 @@ Hit find_in_module(const std::string& path, const Module& mod, Cursor cur) {
     for (const FnDecl& f : mod.fns) {
         for (const Param& p : f.params) find_in_type(p.type.get(), cur, hit);
         find_in_type(f.ret.get(), cur, hit);
-        for (const auto& s : f.body) find_in_stmt(s.get(), cur, &f, hit);
+        for (const auto& s : f.body) find_in_stmt(s.get(), cur, &f, nullptr, hit);
         if (hit.kind != Hit::None) return hit;
     }
-    auto walk_methods = [&](const std::vector<FnDecl>& ms) {
+    auto walk_methods = [&](const std::vector<FnDecl>& ms, const ClassDecl* owner) {
         for (const FnDecl& f : ms) {
             for (const Param& p : f.params) find_in_type(p.type.get(), cur, hit);
             find_in_type(f.ret.get(), cur, hit);
-            for (const auto& s : f.body) find_in_stmt(s.get(), cur, &f, hit);
+            for (const auto& s : f.body) find_in_stmt(s.get(), cur, &f, owner, hit);
             if (hit.kind != Hit::None) return;
         }
     };
     for (const ClassDecl& c : mod.classes) {
         for (const FieldDecl& fld : c.fields) find_in_type(fld.type.get(), cur, hit);
         if (hit.kind != Hit::None) return hit;
-        walk_methods(c.methods);
+        walk_methods(c.methods, &c);
         if (hit.kind != Hit::None) return hit;
     }
     for (const EnumDecl& en : mod.enums) {
-        walk_methods(en.methods);
+        walk_methods(en.methods, nullptr);
         if (hit.kind != Hit::None) return hit;
     }
     return hit;
@@ -632,6 +647,170 @@ bool match_builtin(const std::string& word, Found& out) {
     return false;
 }
 
+// ---- declared-type resolution (query-facade internals) -------------------
+
+const FnDecl* find_fn(const Program& prog, const std::string& name) {
+    for (const auto& pkg : prog.packages)
+        for (const auto& pf : pkg->files)
+            for (const FnDecl& f : pf->mod.fns)
+                if (f.name == name) return &f;
+    return nullptr;
+}
+
+const ClassDecl* find_class(const Program& prog, const std::string& name) {
+    for (const auto& pkg : prog.packages)
+        for (const auto& pf : pkg->files)
+            for (const ClassDecl& c : pf->mod.classes)
+                if (c.name == name) return &c;
+    return nullptr;
+}
+
+const EnumDecl* find_enum(const Program& prog, const std::string& name) {
+    for (const auto& pkg : prog.packages)
+        for (const auto& pf : pkg->files)
+            for (const EnumDecl& e : pf->mod.enums)
+                if (e.name == name) return &e;
+    return nullptr;
+}
+
+// head name of a written type: `List<T>` -> "List", `Point` -> "Point"
+std::string type_head(const TypeRef* t) {
+    return (t && t->kind == TypeRef::Kind::named) ? t->name : "";
+}
+
+// scan a fn's (nested) let/var bindings and for-in vars for `name`
+std::string local_type_head_in(const std::vector<StmtPtr>& body,
+                               const std::string& name) {
+    for (const StmtPtr& s : body) {
+        if (s->kind == Stmt::Kind::let_ && s->name == name)
+            return type_head(s->type.get());
+        if (s->kind == Stmt::Kind::for_in && s->loop_var == name)
+            return type_head(s->loop_type.get());
+        std::string h = local_type_head_in(s->body, name);
+        if (!h.empty()) return h;
+        h = local_type_head_in(s->else_body, name);
+        if (!h.empty()) return h;
+    }
+    return "";
+}
+
+// declared type head of a field/method named `member` on `type_name` (+ supers)
+std::string member_type_head(const Program& prog, const std::string& type_name,
+                             const std::string& member, int depth) {
+    if (depth > 8) return "";
+    if (const ClassDecl* c = find_class(prog, type_name)) {
+        for (const FieldDecl& f : c->fields)
+            if (f.name == member) return type_head(f.type.get());
+        for (const FnDecl& m : c->methods)
+            if (m.name == member) return type_head(m.ret.get());
+        if (!c->base.empty()) {
+            std::string h = member_type_head(prog, c->base, member, depth + 1);
+            if (!h.empty()) return h;
+        }
+        for (const std::string& i : c->interfaces) {
+            std::string h = member_type_head(prog, i, member, depth + 1);
+            if (!h.empty()) return h;
+        }
+    }
+    if (const EnumDecl* en = find_enum(prog, type_name))
+        for (const FnDecl& m : en->methods)
+            if (m.name == member) return type_head(m.ret.get());
+    return "";
+}
+
+// best-effort declared type head of an expression
+std::string type_name_of(const Program& prog, const FnDecl* fn,
+                         const ClassDecl* cls, const Expr* e) {
+    if (!e) return "";
+    switch (e->kind) {
+        case Expr::Kind::self_ref: return cls ? cls->name : "";
+        case Expr::Kind::new_:
+        case Expr::Kind::init: return e->name;
+        case Expr::Kind::int_lit: return "int";
+        case Expr::Kind::float_lit: return "float";
+        case Expr::Kind::string_lit: return "string";
+        case Expr::Kind::bool_lit: return "bool";
+        case Expr::Kind::cast: return type_head(e->type.get());
+        case Expr::Kind::ident: {
+            std::string n(e->text);
+            if (fn) {
+                for (const Param& p : fn->params)
+                    if (p.name == n) return type_head(p.type.get());
+                std::string h = local_type_head_in(fn->body, n);
+                if (!h.empty()) return h;
+            }
+            if (cls)
+                for (const FieldDecl& f : cls->fields)
+                    if (f.name == n) return type_head(f.type.get());
+            return "";
+        }
+        case Expr::Kind::field: {
+            std::string recv = type_name_of(prog, fn, cls, e->object.get());
+            return recv.empty() ? "" : member_type_head(prog, recv, e->name, 0);
+        }
+        case Expr::Kind::call: {
+            const Expr* c = e->callee.get();
+            if (c && c->kind == Expr::Kind::field) {
+                std::string recv = type_name_of(prog, fn, cls, c->object.get());
+                if (!recv.empty()) return member_type_head(prog, recv, c->name, 0);
+            } else if (c && c->kind == Expr::Kind::ident) {
+                if (const FnDecl* f = find_fn(prog, std::string(c->text)))
+                    return type_head(f->ret.get());
+            }
+            return "";
+        }
+        default: return "";
+    }
+}
+
+// find a member named `member` on `type_name` (+ supers) and render a hover
+bool find_member_of(const Program& prog, const std::string& type_name,
+                    const std::string& member, Found& out, int depth = 0) {
+    if (depth > 8) return false;
+    for (const auto& pkg : prog.packages)
+        for (const auto& pf : pkg->files) {
+            for (const ClassDecl& c : pf->mod.classes) {
+                if (c.name != type_name) continue;
+                for (const FnDecl& m : c.methods)
+                    if (m.name == member) {
+                        out = {true, "method", method_sig(c.name, m), m.doc,
+                               loc(pf->path, m.line), true};
+                        return true;
+                    }
+                for (const FieldDecl& f : c.fields)
+                    if (f.name == member) {
+                        out = {true, "field", c.name + "." + field_sig(f), f.doc,
+                               loc(pf->path, f.line), true};
+                        return true;
+                    }
+                if (!c.base.empty() &&
+                    find_member_of(prog, c.base, member, out, depth + 1))
+                    return true;
+                for (const std::string& i : c.interfaces)
+                    if (find_member_of(prog, i, member, out, depth + 1)) return true;
+            }
+            for (const EnumDecl& e : pf->mod.enums) {
+                if (e.name != type_name) continue;
+                for (const FnDecl& m : e.methods)
+                    if (m.name == member) {
+                        out = {true, "method", method_sig(e.name, m), m.doc,
+                               loc(pf->path, m.line), true};
+                        return true;
+                    }
+            }
+        }
+    // builtin type (string/Bytes/...) methods
+    for (const BuiltinMethod& b : builtin_methods())
+        if (member == b.name && bt_name(b.recv) == type_name) {
+            out = {true, "builtin method",
+                   "fn " + bt_name(b.recv) + "." + b.name + bt_params(b.params) +
+                       bt_ret(b.ret),
+                   "", "builtin", false};
+            return true;
+        }
+    return false;
+}
+
 } // namespace
 
 std::string hover_at(const Program& prog, const std::string& file,
@@ -648,6 +827,12 @@ std::string hover_at(const Program& prog, const std::string& file,
             if (resolve_name(prog, cur, hit.name, Want::type, f)) return format(f);
             break;
         case Hit::Member:
+            // precise: resolve the member on the receiver's declared type
+            if (hit.recv) {
+                std::string t = type_name_of(prog, hit.fn, hit.cls, hit.recv);
+                if (!t.empty() && find_member_of(prog, t, hit.name, f))
+                    return format(f);
+            }
             if (resolve_name(prog, cur, hit.name, Want::member, f)) return format(f);
             if (match_builtin(hit.name, f)) return format(f);
             break;
@@ -667,6 +852,140 @@ std::string hover_at(const Program& prog, const std::string& file,
         if (match_builtin(word, f)) return format(f);
     }
     return "";
+}
+
+// ---- public query facade --------------------------------------------------
+
+namespace {
+
+void collect_members(const Program& prog, const std::string& type_name,
+                     std::vector<MemberInfo>& out, std::set<std::string>& seen,
+                     int depth) {
+    if (depth > 8) return;
+    for (const auto& pkg : prog.packages)
+        for (const auto& pf : pkg->files) {
+            for (const ClassDecl& c : pf->mod.classes) {
+                if (c.name != type_name) continue;
+                for (const FieldDecl& f : c.fields)
+                    if (seen.insert(f.name).second)
+                        out.push_back({f.name, "field", field_sig(f), f.doc,
+                                       loc(pf->path, f.line)});
+                for (const FnDecl& m : c.methods)
+                    if (seen.insert(m.name).second)
+                        out.push_back({m.name, "method", fn_sig(m), m.doc,
+                                       loc(pf->path, m.line)});
+                if (!c.base.empty())
+                    collect_members(prog, c.base, out, seen, depth + 1);
+                for (const std::string& i : c.interfaces)
+                    collect_members(prog, i, out, seen, depth + 1);
+                return;
+            }
+            for (const EnumDecl& e : pf->mod.enums) {
+                if (e.name != type_name) continue;
+                for (const EnumVariant& v : e.variants)
+                    if (seen.insert(v.name).second) {
+                        std::string sig = v.name;
+                        if (!v.payload.empty()) sig += params_str(v.payload, false);
+                        out.push_back({v.name, "variant", sig, v.doc,
+                                       loc(pf->path, e.line)});
+                    }
+                for (const FnDecl& m : e.methods)
+                    if (seen.insert(m.name).second)
+                        out.push_back({m.name, "method", fn_sig(m), m.doc,
+                                       loc(pf->path, m.line)});
+                return;
+            }
+        }
+    for (const BuiltinMethod& b : builtin_methods())
+        if (bt_name(b.recv) == type_name && seen.insert(b.name).second)
+            out.push_back({std::string(b.name), "method",
+                           "fn " + std::string(b.name) + bt_params(b.params) +
+                               bt_ret(b.ret),
+                           "", "builtin"});
+}
+
+void collect_locals(const std::vector<StmtPtr>& body, std::vector<ScopeName>& out) {
+    for (const StmtPtr& s : body) {
+        if (s->kind == Stmt::Kind::let_ && !s->name.empty()) {
+            std::string sig = std::string(s->is_var ? "var " : "let ") + s->name;
+            if (s->type) sig += ": " + type_str(s->type.get());
+            out.push_back({s->name, "local", sig, ""});
+        }
+        if (s->kind == Stmt::Kind::for_in && !s->loop_var.empty()) {
+            std::string sig = s->loop_var;
+            if (s->loop_type) sig += ": " + type_str(s->loop_type.get());
+            out.push_back({s->loop_var, "local", sig, ""});
+        }
+        collect_locals(s->body, out);
+        collect_locals(s->else_body, out);
+    }
+}
+
+const FnDecl* enclosing_fn(const Module& mod, Cursor cur, const ClassDecl** cls_out) {
+    const FnDecl* fn = nullptr;
+    for (const FnDecl& f : mod.fns)
+        if (within(cur, f.line, f.col, f.end_line, f.end_col)) fn = &f;
+    for (const ClassDecl& c : mod.classes)
+        for (const FnDecl& m : c.methods)
+            if (within(cur, m.line, m.col, m.end_line, m.end_col)) {
+                fn = &m;
+                *cls_out = &c;
+            }
+    for (const EnumDecl& e : mod.enums)
+        for (const FnDecl& m : e.methods)
+            if (within(cur, m.line, m.col, m.end_line, m.end_col)) fn = &m;
+    return fn;
+}
+
+} // namespace
+
+std::vector<MemberInfo> members_of(const Program& prog, const std::string& type_name) {
+    std::vector<MemberInfo> out;
+    std::set<std::string> seen;
+    collect_members(prog, type_name, out, seen, 0);
+    return out;
+}
+
+std::string type_at(const Program& prog, const std::string& file, uint32_t line,
+                    uint32_t col) {
+    const PFile* cur = find_pfile(prog, file);
+    if (!cur) return "";
+    Hit hit = find_in_module(cur->path, cur->mod, {line, col});
+    if (hit.expr) return type_name_of(prog, hit.fn, hit.cls, hit.expr);
+    return "";
+}
+
+std::vector<ScopeName> scope_at(const Program& prog, const std::string& file,
+                                uint32_t line, uint32_t col) {
+    std::vector<ScopeName> out;
+    const PFile* cur = find_pfile(prog, file);
+    if (!cur) return out;
+    const ClassDecl* cls = nullptr;
+    const FnDecl* fn = enclosing_fn(cur->mod, {line, col}, &cls);
+    if (fn) {
+        for (const Param& p : fn->params) {
+            std::string sig = p.name;
+            if (p.type) sig += ": " + type_str(p.type.get());
+            out.push_back({p.name, "parameter", sig, ""});
+        }
+        collect_locals(fn->body, out);
+    }
+    if (cls)
+        for (const FieldDecl& f : cls->fields)
+            out.push_back({f.name, "field", field_sig(f), f.doc});
+    for (const FnDecl& f : cur->mod.fns)
+        out.push_back({f.name, "function", fn_sig(f), f.doc});
+    for (const ClassDecl& c : cur->mod.classes)
+        out.push_back({c.name, "type", class_sig(c), c.doc});
+    for (const EnumDecl& e : cur->mod.enums)
+        out.push_back({e.name, "enum", enum_sig(e), e.doc});
+    static const char* kws[] = {
+        "let", "var", "fn",     "if",     "else",   "for",    "in",
+        "match", "return", "break", "continue", "class", "enum", "interface",
+        "struct", "union", "import", "pub", "override", "static", "defer",
+        "unsafe", "self", "true", "false", "new", "as"};
+    for (const char* kw : kws) out.push_back({kw, "keyword", "", ""});
+    return out;
 }
 
 } // namespace beans
