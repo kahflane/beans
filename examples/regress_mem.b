@@ -25,10 +25,14 @@ fn uaf_check() {
 class PinNode {
     value: int = 0
     next: Option<PinNode> = none
+
+    fn init(value: int) { self.value = value }
 }
 
 fn match_pin_check() {
-    let n: PinNode = PinNode { next: some(PinNode { value: 42 }) }
+    let child: PinNode = new PinNode(42)
+    let n: PinNode = new PinNode(0)
+    n.next = some(child)
     var got: int = -1
     match n.next {
         some(child) => {
@@ -44,7 +48,7 @@ fn match_pin_check() {
 // position wrapped negative and sailed past the guard into a wild read/write.
 // A legitimate out-of-range access still panics; the overflow one must too.
 fn bounds_check() {
-    let b: Bytes = Bytes.new(8)
+    let b: Bytes = new Bytes(8)
     b.put_u64(0, 42)
     io.println("{b.get_u64(0)}")           // in range: 42
     io.println("{b.get_u64(9223372036854775800)}") // overflow: must panic, not read garbage

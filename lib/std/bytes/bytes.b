@@ -32,7 +32,7 @@ pub fn varint_size(value: u64) -> int {
 }
 
 pub fn encode_varint(value: u64) -> Bytes {
-    var out: Bytes = Bytes.new(10)
+    var out: Bytes = new Bytes(10)
     var remaining: u64 = value
     var index: int = 0
     for remaining >= 128 {

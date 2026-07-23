@@ -53,9 +53,10 @@ private:
                           bool is_struct = false, bool is_c_layout = false,
                           bool is_union = false);
     EnumDecl parse_enum(bool is_pub);
-    FnDecl parse_fn(bool is_pub, bool is_override, bool allow_no_body);
+    FnDecl parse_fn(bool is_pub, bool is_override, bool allow_no_body,
+                    bool is_method = false, bool is_static = false);
     std::vector<GenericParam> parse_generics();
-    std::vector<Param> parse_params(bool* has_self);
+    std::vector<Param> parse_params();
 
     // types
     TypePtr parse_type();

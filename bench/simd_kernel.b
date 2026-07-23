@@ -5,8 +5,8 @@ import std.os
 
 fn main() {
     let args: List<string> = os.args()
-    let n: int = if args.len() > 0 { args[0].to_int().or(200_000_000) } else { 200_000_000 }
-    let seed: int = if args.len() > 1 { args[1].to_int().or(1) } else { 1 }
+    let n: int = args.get(0).or("").to_int().or(200_000_000)
+    let seed: int = args.get(1).or("").to_int().or(1)
     unsafe {
         var value: Simd4f32 = Simd4f32.of(seed as f32, (seed + 1) as f32,
                                            (seed + 2) as f32, (seed + 3) as f32)

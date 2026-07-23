@@ -16,4 +16,4 @@ grep -q 'insertvalue {i1, %bs.Pair} zeroinitializer, i1 true, 0' build/inline_op
 grep -q 'define {i1, {i1, %bs.Pair}}' build/inline_options.ll || \
     grep -q '{i1, {i1, %bs.Pair}}' build/inline_options.ll
 
-echo "ok inline Option structs, arrays, SIMD, slices, nesting, capture, match, and try"
+echo "ok Option methods across scalars, ARC, structs, arrays, SIMD, slices, and nesting"

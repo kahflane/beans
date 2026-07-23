@@ -4,9 +4,9 @@ import std.os
 
 fn main() {
     let args: List<string> = os.args()
-    let n: int = if args.len() > 0 { args[0].to_int().or(20_000_000) } else { 20_000_000 }
-    let seed: int = if args.len() > 1 { args[1].to_int().or(1) } else { 1 }
-    var arena: Arena<int> = Arena.new(4096)
+    let n: int = args.get(0).or("").to_int().or(20_000_000)
+    let seed: int = args.get(1).or("").to_int().or(1)
+    var arena: Arena<int> = new Arena(4096)
     var state: int = seed + 1
     var sum: int = 0
     for i: int in 0..n {

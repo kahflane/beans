@@ -1,4 +1,4 @@
-# beans syntax — draft 0.5
+# beans syntax — draft 0.7
 
 Language: **beans** · extension: **.b** · status: draft for discussion
 Toolchain status: **lexer + parser + loader + checker + interpreter + native backend implemented** — including multi-file modules and git imports
@@ -12,7 +12,7 @@ Two target jobs, and the design serves both:
 
 ## Design rules
 
-1. Small grammar. Keep the keyword set small; it is currently 26.
+1. Small grammar. Every keyword must remove more complexity than it adds.
 2. Everything is an object. `5.abs()` works. Primitives are unboxed under the hood.
 3. No null. No exceptions. `Option<T>` and `Result<T>` only.
 4. **Every new name states its type.** No inference. Applies to `let`/`var`, params, fields, loop variables. One exception: match bindings — the matched value already pins the type, so `some(u) =>` is fine (`some(u: User) =>` allowed if you want it).
@@ -63,8 +63,8 @@ import gitlab.com/tools/csv as csvlib
 ```
 
 - Last path segment is the name you use (`http.get(...)`). `as` renames the binding.
-- Cross-package access: `util.some_fn()`, `util.User`, `util.User.new(...)`, `util.color.red` — anything `pub`. Methods of a `pub interface` travel with it (an interface is its method set).
-- `pub` is enforced in initializers too: `util.User { hidden: 1 }` is an error unless `hidden` is `pub`. A class whose non-`pub` field has no default can only be built inside its own package.
+- Cross-package access: `util.some_fn()`, `util.User`, `new util.User(...)`, `util.color.red` — anything `pub`. Methods of a `pub interface` travel with it (an interface is its method set).
+- `pub fn init(...)` controls class construction across package lines. Struct field literals still enforce field visibility.
 - A git import needs `host/owner/repo`; the repo must carry its own `beans.mod`. First build clones (`--depth 1`, `--branch` if pinned) into `$BEANS_HOME/src` (default `~/.beans/src`) and reuses the cache after.
 - No `beans.mod` above the file = single-file mode: `std.*` and git imports still work, local packages don't.
 - Two packages can't share a final name in one program (`a/json` + `b/json`) — rename one directory. `beans.lock` with exact hashes: later.
@@ -103,9 +103,9 @@ and `parse_int_range_or(from, to, fallback)` for allocation-free byte-range work
 ## Bytes (v0.5, implemented)
 
 The binary buffer — strings stay text; anything binary is `Bytes`. Mutating methods return
-self, so page-building chains work: `Bytes.new(4096).put_u32(0, root).put_u64(8, lsn)`.
+self, so page-building chains work: `new Bytes(4096).put_u32(0, root).put_u64(8, lsn)`.
 
-- `Bytes.new(n)` (zeroed, panics on negative), `Bytes.from(s)` (copies the text bytes)
+- `new Bytes(n)` (zeroed, panics on negative), `Bytes.from(s)` (copies the text bytes)
 - `len()`, `reserve(n)`, `resize(n)` (regrown range reads zero), `fill(v)`
 - `get(i)` / `set(i, v)` — one byte, panics out of range; `push(v)` appends one
   byte. These are low-level storage operations used by Beans-written formats.
@@ -147,7 +147,7 @@ Class-first, like everything builtin. Errors are `Result<T>`; `Error.kind` carri
 - **std.path** (pure Beans string math, no fs access): `join(a, b)` (absolute `b` wins),
   `parent`, `base`, `ext` (with the dot; a leading dot is a dotfile, not an extension),
   and `stem`. Import it with `import std.path`; the old native `Path.*` copy is gone.
-- **std.reader**: `reader.Reader(f)` then `read_line()` → `Result<Option<string>>` —
+- **std.reader**: `new reader.Reader(f)` then `read_line()` → `Result<Option<string>>` —
   `ok(some(line))` without its newline, a partial last line, then `ok(none)` at EOF.
   It reads at its own offset (pread), so the file's cursor never moves; buffered
   data keeps serving after `f.close()`, and the closed error surfaces on the next refill.
@@ -163,8 +163,9 @@ the generic `count`, `filter`, `transform`, and `unique_of` functions. Its
 `increment`, `get_or_insert`, `merge_with`, `remove_if`, and `map_values`
 functions mutate a caller Map through `inout`; these are ordinary generic Beans
 functions, including for structural wide keys.
-`std.option` provides generic `map`, `and_then`, and `filter`; `std.result`
-provides generic `map`, `and_then`, and `recover`; `std.math`
+`Option` provides instance methods `map`, `and_then`, and `filter`; `Result`
+provides instance methods `map`, `and_then`, and `recover`. There are no
+`std.option` or `std.result` packages. `std.math`
 provides `clamp_int` and `gcd`; `std.bytes` provides Beans-written `crc32`,
 `varint_size`, `encode_varint`, `append_varint`, `decode_varint`, and
 `decode_varint_at_or`; `std.path` is fully
@@ -176,7 +177,6 @@ the same checker, interpreter, MIR, and native backend as user code.
 `BEANS_STDLIB` can point the loader at another shipped-library root. Native
 registry rows remain for low-level allocation/storage, raw bytes, OS calls,
 atomics, and thread entry while more of `core` and `std` move to `.b` files.
-  (none at EOF), `read_all()`.
 
 **What prints** (same rule for `io.println` and `{x}` interpolation): numbers, bools, strings;
 enums, as `variant` or `variant(payload, ...)`; lists of printable things, as `[a, b, c]`,
@@ -226,35 +226,35 @@ var total: decimal = 0.0    // can be reassigned
 
 `let` means the *variable* can't be rebound. The object it points to can still change inside (Java-style — no borrow checker, no `mut` markers).
 
-`take name` moves the value out of a local binding. The old binding cannot be
+`move name` moves the value out of a local binding. The old binding cannot be
 read again unless it is a `var` and gets a new value first:
 
 ```
 var job: Job = next_job()
-let running: Job = take job
+let running: Job = move job
 job = next_job()                 // reinitializes it
 ```
 
 The checker rejects use after move and a value moved on only one branch. A
 move on every branch is definite. Normal parameters, loop variables, match
-bindings, and closure captures are borrowed, so they cannot be taken. Moving an outer
+bindings, and closure captures are borrowed, so they cannot be moved. Moving an outer
 local from a loop is also rejected because the next iteration would see an
-empty binding. For now `take` names a whole local; field and index moves need
+empty binding. For now `move` names a whole local; field and index moves need
 consuming accessors such as List `remove`.
 
-Parameters borrow by default. A `take` parameter owns its argument and drops it
+Parameters borrow by default. A `move` parameter owns its argument and drops it
 at function exit unless the body moves it onward:
 
 ```
-fn enqueue(take jobs: List<Job>) { ... }
+fn enqueue(move jobs: List<Job>) { ... }
 
 var batch: List<Job> = make_batch()
-enqueue(take batch)
+enqueue(move batch)
 ```
 
 A fresh result can be passed directly; an existing move-only local needs
-`take`. Take modes must match across interface methods and overrides. Function
-values and closures do not carry ownership modes yet, so a function with take
+`move`. Move modes must match across interface methods and overrides. Function
+values and closures do not carry ownership modes yet, so a function with move
 or inout parameters cannot be stored as a closure value.
 
 An `inout` parameter aliases one mutable caller local for the duration of the
@@ -275,42 +275,42 @@ swap(inout a, inout b)
 The caller must write `inout`, the argument must be a `var`, and the same local
 cannot appear in two inout positions of one call. An inout parameter cannot be
 captured by a closure. Native code passes the local's address directly; ARC
-values release the old value and take ownership of the replacement on overwrite.
+values release the old value and own the replacement on overwrite.
 
-`@move_only class` gives the same outer-handle rule to a user type:
+`unique class` gives the same outer-handle rule to a user type:
 
 ```
-@move_only class Packet {
+unique class Packet {
     bytes: Bytes
 }
 ```
 
-It cannot be copied by binding, assignment, return, or storage. Use `take` to
+It cannot be copied by binding, assignment, return, or storage. Use `move` to
 move it. A subclass of a move-only class is move-only too. This controls the
 reference handle; fields inside the object still follow their own rules.
 
 `Box<T>` and `Arena<T>` are move-only outer handles. Binding or assigning an
-existing handle needs `take`; function parameters borrow by default.
+existing handle needs `move`; function parameters borrow by default.
 
 ```
-var value: Box<int> = Box.new(7)
+var value: Box<int> = new Box(7)
 value.set(9)
-let owned: Box<int> = take value
+let owned: Box<int> = move value
 
-var arena: Arena<string> = Arena.new(1024)
+var arena: Arena<string> = new Arena(1024)
 let handle: int = arena.put("bean")
 let word: string = arena.at(handle)       // checked; panics on a bad handle
 let maybe: Option<string> = arena.get(handle)
 arena.clear()                             // drops all values in one pass
 ```
 
-`Box.new(value)` owns one heap slot. `get()` returns the value and `set(value)`
+`new Box(value)` owns one heap slot. `get()` returns the value and `set(value)`
 replaces it. The native runtime uses the common iterative ownership walker, so
 boxed chains do not recurse during teardown. Structs, fixed arrays, SIMD,
 slices, inline Option/Result values, and decimals keep their real inline layout;
 nested ARC fields are retained and dropped recursively.
 
-`Arena.new(capacity)` needs a declared `Arena<T>` type. `put(value)` appends and
+`new Arena(capacity)` needs a declared `Arena<T>` type or an explicit type argument. `put(value)` appends and
 returns a stable integer handle; `len`, `at`, `get`, and `clear` operate on the
 current region. `clear` keeps capacity but invalidates every old handle. This
 arena stores typed-width values in one contiguous region. Wide values and
@@ -322,7 +322,7 @@ there is no borrowed arena-reference type yet.
 observes the same control block without keeping the value alive:
 
 ```
-let shared: Shared<string> = Shared.new("beans")
+let shared: Shared<string> = new Shared("beans")
 let weak: Weak<string> = shared.downgrade()
 let live: Option<Shared<string>> = weak.upgrade()
 let gone: bool = weak.expired()
@@ -337,16 +337,18 @@ not trace through explicit Shared control blocks. `Shared<T>` and `Weak<T>` are
 `Send` and `Sync` only when `T` is both. `Mutex<T>` is the explicit lock-based
 synchronization boundary, including for local ARC class values.
 
-### Short init
+### Struct and collection literals
 
-When the left side already states the type, the right side can drop it:
+Structs keep named field literals. Lists and maps keep their literal forms:
 
 ```
-var st: Stack<int> = {}                  // same as Stack<int> {}
-let u: User = { name: "jul", age: 30 }   // same as User { ... }
+let point: Point = Point { x: 3, y: 4 }
+let values: List<int> = [1, 2, 3]
+let counts: Map<string, int> = {"beans": 2}
 ```
 
-Works in variable declarations and field defaults.
+Classes never use field literals or short `{}` initialization. Build them with
+`new Class(...)` so every construction path goes through `init`.
 
 ## Types
 
@@ -418,6 +420,12 @@ updating a key keeps its place, while removing and reinserting it moves it to th
 end. Lookup is hash-indexed (O(1)) in both backends, and `remove` is amortized
 O(1). Plain Map swap-removes entries, so deletion may change enumeration order;
 OrderedMap keeps stable entry slots and compacts holes as needed.
+
+Bracket reads are checked, required reads: `list[i]` panics when the index is
+outside the list, and `map[key]` panics when the key is missing. Use
+`list.get(i)` or `map.get(key)` when absence is expected; both return `Option`.
+Bracket assignment stays `list[i] = value` and `map[key] = value`.
+
 Map values may be wide structs, fixed arrays, SIMD vectors, slices, inline
 Option/Result values, or decimals. Their nested ARC fields are retained, dropped,
 cloned, returned by `get`, and copied into `values()` recursively. Struct,
@@ -426,7 +434,7 @@ fixed-array, and inline Option/Result keys work when their contents satisfy
 ARC fields, while `get`, `contains`, and `remove` use allocation-free stack keys.
 
 List, Map, and OrderedMap are move-only unique-buffer values. Binding,
-assignment, storage, and return use `take`; function parameters and loop reads
+assignment, storage, and return use `move`; function parameters and loop reads
 borrow by default. `clone()` makes an independent collection buffer, so changing
 the clone does not change the original. Class elements remain shared ARC
 references. A collection holding another move-only value cannot be cloned yet,
@@ -486,44 +494,54 @@ class User {
     age: int = 0            // default value
     pub email: string       // fields private to package unless pub
 
-    // no `self` param = static
-    fn new(name: string) -> User {
-        return User { name: name }     // struct-style init
+    pub fn init(name: string) {
+        self.name = name
     }
 
-    // `self` param = instance method. no `static` keyword needed.
-    fn greet(self) -> string {
+    fn greet() -> string {
         return "hi {self.name}"
+    }
+
+    static fn guest() -> User {
+        return new User("guest")
     }
 }
 
-let u: User = User.new("jul")
+let u: User = new User("jul")
 ```
 
-- `ClassName { field: value }` is the raw initializer. `fn new(...)` is a convention, not a keyword.
-- Want two ways to build it? Write `new` and `from_json`. No overloading magic.
+- Methods are instance methods by default. Their `self` binding is implicit and
+  available in the body; it is never written in the parameter list.
+- `static fn` is required for class statics. A static method has no `self` and is
+  not inherited.
+- `new Class(...)` is the only class-construction form and always follows the
+  class's `init` rules. Class field literals and plain `Class(...)` calls are errors.
+- Named statics remain for fallible or non-construction operations, including
+  `File.open`, `MMap.open`, `KV.open_in`, `Bytes.from`, `RawPtr.alloc`,
+  `Slice.from_raw`, and `Simd4f32.splat`, `of`, and `load`.
+- Infallible constructor-like builtins use `new`: `Bytes`, `Box`, `Arena`,
+  `Shared`, `Mutex`, `Channel`, and `AtomicInt`.
 
-### init and deinit (v0.6, implemented)
+### init and deinit (v0.7, implemented)
 
-`init` is the constructor — a method literally named `init`, no new keyword. Declaring one
-changes how the class is built: call the class like a function, and the raw `{ }` form becomes
-an error for that class. One way in, so its invariants always hold.
+`init` is the constructor body. `new Class(...)` allocates the object and invokes
+it. Like every instance method, `init` has implicit `self`.
 
 ```
 class Conn {
     host: string
     hits: int = 0
 
-    pub fn init(self, host: string) {
+    pub fn init(host: string) {
         self.host = host
     }
 
-    fn deinit(self) {
+    fn deinit() {
         io.println("closing {self.host}")
     }
 }
 
-let c: Conn = Conn("db1")
+let c: Conn = new Conn("db1")
 ```
 
 - `init` returns nothing and runs on a fresh object: fields with defaults start at them, the
@@ -532,17 +550,20 @@ let c: Conn = Conn("db1")
   fields already assigned — no method calls, no passing `self` on, no `return`, and no string
   interpolation (its pieces are checked too late to prove them safe). The checker proves all
   of it, so a half-built object can never escape. After the last field, anything goes.
-- Construction that can fail stays a static — `fn new(...) -> Result<Conn>` validates, then
-  calls `Conn(...)`.
-- Generic classes take their type arguments from the spot: `let s: Stack<int> = Stack()`.
-- `pub fn init` is what lets another package write `Conn(...)` — the usual visibility rule.
+- A class whose fields all have defaults receives an implicit zero-argument
+  initializer. A class with any required field must declare `init`.
+- Construction that can fail stays a named static, such as
+  `static fn open(...) -> Result<Conn>`; it may call `new Conn(...)` after validation.
+- Generic classes take type arguments from the declared spot or an explicit
+  constructor type: `let a: Stack<int> = new Stack()` or `new Stack<int>()`.
+- `pub fn init` is what lets another package write `new Conn(...)` — the usual visibility rule.
 
 **init and inheritance** work through `super.init(...)`, in Swift's order — own fields first:
 
 ```
-class Dog : Animal {
+class Dog extends Animal {
     breed: string
-    fn init(self, breed: string, name: string) {
+    fn init(breed: string, name: string) {
         self.breed = breed        // 1. this class's own fields
         super.init(name)          // 2. the parent's constructor, exactly once
         self.bark()               // 3. everything is assigned — anything goes
@@ -557,13 +578,13 @@ class Dog : Animal {
   init may be about to overwrite them). Assigning one is an error; `super.init` owns them.
 - `super.init` runs exactly once, as a top-level statement, only inside `init`, and it is
   mandatory whenever a class above declares an init. `return` before it is an error.
-- `super` is not a keyword (still 23): the checker recognizes only the exact form
+- `super` is contextual: the checker recognizes only the exact form
   `super.init(...)`. General `super.method()` calls: later.
-- A subclass that adds **no required fields** inherits the constructor — `Pup(args)` runs the
-  nearest ancestor init on a Pup. A subclass that adds required fields must declare its own
-  init. Either way `{ }` stays banned while any ancestor has an init.
+- A subclass whose added fields all have defaults inherits the nearest ancestor
+  initializer — `new Pup(args)` runs it on a Pup. A subclass that adds a required
+  field must declare its own init.
 - A class whose parent has *no* init may still declare one; its prefix then covers the
-  inherited fields too, under the raw form's visibility rules.
+  inherited fields too, under normal field visibility rules.
 
 `deinit` is the destructor. It runs exactly once, on whichever thread drops the last
 reference, the moment the count hits zero — and before the fields are released, so the body
@@ -581,35 +602,42 @@ can still read them. Deterministic, like C++/Swift: no GC pause, no "sometime la
 
 ## Inheritance and interfaces
 
-Single inheritance, many interfaces, one syntax — a colon list:
+Classes have one base class and may implement many interfaces. Interfaces may
+extend other interfaces:
 
 ```
 interface Shape {
-    fn area(self) -> f64
+    fn area() -> f64
 
     // default method bodies allowed (kills most need for abstract classes)
-    fn describe(self) -> string {
+    fn describe() -> string {
         return "shape with area {self.area()}"
     }
 }
 
-class Circle : Shape {
+interface NamedShape extends Shape {
+    fn name() -> string
+}
+
+class Circle implements Shape {
     r: f64
 
-    fn area(self) -> f64 {
+    fn area() -> f64 {
         return 3.14159265 * self.r * self.r
     }
 }
 
-class LoudCircle : Circle {
+class LoudCircle extends Circle implements NamedShape {
     // overriding a real method requires the keyword — typo protection
-    override fn describe(self) -> string {
+    override fn describe() -> string {
         return "A CIRCLE. AREA {self.area()}."
     }
 }
 ```
 
-No `extends`, no `implements`, no `abstract`, no `static`, no `final` (for now).
+`extends` takes one class base, while `implements` takes comma-separated
+interfaces. Interface requirements and default methods are instance methods.
+Static interface methods are unsupported. There is no `abstract` or `final` yet.
 
 ### Downcast
 
@@ -651,7 +679,8 @@ fn describe(p: Payment) -> string {
 }
 ```
 
-Enums are objects too — they can carry methods (`fn label(self) -> string { ... }` inside the enum body).
+Enums are objects too — they can carry methods (`fn label() -> string { ... }`
+inside the enum body, with implicit `self`).
 
 ## Option and Result
 
@@ -688,7 +717,24 @@ match parse_age(input) {
 
 let age: int = parse_age(input).or(18)                    // fallback
 let u: User = find(users, "jul").expect("must exist")     // crash with message
+
+let adult: Option<User> = find(users, "jul").filter(fn(u: User) -> bool {
+    return u.age >= 18
+})
+let label: Option<string> = adult.map(fn(u: User) -> string {
+    return u.name
+})
+let parsed: Result<int> = load_text().and_then(fn(s: string) -> Result<int> {
+    return s.to_int()
+})
+let count: int = parsed.recover(fn(e: Error) -> int { return 0 })
 ```
+
+`Option` has `map`, `and_then`, and `filter`. `Result` has `map`,
+`and_then`, and `recover`. They are instance methods on the value, not functions
+in `std.option` or `std.result`. These methods copy the active input payload, so
+its type must implement `Clone`. Their inline, boxed, and null-niche layouts do
+not change.
 
 Native `Option` uses three layouts without changing source semantics: pointer
 payloads use null as `none`, wide inline values such as structs, fixed arrays,
@@ -759,27 +805,31 @@ Monomorphized (a real copy per type, like C++ templates — this is a speed feat
 class Stack<T> {
     items: List<T> = []
 
-    fn push(self, x: T) { self.items.push(x) }
-    fn pop(self) -> Option<T> { return self.items.pop() }
+    fn push(x: T) { self.items.push(x) }
+    fn pop() -> Option<T> { return self.items.pop() }
 }
 
-fn largest<T: Order>(xs: List<T>) -> Option<T> { ... }
-fn index<K: Eq + Hash, V>(key: K, value: V) -> Map<K, V> { ... }
+fn largest<T implements Order>(xs: List<T>) -> Option<T> { ... }
+fn index<K implements Eq & Hash, V>(key: K, value: V) -> Map<K, V> { ... }
 ```
 
-The built-in traits are `Clone`, `Eq`, `Hash`, `Order`, `Send`, and `Sync`.
+The compiler-known interfaces are `Clone`, `Eq`, `Hash`, `Order`, `Send`, and `Sync`.
 Bounds are checked when a generic function or type is used, and generic bodies
 can only use operations promised by their bounds. `Order` also promises `Eq`.
-The old draft name `Comparable` remains an alias for `Order`.
+User interfaces, including imported interfaces, may also be bounds. Generic
+code may call the instance methods promised by those interfaces.
 
-`Map<K, V>` and `OrderedMap<K, V>` require `K: Eq + Hash`. Collection
+`Map<K, V>` and `OrderedMap<K, V>` require `K implements Eq & Hash`. Collection
 `clone()` is available only when every stored type is `Clone`; ordering and
-equality methods likewise require `Order` or `Eq`. Unknown traits are errors,
+equality methods likewise require `Order` or `Eq`. Unknown interfaces are errors,
 not ignored notes.
 
 ## Concurrency
 
-Direction: **OS threads, not green threads.** Reason: green threads make every C/C++ call expensive (Go's cgo problem — stack switching at the boundary). Beans lives on C++ interop and wants to write databases, so real threads it is. And no new keywords — closures plus `std.thread` do the whole job, grammar stays at 23.
+Direction: **OS threads, not green threads.** Reason: green threads make every
+C/C++ call expensive (Go's cgo problem — stack switching at the boundary).
+Beans lives on C++ interop and wants to write databases, so real threads it is.
+Closures plus `std.thread` do the whole job.
 
 ```
 import std.thread
@@ -791,18 +841,18 @@ let t: Thread<int> = thread.spawn(fn() -> int {
 let n: int = t.join()               // wait + get the value
 
 // mutex wraps the data itself — no way to touch it without holding the lock
-let ledger: Mutex<Ledger> = Mutex.new(Ledger.new())
+let ledger: Mutex<Ledger> = new Mutex(new Ledger())
 ledger.with(fn(l: Ledger) {
     l.post(entry)                   // locked for exactly this block, auto-unlock
 })
 
 // channels move work between threads
-let ch: Channel<string> = Channel.new(64)      // buffered
+let ch: Channel<string> = new Channel(64)      // buffered
 ch.send("job")
 let job: Option<string> = ch.recv()            // none when closed and empty
 
 // atomics for plain counters
-let hits: AtomicInt = AtomicInt.new(0)
+let hits: AtomicInt = new AtomicInt(0)
 hits.add(1)
 ```
 
@@ -810,7 +860,8 @@ hits.add(1)
 - A `thread.spawn` closure may capture only `Send` values and must return a
   `Send` value. Plain class references, List, Map, Box, Arena, Bytes, File, and
   MMap are non-`Send`. Scalars, immutable strings, AtomicInt, Mutex, a Channel
-  of `Send` values, and `Shared<T>`/`Weak<T>` where `T: Send + Sync` can cross.
+  of `Send` values, and `Shared<T>`/`Weak<T>` where
+  `T implements Send & Sync` can cross.
   This makes `class` a local ARC reference by default; wrap shared mutable data
   in Mutex instead of silently racing it.
 
@@ -821,14 +872,15 @@ hits.add(1)
   from hitting an fd number that `close()` freed and the OS reused for a different file. The
   logical `closed` flag flips immediately, so same-thread `close()` semantics are unchanged; only
   the OS-level release is deferred, and only while threads run.
-- `defer f.close()` — runs when the function exits normally, newest first. Must sit at the
+- `defer f.close()` — runs when the function exits normally, including through
+  `return` and `?`, newest first and before local destruction. Must sit at the
   top level of the function body (not inside `if`/`for`/blocks — it is a function-exit hook,
   and nested registration would need runtime capture the native backend does not do). A panic
   exits the process without running defers, and a panic inside a defer is itself fatal.
   (Go's best idea, minus unwinding.)
 - `unsafe { }` — gates low-level operations. The first implemented part is
   `RawPtr<T>` for primitive integer, float, bool, raw-pointer, fixed-array, and
-  declared `@c_layout struct`/`union` values. These shapes can nest.
+  declared `extern "C" struct`/`union` values. These shapes can nest.
   `RawPtr.alloc(n)`
   allocates zeroed unmanaged storage; `null()` and `from_address(u64)` create
   pointer values. `read`, `write`, `read_volatile`, `write_volatile`, `offset`,
@@ -846,7 +898,7 @@ hits.add(1)
   alias leaves every other alias dangling.
 - `extern "C" fn name(args) -> T` declares an unmangled host C symbol. Calls
   require `unsafe {}`. The ABI supports up to six integer, bool, `RawPtr`,
-  `f32`, `f64`, or `@c_layout struct`/`union` arguments and the same return
+  `f32`, `f64`, or `extern "C" struct`/`union` arguments and the same return
   types (or no return). Aggregates may contain nested C-layout records and
   fixed arrays. Clang owns the platform ABI lowering: native builds link a
   generated pointer-ABI wrapper, and the interpreter compiles and caches a tiny
@@ -885,20 +937,19 @@ hits.add(1)
   returned as an LLVM aggregate, with no ARC header or heap allocation:
 
   ```beans
-  @c_layout
-  struct Packet {
+  extern "C" struct Packet {
       tag: u8
       count: u32
       ratio: f32
   }
   ```
 
-  `@c_layout` fixes declaration order and the target C size/alignment rules, so
+  `extern "C"` fixes declaration order and the target C size/alignment rules, so
   `RawPtr<Packet>` and `Slice<Packet>` can access matching native memory.
   Fields are private unless marked `pub`, as with classes. Ordinary structs can
   own strings, classes, collections, Options/Results, and other ARC values; the
   compiler retains and drops those fields recursively through copies, arrays,
-  class fields, and typed List, Map-value, Box, and Arena storage. `@c_layout` structs stay restricted to
+  class fields, and typed List, Map-value, Box, and Arena storage. `extern "C"` structs stay restricted to
   inline scalars, `RawPtr`, fixed arrays, and nested C-layout structs so their C
   ABI has no hidden ownership policy. A direct or array-wrapped
   recursive value edge is rejected because it has no finite size; use `RawPtr`
@@ -908,14 +959,13 @@ hits.add(1)
   and lookups use a stack copy. A field can be changed only through a `var`
   local.
 
-- `@c_layout union` declares overlapping inline scalar, `RawPtr`, fixed-array,
+- `extern "C" union` declares overlapping inline scalar, `RawPtr`, fixed-array,
   or nested C-layout storage. It must be
   initialized with exactly one named field. Initialization, reads, and writes
   require `unsafe`, because Beans does not track which member is active:
 
   ```beans
-  @c_layout
-  union Word {
+  extern "C" union Word {
       bits: u32
       number: f32
   }
@@ -926,25 +976,34 @@ hits.add(1)
   has no defaults, methods, generics, inheritance, compound field assignment,
   ARC reference fields, or direct old-container storage.
 
-## Keywords (28)
+`unique` is a contextual declaration modifier; `extern "C"` is a declaration
+modifier built from the `extern` keyword. Standard modifier
+order is `pub unique class` and `pub extern "C" struct`.
+
+## Keywords and modifiers
 
 ```
 class struct union interface enum fn let var pub override
-if else for in match return break continue take inout
-import as defer unsafe extern self true false
+if else for in match return break continue move inout
+import as defer unsafe extern new extends implements static
+self true false unique
 ```
 
-`some none ok err new` are ordinary names, not keywords. `spawn` is a library function, not a keyword.
+`some none ok err` are ordinary names. `super` is contextual. `spawn` is a
+library function, not a keyword.
 
 ## Decided
 
-- `super.init` v0.6 (implemented): Swift order — own fields, then the parent's constructor,
-  then full self; exactly once, top level, mandatory when an ancestor has init; `super` is
-  contextual, not a keyword; a subclass adding no required fields inherits the constructor
-- `init`/`deinit` v0.6 (implemented): constructor by method name, `ClassName(args)` call form,
-  straight-line-prefix field assignment proof, no init with inheritance yet; destructor runs at
-  refcount zero before fields release, subclass-then-parent chain, skipped for cycle garbage,
-  panic inside it fatal, `self` must not escape
+- Syntax v0.7 (implemented): `new Class(...)` is the only class construction;
+  implicit instance `self`; explicit `static fn`; `extends`/`implements`;
+  `T implements A & B`; `move`; `unique class`; `extern "C" struct/union`;
+  Option/Result combinators are instance methods; old forms have no aliases
+- `init`/`deinit`: constructor and destructor bodies use implicit `self`;
+  all-default classes get an implicit initializer; required fields require
+  `init`; subclass initializer inheritance is allowed when added fields all
+  have defaults; `super.init` keeps the Swift order — own fields, then parent,
+  then full self; destruction runs at refcount zero before field release,
+  subclass then parent, and is skipped for cycle garbage
 - Stdlib v0.5 phase 4 (implemented): Beans-written `std.reader` line reading over positional I/O (the old native `BufReader` is gone), format specs in interpolation (`{x:8.2}` — first top-level `:` in the braces; the same rendering as `std.fmt`), `chars()` for UTF-8, varint + crc32 on `Bytes`, `MMap.resize` (the handle keeps its fd), `Dir.walk` (recursive, sorted, relative), and Beans-written `std.path`
 - Stdlib v0.5 phase 3 (implemented): the List/Map method set with **stable** sorts (`sort_by` takes a less-than closure; both backends run the identical merge), `Bytes` value `==`, advisory file locks, `MMap` (whole-file, shared, drop unmaps, grow = close + reopen), `std.fmt`, and printing widened to enums and lists — `variant(payload)` / `[a, b]` — everywhere strings interpolate; maps, class instances, and `Result` stay unprintable
 - Stdlib v0.5: the string method set, `Bytes`, `File`/`Dir`, `std.os`, and the `std.io` console set (implemented); byte semantics, panics carry positions, mutators return self for chaining, fs errors carry kind slugs
@@ -952,10 +1011,10 @@ import as defer unsafe extern self true false
 - Block-bodied match arms in statement position (v0.4, implemented)
 - `pub interface` exposes its method set implicitly (v0.4)
 - Explicit types everywhere, no inference (v0.2) — match bindings relaxed in v0.3
-- Short init `= {}` when the left side states the type (v0.3)
+- Named field literals remain for structs; classes construct only with `new`
 - No `+` on strings — interpolation / `std.fmt` / `join` only (v0.3)
 - Private by default everywhere, `pub` to expose (confirmed v0.3)
-- OS threads + checked `Send` captures/returns + `Mutex<T>.with` + `Channel<T>`, no new keywords
+- OS threads + checked `Send` captures/returns + `Mutex<T>.with` + `Channel<T>`
 - `decimal` built-in for money (v0.2)
 - Go-style remote imports from git hosts + beans.mod (v0.2)
 - `Result<T>`, error type defaults to built-in `Error`
@@ -966,5 +1025,5 @@ import as defer unsafe extern self true false
 
 ## Open questions
 
-1. Concurrency sketch above — confirm the shape, or do you want `spawn { ... }` as keyword sugar (would be keyword #24)?
-2. decimal division rounding: default mode (banker's rounding?) and a `.round(places, mode)` API — settle when we do the stdlib.
+1. decimal division rounding: default mode (banker's rounding?) and a
+   `.round(places, mode)` API — settle when we do the stdlib.

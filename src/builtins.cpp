@@ -1546,7 +1546,6 @@ const std::vector<BuiltinMethod>& builtin_methods() {
 
 const std::vector<BuiltinStatic>& builtin_statics() {
     static const std::vector<BuiltinStatic> table = {
-        {"Bytes", "new", {BT::i64}, BT::bytes, "beans_bytes_new", true, bytes_new},
         {"Bytes", "from", {BT::str}, BT::bytes, "beans_bytes_from", false, bytes_from},
         {"Bytes", "varint_size", {BT::i64}, BT::i64, "beans_bytes_varint_size", false, bytes_varint_size_s},
         {"File", "exists", {BT::str}, BT::boolean, "beans_file_exists", false, file_exists_s},
@@ -1564,6 +1563,13 @@ const std::vector<BuiltinStatic>& builtin_statics() {
         {"Dir", "sync", {BT::str}, BT::res_bool, "beans_dir_sync", false, dir_sync_s},
         {"Dir", "walk", {BT::str}, BT::res_list_str, "beans_dir_walk", false, dir_walk_s},
         {"MMap", "open", {BT::str, BT::boolean}, BT::res_mmap, "beans_mmap_open", false, mmap_open_s},
+    };
+    return table;
+}
+
+const std::vector<BuiltinConstructor>& builtin_constructors() {
+    static const std::vector<BuiltinConstructor> table = {
+        {"Bytes", {BT::i64}, BT::bytes, "beans_bytes_new", true, bytes_new},
     };
     return table;
 }

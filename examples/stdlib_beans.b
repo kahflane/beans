@@ -3,9 +3,7 @@ import std.bytes as byte_algo
 import std.io
 import std.fmt
 import std.math
-import std.option
 import std.path
-import std.result
 
 struct Pair {
     left: i32
@@ -51,26 +49,26 @@ fn main() {
         inout wide_counts, Pair { left: -1, right: 2 }, 5)
     io.println("wide generic {wide_total} {wide_counts[Pair { left: -1, right: 2 }]}")
 
-    let mapped: Option<string> = option.map(some(21), fn(value: int) -> string {
+    let mapped: Option<string> = some(21).map(fn(value: int) -> string {
         return "value {value * 2}"
     })
-    let kept: Option<int> = option.filter(some(8), fn(value: int) -> bool {
+    let kept: Option<int> = some(8).filter(fn(value: int) -> bool {
         return value > 5
     })
     io.println("{mapped.or("missing")} {kept.or(0)}")
 
-    let parsed: Result<string> = result.map(ok(21), fn(value: int) -> string {
+    let parsed: Result<string> = ok(21).map(fn(value: int) -> string {
         return "result {value * 2}"
     })
     let missing: Result<int> = err("missing number")
-    let recovered: int = result.recover(missing, fn(error: Error) -> int {
+    let recovered: int = missing.recover(fn(error: Error) -> int {
         return error.msg.len()
     })
     io.println("{parsed.expect("bad map")} {recovered}")
 
     let raw: Bytes = Bytes.from("123456789")
     let encoded: Bytes = byte_algo.encode_varint(300)
-    let appended: Bytes = Bytes.new(1)
+    let appended: Bytes = new Bytes(1)
     appended.set(0, 99)
     byte_algo.append_varint(appended, 300)
     io.println("{byte_algo.crc32(raw)} {raw.crc32(0, raw.len()) as u32}")
@@ -85,7 +83,7 @@ fn main() {
         decoded_sum = decoded_sum + byte_algo.decode_varint(item).or(0)
         encoded_size += item.len()
     }
-    let malformed: Bytes = Bytes.new(10).fill(255)
+    let malformed: Bytes = new Bytes(10).fill(255)
     io.println("boundaries {decoded_sum} {encoded_size} {byte_algo.decode_varint(malformed).or(77)}")
     io.println("path {path.join("a/", "b")} {path.join("a", "/root")} {path.parent("/a/b/")} {path.base("/a/b/")} {path.ext("archive.tar.gz")} {path.stem("archive.tar.gz")} {path.ext(".bashrc")}")
     io.println("fmt {fmt.hex(-1)} {fmt.bin(10)} {fmt.group(-9223372036854775807 - 1, "_")}")

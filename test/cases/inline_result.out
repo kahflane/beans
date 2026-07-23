@@ -1,7 +1,13 @@
 inline result true false true
 result values 20 11 20
 result stdlib 25
+result methods 6 beans 7 false
+result array 7
 result error no pair
 result nested 10
+result mapped nested 20
 result capture no pair
 result assign 40
+result wide error 9 false 7 10
+result custom error false 5
+result wide 10 32

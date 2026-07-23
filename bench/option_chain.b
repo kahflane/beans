@@ -5,16 +5,21 @@ import std.os
 class Node {
     value: int
     next: Option<Node> = none
+
+    fn init(value: int, next: Option<Node>) {
+        self.value = value
+        self.next = next
+    }
 }
 
 fn main() {
     let args: List<string> = os.args()
-    let n: int = if args.len() > 0 { args[0].to_int().or(1_000_000) } else { 1_000_000 }
-    let seed: int = if args.len() > 1 { args[1].to_int().or(1) } else { 1 }
+    let n: int = args.get(0).or("").to_int().or(1_000_000)
+    let seed: int = args.get(1).or("").to_int().or(1)
     var head: Option<Node> = none
     var i: int = 0
     for i < n {
-        let node: Node = Node { value: i + seed, next: head }
+        let node: Node = new Node(i + seed, head)
         head = some(node)
         i += 1
     }

@@ -4,8 +4,8 @@ import std.os
 
 fn main() {
     let args: List<string> = os.args()
-    let n: int = if args.len() > 0 { args[0].to_int().or(5_000_000) } else { 5_000_000 }
-    let seed: int = if args.len() > 1 { args[1].to_int().or(1) } else { 1 }
+    let n: int = args.get(0).or("").to_int().or(5_000_000)
+    let seed: int = args.get(1).or("").to_int().or(1)
     var values: List<int> = []
     values.reserve(n)
     var i: int = 0

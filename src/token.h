@@ -12,10 +12,11 @@ enum class TokenKind : uint8_t {
     float_lit,
     string_lit,
 
-    // keywords (28)
+    // tokens with reserved keyword spellings (33; `unique` is contextual)
     kw_class, kw_struct, kw_union, kw_interface, kw_enum, kw_fn, kw_let, kw_var, kw_pub, kw_override,
     kw_if, kw_else, kw_for, kw_in, kw_match, kw_return, kw_break, kw_continue,
-    kw_import, kw_as, kw_defer, kw_unsafe, kw_extern, kw_take, kw_inout,
+    kw_import, kw_as, kw_defer, kw_unsafe, kw_extern, kw_new,
+    kw_extends, kw_implements, kw_static, kw_move, kw_take, kw_inout,
     kw_self, kw_true, kw_false,
 
     // brackets

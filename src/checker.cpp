@@ -276,7 +276,6 @@ void Checker::register_decls() {
         for (const auto& pf : pkg->files) {
             enter_file(*pkg, *pf);
             for (const ClassDecl& c : pf->mod.classes) {
-                validate_generic_params(c.generics, c.line, c.col);
                 if (classes_.count(c.qualname) || enums_.count(c.qualname) ||
                     builtin_generic_classes_.count(c.name) || c.name == "Error") {
                     error_at(c.line, c.col, "type name '" + c.name + "' already taken");
@@ -288,7 +287,6 @@ void Checker::register_decls() {
                 classes_[c.qualname] = std::move(info);
             }
             for (const EnumDecl& e : pf->mod.enums) {
-                validate_generic_params(e.generics, e.line, e.col);
                 if (classes_.count(e.qualname) || enums_.count(e.qualname) ||
                     builtin_generic_classes_.count(e.name) || e.name == "Error") {
                     error_at(e.line, e.col, "type name '" + e.name + "' already taken");
@@ -309,6 +307,7 @@ void Checker::register_decls() {
             for (const ClassDecl& c : pf->mod.classes) {
                 auto it = classes_.find(c.qualname);
                 if (it != classes_.end() && it->second.decl == &c) {
+                    validate_generic_params(c.generics, c.line, c.col);
                     resolve_supers(it->second);
                     resolve_class_members(it->second);
                 }
@@ -316,6 +315,7 @@ void Checker::register_decls() {
             for (const EnumDecl& e : pf->mod.enums) {
                 auto it = enums_.find(e.qualname);
                 if (it != enums_.end() && it->second.decl == &e) {
+                    validate_generic_params(e.generics, e.line, e.col);
                     resolve_enum_members(it->second);
                 }
             }
@@ -342,18 +342,18 @@ void Checker::register_decls() {
                     for (size_t i = 0; i < f.params.size(); i++) {
                         if (f.params[i].passing != Param::Passing::borrow) {
                             error_at(f.params[i].line, f.params[i].col,
-                                     "extern parameters cannot use take or inout");
+                                     "extern parameters cannot use move or inout");
                         }
                         if (!is_c_abi_type(params[i], false) &&
                             !is_c_abi_callback(params[i])) {
                             error_at(f.params[i].line, f.params[i].col,
-                                     "extern parameter needs an integer, float, bool, RawPtr, @c_layout struct/union, or C callback type, got " +
+                                     "extern parameter needs an integer, float, bool, RawPtr, extern \"C\" struct/union, or C callback type, got " +
                                          type_name(params[i]));
                         }
                     }
                     if (!is_c_abi_type(ret, true)) {
                         error_at(f.line, f.col,
-                                 "extern return needs an integer, float, bool, RawPtr, @c_layout struct/union, or no value, got " +
+                                 "extern return needs an integer, float, bool, RawPtr, extern \"C\" struct/union, or no value, got " +
                                      type_name(ret));
                     }
                 }
@@ -371,15 +371,26 @@ void Checker::register_decls() {
 // and write them into the decl for the interpreter and codegen
 void Checker::resolve_supers(ClassInfo& c) {
     c.supers.clear();
-    c.decl->supers_resolved.clear();
-    for (const std::string& s : c.decl->supers) {
+    c.decl->base_resolved.clear();
+    c.decl->interfaces_resolved.clear();
+    if (!c.decl->base.empty()) {
+        std::string key = resolve_class_key(c.decl->base, c.decl->line, c.decl->col);
+        if (key.empty()) {
+            error_at(c.decl->line, c.decl->col,
+                     "unknown base class '" + c.decl->base + "'");
+        } else {
+            c.decl->base_resolved = key;
+            c.supers.push_back(key);
+        }
+    }
+    for (const std::string& s : c.decl->interfaces) {
         std::string key = resolve_class_key(s, c.decl->line, c.decl->col);
         if (key.empty()) {
-            error_at(c.decl->line, c.decl->col, "unknown parent '" + s + "'");
+            error_at(c.decl->line, c.decl->col, "unknown interface '" + s + "'");
             continue;
         }
         c.supers.push_back(key);
-        c.decl->supers_resolved.push_back(key);
+        c.decl->interfaces_resolved.push_back(key);
     }
 }
 
@@ -418,7 +429,9 @@ void Checker::resolve_class_members(ClassInfo& c) {
                 error_at(m.line, m.col, "type parameter '" + g.name +
                                             "' hides an outer type parameter");
             }
-            for (const std::string& trait : split_traits(g.bound))
+            const auto& bounds = g.bounds_resolved.size() == g.bounds.size()
+                                     ? g.bounds_resolved : g.bounds;
+            for (const std::string& trait : bounds)
                 cur_type_bounds_[g.name].insert(trait);
         }
         std::vector<TypeId> params;
@@ -498,7 +511,9 @@ void Checker::resolve_enum_members(EnumInfo& e) {
                 error_at(m.line, m.col, "type parameter '" + g.name +
                                             "' hides an outer type parameter");
             }
-            for (const std::string& trait : split_traits(g.bound))
+            const auto& bounds = g.bounds_resolved.size() == g.bounds.size()
+                                     ? g.bounds_resolved : g.bounds;
+            for (const std::string& trait : bounds)
                 cur_type_bounds_[g.name].insert(trait);
         }
         std::vector<TypeId> params;
@@ -570,7 +585,7 @@ void Checker::check_hierarchy(ClassInfo& c) {
             error_at(d->line, d->col,
                      d->is_union ? "generic unions are not available yet"
                                  : "generic structs are not available yet");
-        if (!d->supers.empty())
+        if (!d->base.empty() || !d->interfaces.empty())
             error_at(d->line, d->col,
                      d->is_union ? "unions cannot inherit" : "structs cannot inherit");
         for (const FnDecl& method : d->methods)
@@ -596,9 +611,9 @@ void Checker::check_hierarchy(ClassInfo& c) {
                      "'" + mname + "' can't be declared in an interface");
             continue;
         }
-        if (!mdecl->has_self) {
-            error_at(mdecl->line, mdecl->col, "'" + mname + "' takes self — it's not a static");
-        }
+        if (!mdecl->has_self)
+            error_at(mdecl->line, mdecl->col,
+                     "'" + mname + "' is an instance method — remove 'static'");
         if (mdecl->ret) {
             error_at(mdecl->line, mdecl->col, "'" + mname + "' returns nothing");
         }
@@ -623,6 +638,20 @@ void Checker::check_hierarchy(ClassInfo& c) {
 
     std::set<std::string> seen = {d->qualname}; // supers are qualified keys
     std::vector<std::string> work = c.supers;
+    if (!d->base_resolved.empty()) {
+        auto bit = classes_.find(d->base_resolved);
+        if (bit != classes_.end() && bit->second.decl &&
+            bit->second.decl->is_interface)
+            error_at(d->line, d->col, "extends needs a class; put interfaces after implements");
+    }
+    for (const std::string& name : d->interfaces_resolved) {
+        auto iit = classes_.find(name);
+        if (iit != classes_.end() && iit->second.decl &&
+            !iit->second.decl->is_interface)
+            error_at(d->line, d->col,
+                     d->is_interface ? "interfaces may extend only interfaces"
+                                     : "implements needs an interface");
+    }
     for (const std::string& s : c.supers) {
         auto it = classes_.find(s);
         if (it == classes_.end()) {
@@ -674,8 +703,17 @@ void Checker::check_hierarchy(ClassInfo& c) {
                 if (!f.def) {
                     error_at(d->line, d->col,
                              "'" + d->name + "' adds required field '" + f.name +
-                                 "' but has no init — declare fn init(self, ...) and "
-                                 "call super.init(...)");
+                                 "' but has no init — declare fn init(...) and "
+                                     "call super.init(...)");
+                }
+            }
+        } else {
+            for (const FieldDecl& f : d->fields) {
+                if (!f.def) {
+                    error_at(d->line, d->col,
+                             "class '" + d->name + "' has required field '" + f.name +
+                                 "' — declare fn init(...); only all-default classes "
+                                 "receive an implicit init()");
                 }
             }
         }
@@ -848,7 +886,7 @@ TypeId Checker::resolve_type(const TypeRef* t) {
         if ((n == "RawPtr" || n == "Slice") && args.size() == 1 &&
             !is_raw_pointee(args[0])) {
             error_at(t->line, t->col,
-                     n + " only supports inline scalars, RawPtr, fixed arrays, and @c_layout struct/union values, got " +
+                     n + " only supports inline scalars, RawPtr, fixed arrays, and extern \"C\" struct/union values, got " +
                          type_name(args[0]));
         }
         return pool_.named(Type::K::class_, n, std::move(args));
@@ -1001,27 +1039,7 @@ bool Checker::printable_rec(TypeId t, std::set<TypeId>& seen) {
 }
 
 std::string Checker::canonical_trait(const std::string& trait) {
-    // Comparable was the old draft spelling. Keep source compatibility while
-    // the trait itself uses the clearer Order name.
-    return trait == "Comparable" ? "Order" : trait;
-}
-
-std::vector<std::string> Checker::split_traits(const std::string& bounds) {
-    std::vector<std::string> out;
-    size_t start = 0;
-    while (start < bounds.size()) {
-        size_t end = bounds.find('+', start);
-        std::string name = bounds.substr(start, end == std::string::npos
-                                                   ? std::string::npos
-                                                   : end - start);
-        size_t first = name.find_first_not_of(" \t");
-        size_t last = name.find_last_not_of(" \t");
-        if (first != std::string::npos)
-            out.push_back(canonical_trait(name.substr(first, last - first + 1)));
-        if (end == std::string::npos) break;
-        start = end + 1;
-    }
-    return out;
+    return trait;
 }
 
 void Checker::set_type_params(const std::vector<GenericParam>& params) {
@@ -1029,7 +1047,9 @@ void Checker::set_type_params(const std::vector<GenericParam>& params) {
     cur_type_bounds_.clear();
     for (const GenericParam& param : params) {
         cur_type_params_.insert(param.name);
-        for (const std::string& trait : split_traits(param.bound))
+        const auto& bounds = param.bounds_resolved.size() == param.bounds.size()
+                                 ? param.bounds_resolved : param.bounds;
+        for (const std::string& trait : bounds)
             cur_type_bounds_[param.name].insert(trait);
     }
 }
@@ -1044,11 +1064,20 @@ void Checker::validate_generic_params(const std::vector<GenericParam>& params,
         if (!names.insert(param.name).second) {
             error_at(line, col, "type parameter '" + param.name + "' is declared twice");
         }
-        for (const std::string& trait : split_traits(param.bound)) {
-            if (!known.count(trait)) {
-                error_at(line, col, "unknown trait '" + trait +
-                                            "' on type parameter '" + param.name + "'");
+        param.bounds_resolved.clear();
+        for (const std::string& trait : param.bounds) {
+            if (known.count(trait)) {
+                param.bounds_resolved.push_back(trait);
+                continue;
             }
+            std::string key = resolve_class_key(trait, line, col);
+            auto it = classes_.find(key);
+            if (key.empty() || it == classes_.end() || !it->second.decl ||
+                !it->second.decl->is_interface) {
+                error_at(line, col, "generic bound '" + trait + "' is not an interface");
+                continue;
+            }
+            param.bounds_resolved.push_back(key);
         }
     }
 }
@@ -1068,8 +1097,20 @@ bool Checker::trait_satisfied_rec(TypeId t, const std::string& raw_trait,
         auto it = cur_type_bounds_.find(t->name);
         if (it == cur_type_bounds_.end()) return false;
         if (it->second.count(trait)) return true;
+        for (const std::string& bound : it->second) {
+            auto bit = classes_.find(bound);
+            if (bit != classes_.end() && bit->second.decl &&
+                bit->second.decl->is_interface && is_subclass_of(bound, trait))
+                return true;
+        }
         // A total order includes equality.
         return trait == "Eq" && it->second.count("Order");
+    }
+
+    auto requested = classes_.find(trait);
+    if (requested != classes_.end() && requested->second.decl &&
+        requested->second.decl->is_interface) {
+        return t->k == Type::K::class_ && is_subclass_of(t->name, trait);
     }
 
     bool scalar = t->is_numeric() || t->k == Type::K::bool_ ||
@@ -1203,10 +1244,12 @@ void Checker::check_generic_bounds(const std::vector<GenericParam>& params,
     for (const GenericParam& param : params) {
         auto it = env.find(param.name);
         if (it == env.end()) continue;
-        for (const std::string& trait : split_traits(param.bound)) {
+        const auto& bounds = param.bounds_resolved.size() == param.bounds.size()
+                                 ? param.bounds_resolved : param.bounds;
+        for (const std::string& trait : bounds) {
             if (!trait_satisfied(it->second, trait)) {
-                error_at(line, col, what + " needs " + param.name + ": " + trait +
-                                        ", got " + type_name(it->second));
+                error_at(line, col, what + " needs " + param.name + " implements " +
+                                        trait + ", got " + type_name(it->second));
             }
         }
     }
@@ -1307,10 +1350,10 @@ bool Checker::is_c_abi_callback(TypeId t) const {
 
 void Checker::require_move_source(const Expr* e, TypeId t, const std::string& where) {
     if (!e || !is_move_only(t)) return;
-    if (e->kind == Expr::Kind::unary && e->op == TokenKind::kw_take) return;
+    if (e->kind == Expr::Kind::unary && e->op == TokenKind::kw_move) return;
     if (e->kind == Expr::Kind::ident) {
         error_at(e->line, e->col,
-                 where + " needs 'take " + std::string(e->text) +
+                 where + " needs 'move " + std::string(e->text) +
                      "' because " + type_name(t) + " is move-only");
     } else if (e->kind == Expr::Kind::field || e->kind == Expr::Kind::index) {
         error_at(e->line, e->col,
@@ -1454,7 +1497,7 @@ void Checker::check_fn_body(const FnDecl& f, ClassInfo* cls, EnumInfo* en) {
     for (const Param& p : f.params) {
         declare(p.name, resolve_type(p.type.get()),
                 p.passing == Param::Passing::inout, p.line, p.col,
-                p.passing != Param::Passing::take);
+                p.passing != Param::Passing::move);
         if (p.passing == Param::Passing::inout) {
             if (Local* local = find_local_mut(p.name)) local->inout = true;
         }
@@ -2048,9 +2091,9 @@ TypeId Checker::check_expr_impl(const Expr* e, TypeId expected) {
                 }
                 return local->type;
             }
-            if (e->op == TokenKind::kw_take) {
+            if (e->op == TokenKind::kw_move) {
                 if (!e->rhs || e->rhs->kind != Expr::Kind::ident) {
-                    error_at(e->line, e->col, "take needs a local name");
+                    error_at(e->line, e->col, "move needs a local name");
                     return t_poison();
                 }
                 std::string name(e->rhs->text);
@@ -2073,18 +2116,18 @@ TypeId Checker::check_expr_impl(const Expr* e, TypeId expected) {
                 }
                 if (local->borrowed) {
                     error_at(e->line, e->col,
-                             "can't take borrowed binding '" + name + "'");
+                             "can't move borrowed binding '" + name + "'");
                     return type;
                 }
                 int depth = local_scope_index(name);
                 if (take_floor_depth_ >= 0 && depth < take_floor_depth_) {
                     error_at(e->line, e->col,
-                             "can't take outer value '" + name +
+                             "can't move outer value '" + name +
                                  "' from a loop or escaping closure");
                     return type;
                 }
                 if (in_defer_) {
-                    error_at(e->line, e->col, "take is not allowed inside defer");
+                    error_at(e->line, e->col, "move is not allowed inside defer");
                     return type;
                 }
                 local->move = MoveState::moved;
@@ -2133,6 +2176,8 @@ TypeId Checker::check_expr_impl(const Expr* e, TypeId expected) {
             }
             return pool_.range_of(l);
         }
+        case Expr::Kind::new_:
+            return check_new(e, expected);
         case Expr::Kind::call:
             return check_call(e, expected);
         case Expr::Kind::field:
@@ -2277,9 +2322,9 @@ TypeId Checker::check_expr_impl(const Expr* e, TypeId expected) {
         case Expr::Kind::closure: {
             std::vector<TypeId> params;
             for (const Param& p : e->params) {
-                if (p.passing == Param::Passing::take) {
+                if (p.passing == Param::Passing::move) {
                     error_at(p.line, p.col,
-                             "take parameters are not supported on closure values yet");
+                             "move parameters are not supported on closure values yet");
                 } else if (p.passing == Param::Passing::inout) {
                     error_at(p.line, p.col,
                              "inout parameters are not supported on closure values yet");
@@ -2441,6 +2486,21 @@ Checker::Member Checker::lookup_member(TypeId recv, const std::string& name,
     Member none;
     if (!recv) return none;
 
+    if (recv->k == Type::K::type_param) {
+        auto bounds = cur_type_bounds_.find(recv->name);
+        if (bounds == cur_type_bounds_.end()) return none;
+        for (const std::string& bound : bounds->second) {
+            auto it = classes_.find(bound);
+            if (it == classes_.end() || !it->second.decl ||
+                !it->second.decl->is_interface)
+                continue;
+            TypeId iface = pool_.named(Type::K::class_, bound);
+            Member member = lookup_member(iface, name, line, col);
+            if (member.kind != Member::Kind::none) return member;
+        }
+        return none;
+    }
+
     if (recv->k == Type::K::class_ &&
         (recv->name == "RawPtr" || recv->name == "Slice" ||
          recv->name == "Simd4f32")) {
@@ -2479,7 +2539,8 @@ Checker::Member Checker::lookup_member(TypeId recv, const std::string& name,
                     return m;
                 }
                 auto mit = c->methods.find(name);
-                if (mit != c->methods.end()) {
+                if (mit != c->methods.end() &&
+                    (first || c->method_decls.at(name)->has_self)) {
                     // a pub interface's methods travel with it — the interface
                     // IS its method set, hiding them would make it useless
                     bool open = c->method_decls.at(name)->is_pub ||
@@ -2737,6 +2798,8 @@ Checker::Member Checker::builtin_member(TypeId recv, const std::string& name) {
             if (name == "or") return method({T}, T);
             if (name == "expect") return method({t_str()}, T);
             if (name == "is_some" || name == "is_none") return method({}, t_bool());
+            if (name == "map" || name == "and_then" || name == "filter")
+                return method({}, t_poison());
             return none;
         }
         if (recv->name == "Result" && recv->args.size() == 2) {
@@ -2744,6 +2807,8 @@ Checker::Member Checker::builtin_member(TypeId recv, const std::string& name) {
             if (name == "or") return method({T}, T);
             if (name == "expect") return method({t_str()}, T);
             if (name == "is_ok") return method({}, t_bool());
+            if (name == "map" || name == "and_then" || name == "recover")
+                return method({}, t_poison());
             return none;
         }
         return none;
@@ -2839,9 +2904,9 @@ TypeId Checker::check_call(const Expr* e, TypeId expected) {
                              const std::string& what) {
         std::set<std::string> inout_names;
         for (size_t i = 0; i < e->args.size() && i < declared.size() && i < types.size(); i++) {
-            if (declared[i].passing == Param::Passing::take) {
+            if (declared[i].passing == Param::Passing::move) {
                 require_move_source(e->args[i].get(), types[i],
-                                    what + " take argument " + std::to_string(i + 1));
+                                    what + " move argument " + std::to_string(i + 1));
             } else if (declared[i].passing == Param::Passing::inout) {
                 const Expr* arg = e->args[i].get();
                 if (!arg || arg->kind != Expr::Kind::unary ||
@@ -2963,7 +3028,8 @@ TypeId Checker::check_call(const Expr* e, TypeId expected) {
                 }
                 return t_result(ok_t ? ok_t : got, err_t);
             }
-            TypeId got = check_expr(e->args[0].get(), nullptr);
+            TypeId got = check_expr(e->args[0].get(),
+                                    err_t == t_error_class() ? nullptr : err_t);
             require_move_source(e->args[0].get(), got, "err");
             bool wraps_string = err_t == t_error_class() && got->k == Type::K::string_;
             if (!wraps_string && !assignable(got, err_t)) {
@@ -2985,10 +3051,12 @@ TypeId Checker::check_call(const Expr* e, TypeId expected) {
             return call_generic_fn(top_fn_decls_[fkey], top_fns_[fkey], "'" + name + "'");
         }
 
-        // a class name called like a function is construction through init
+        // Classes are never callable; construction is explicit.
         std::string ckey = resolve_class_key(name, e->line, e->col);
         if (!ckey.empty()) {
-            return check_ctor_call(e, ckey, name, expected);
+            error_at(e->line, e->col, "classes are built with 'new " + name + "(...)'");
+            for (const ExprPtr& a : e->args) check_expr(a.get(), nullptr);
+            return t_poison();
         }
 
         error_at(e->line, e->col, "unknown function '" + name + "'");
@@ -3083,12 +3151,15 @@ TypeId Checker::check_call(const Expr* e, TypeId expected) {
                         return call_generic_fn(top_fn_decls_[key], fit->second,
                                                "'" + n + "." + mname + "'");
                     }
-                    // pkg.Class(args): construction through the class's init
+                    // A package-qualified class is still not a function.
                     auto cit2 = classes_.find(key);
                     if (cit2 != classes_.end()) {
                         check_pub(key, cit2->second.decl && cit2->second.decl->is_pub,
                                   e->line, e->col, "type", n + "." + mname);
-                        return check_ctor_call(e, key, n + "." + mname, expected);
+                        error_at(e->line, e->col, "classes are built with 'new " +
+                                                      n + "." + mname + "(...)'");
+                        for (const ExprPtr& a : e->args) check_expr(a.get(), nullptr);
+                        return t_poison();
                     }
                 }
                 error_at(e->line, e->col,
@@ -3174,93 +3245,6 @@ TypeId Checker::check_call(const Expr* e, TypeId expected) {
                 for (const ExprPtr& a : e->args) check_expr(a.get(), nullptr);
                 return t_poison();
             }
-            if (n == "Arena" && mname == "new") {
-                if (e->args.size() != 1) {
-                    error_at(e->line, e->col, "Arena.new takes an initial capacity");
-                }
-                for (const ExprPtr& a : e->args) check_expr(a.get(), t_int());
-                if (expected && expected->k == Type::K::class_ &&
-                    expected->name == "Arena" && expected->args.size() == 1) {
-                    return expected;
-                }
-                error_at(e->line, e->col,
-                         "can't tell the arena value type — declare it: "
-                         "let arena: Arena<T> = Arena.new(capacity)");
-                return t_poison();
-            }
-            if (n == "Box" && mname == "new") {
-                if (e->args.size() != 1) {
-                    error_at(e->line, e->col, "Box.new takes one value");
-                    for (const ExprPtr& a : e->args) check_expr(a.get(), nullptr);
-                    return t_poison();
-                }
-                TypeId inner = nullptr;
-                if (expected && expected->k == Type::K::class_ &&
-                    expected->name == "Box" && expected->args.size() == 1) {
-                    inner = expected->args[0];
-                }
-                TypeId got = check_expr(e->args[0].get(), inner);
-                require_move_source(e->args[0].get(), got, "Box.new");
-                if (inner && !assignable(got, inner)) {
-                    error_at(e->args[0]->line, e->args[0]->col,
-                             "Box.new here needs " + type_name(inner) +
-                                 ", got " + type_name(got));
-                }
-                return pool_.named(Type::K::class_, "Box", {inner ? inner : got});
-            }
-            if (n == "Shared" && mname == "new") {
-                if (e->args.size() != 1) {
-                    error_at(e->line, e->col, "Shared.new takes one value");
-                    for (const ExprPtr& a : e->args) check_expr(a.get(), nullptr);
-                    return t_poison();
-                }
-                TypeId inner = nullptr;
-                if (expected && expected->k == Type::K::class_ &&
-                    expected->name == "Shared" && expected->args.size() == 1) {
-                    inner = expected->args[0];
-                }
-                TypeId got = check_expr(e->args[0].get(), inner);
-                require_move_source(e->args[0].get(), got, "Shared.new");
-                if (inner && !assignable(got, inner)) {
-                    error_at(e->args[0]->line, e->args[0]->col,
-                             "Shared.new here needs " + type_name(inner) +
-                                 ", got " + type_name(got));
-                }
-                return pool_.named(Type::K::class_, "Shared", {inner ? inner : got});
-            }
-            if (n == "Mutex" && mname == "new") {
-                if (e->args.size() != 1) {
-                    error_at(e->line, e->col, "Mutex.new takes the value to guard");
-                    return t_poison();
-                }
-                TypeId inner = nullptr;
-                if (expected && expected->k == Type::K::class_ && expected->name == "Mutex")
-                    inner = expected->args[0];
-                TypeId got = check_expr(e->args[0].get(), inner);
-                require_move_source(e->args[0].get(), got, "Mutex.new");
-                if (inner && !assignable(got, inner)) {
-                    error_at(e->args[0]->line, e->args[0]->col,
-                             "Mutex.new here needs " + type_name(inner) +
-                                 ", got " + type_name(got));
-                }
-                return pool_.named(Type::K::class_, "Mutex", {inner ? inner : got});
-            }
-            if (n == "Channel" && mname == "new") {
-                if (e->args.size() != 1) {
-                    error_at(e->line, e->col, "Channel.new takes a buffer size");
-                }
-                for (const ExprPtr& a : e->args) check_expr(a.get(), t_int());
-                if (expected && expected->k == Type::K::class_ && expected->name == "Channel") {
-                    return expected;
-                }
-                error_at(e->line, e->col,
-                         "can't tell the element type — declare it: let ch: Channel<T> = ...");
-                return t_poison();
-            }
-            if (n == "AtomicInt" && mname == "new") {
-                for (const ExprPtr& a : e->args) check_expr(a.get(), t_int());
-                return pool_.named(Type::K::class_, "AtomicInt");
-            }
             if (n == "Simd4f32") {
                 if (unsafe_depth_ == 0)
                     error_at(e->line, e->col,
@@ -3327,7 +3311,10 @@ TypeId Checker::check_call(const Expr* e, TypeId expected) {
                 }
                 const FnDecl* md = cit->second.method_decls.at(mname);
                 if (md->has_self) {
-                    error_at(e->line, e->col, "'" + mname + "' is an instance method — call it on a " + n + " value");
+                    error_at(e->line, e->col,
+                             "'" + mname + "' is an instance method — declare "
+                             "'static fn " + mname + "' or call it on a " + n +
+                                 " value");
                     return t_poison();
                 }
                 check_pub(n, md->is_pub, e->line, e->col, "static", n + "." + mname);
@@ -3352,12 +3339,86 @@ TypeId Checker::check_call(const Expr* e, TypeId expected) {
         }
         if (t->k == Type::K::class_ && (mname == "init" || mname == "deinit")) {
             error_at(e->line, e->col,
-                     mname == "init" ? "init runs when the object is built — call the class: " +
+                     mname == "init" ? "init runs when the object is built — use new " +
                                            type_name(t) + "(...)"
                                      : "deinit runs by itself when the last reference drops — "
                                        "never call it");
             for (const ExprPtr& a : e->args) check_expr(a.get(), nullptr);
             return t_poison();
+        }
+        if (t->k == Type::K::enum_ &&
+            (t->name == "Option" || t->name == "Result") &&
+            (mname == "map" || mname == "and_then" || mname == "filter" ||
+             mname == "recover")) {
+            if (e->args.size() != 1) {
+                error_at(e->line, e->col, type_name(t) + "." + mname +
+                                              " takes one function");
+                for (const ExprPtr& arg : e->args) check_expr(arg.get(), nullptr);
+                return t_poison();
+            }
+            TypeId payload = t->args[0];
+            if (!trait_satisfied(payload, "Clone")) {
+                error_at(e->line, e->col, type_name(t) + "." + mname +
+                                              " needs its value type to implement Clone");
+            }
+            TypeId function = check_expr(e->args[0].get(), nullptr);
+            if (function->k != Type::K::fn || function->fn_params.size() != 1) {
+                error_at(e->args[0]->line, e->args[0]->col,
+                         type_name(t) + "." + mname + " needs a one-parameter function");
+                return t_poison();
+            }
+            TypeId input = (mname == "recover" && t->name == "Result")
+                               ? t->args[1]
+                               : payload;
+            if (!assignable(input, function->fn_params[0])) {
+                error_at(e->args[0]->line, e->args[0]->col,
+                         type_name(t) + "." + mname + " function takes " +
+                             type_name(input) + ", got " +
+                             type_name(function->fn_params[0]));
+            }
+            if (mname == "filter") {
+                if (t->name != "Option") {
+                    error_at(e->line, e->col, "filter is only available on Option");
+                    return t_poison();
+                }
+                if (function->fn_ret != t_bool())
+                    error_at(e->args[0]->line, e->args[0]->col,
+                             "Option.filter function must return bool");
+                return t;
+            }
+            if (mname == "recover") {
+                if (t->name != "Result") {
+                    error_at(e->line, e->col, "recover is only available on Result");
+                    return t_poison();
+                }
+                if (!assignable(function->fn_ret, payload))
+                    error_at(e->args[0]->line, e->args[0]->col,
+                             "Result.recover function must return " + type_name(payload));
+                return payload;
+            }
+            if (mname == "map") {
+                return t->name == "Option"
+                           ? t_option(function->fn_ret)
+                           : t_result(function->fn_ret, t->args[1]);
+            }
+            if (t->name == "Option") {
+                if (function->fn_ret->k != Type::K::enum_ ||
+                    function->fn_ret->name != "Option") {
+                    error_at(e->args[0]->line, e->args[0]->col,
+                             "Option.and_then function must return Option");
+                    return t_poison();
+                }
+                return function->fn_ret;
+            }
+            if (function->fn_ret->k != Type::K::enum_ ||
+                function->fn_ret->name != "Result" ||
+                function->fn_ret->args.size() != 2 ||
+                function->fn_ret->args[1] != t->args[1]) {
+                error_at(e->args[0]->line, e->args[0]->col,
+                         "Result.and_then function must return Result with the same error type");
+                return t_poison();
+            }
+            return function->fn_ret;
         }
         Member m = lookup_member(t, mname, e->line, e->col);
         if (m.kind == Member::Kind::method) {
@@ -3430,6 +3491,91 @@ TypeId Checker::check_call(const Expr* e, TypeId expected) {
 
 // constructors ----------------------------------------------------------------
 
+TypeId Checker::check_new(const Expr* e, TypeId expected) {
+    auto explicit_args = [&]() {
+        std::vector<TypeId> out;
+        for (const TypePtr& arg : e->type_args) out.push_back(resolve_type(arg.get()));
+        return out;
+    };
+    auto require_count = [&](size_t count, const std::string& shown) {
+        if (e->args.size() == count) return true;
+        error_at(e->line, e->col, shown + " takes " + std::to_string(count) +
+                                      " argument(s), got " +
+                                      std::to_string(e->args.size()));
+        for (const ExprPtr& arg : e->args) check_expr(arg.get(), nullptr);
+        return false;
+    };
+
+    const std::string& name = e->name;
+    if (name == "Bytes") {
+        if (!e->type_args.empty())
+            error_at(e->line, e->col, "Bytes takes no type arguments");
+        require_count(1, "new Bytes");
+        for (const ExprPtr& arg : e->args) check_expr(arg.get(), t_int());
+        e->resolved = "Bytes";
+        return pool_.named(Type::K::class_, "Bytes");
+    }
+    if (name == "AtomicInt") {
+        if (!e->type_args.empty())
+            error_at(e->line, e->col, "AtomicInt takes no type arguments");
+        require_count(1, "new AtomicInt");
+        for (const ExprPtr& arg : e->args) check_expr(arg.get(), t_int());
+        e->resolved = "AtomicInt";
+        return pool_.named(Type::K::class_, "AtomicInt");
+    }
+    if (name == "Arena" || name == "Channel") {
+        std::vector<TypeId> args = explicit_args();
+        if (args.empty() && expected && expected->k == Type::K::class_ &&
+            expected->name == name && expected->args.size() == 1)
+            args = expected->args;
+        if (args.size() != 1) {
+            error_at(e->line, e->col, "new " + name +
+                                          " needs one type argument or a declared result type");
+        }
+        require_count(1, "new " + name);
+        for (const ExprPtr& arg : e->args) check_expr(arg.get(), t_int());
+        e->resolved = name;
+        return pool_.named(Type::K::class_, name,
+                           args.size() == 1 ? args : std::vector<TypeId>{t_poison()});
+    }
+    if (name == "Box" || name == "Shared" || name == "Mutex") {
+        if (!require_count(1, "new " + name)) return t_poison();
+        std::vector<TypeId> args = explicit_args();
+        TypeId inner = args.size() == 1 ? args[0] : nullptr;
+        if (!inner && expected && expected->k == Type::K::class_ &&
+            expected->name == name && expected->args.size() == 1)
+            inner = expected->args[0];
+        TypeId got = check_expr(e->args[0].get(), inner);
+        if (!inner) inner = got;
+        if (args.size() > 1)
+            error_at(e->line, e->col, name + " takes one type argument");
+        require_move_source(e->args[0].get(), got, "new " + name);
+        if (!assignable(got, inner))
+            error_at(e->args[0]->line, e->args[0]->col,
+                     "new " + name + " needs " + type_name(inner) +
+                         ", got " + type_name(got));
+        e->resolved = name;
+        return pool_.named(Type::K::class_, name, {inner});
+    }
+
+    std::string key = resolve_class_key(name, e->line, e->col);
+    if (key.empty()) {
+        error_at(e->line, e->col, "unknown class '" + name + "'");
+        for (const ExprPtr& arg : e->args) check_expr(arg.get(), nullptr);
+        return t_poison();
+    }
+    auto it = classes_.find(key);
+    if (it == classes_.end() || !it->second.decl || it->second.decl->is_struct ||
+        it->second.decl->is_union) {
+        error_at(e->line, e->col, "new only builds classes; use a field literal for '" +
+                                      name + "'");
+        for (const ExprPtr& arg : e->args) check_expr(arg.get(), nullptr);
+        return t_poison();
+    }
+    e->resolved = key;
+    return check_ctor_call(e, key, name, expected);
+}
+
 // super.init(...): the child's own fields are already proven assigned by
 // check_init_body's walk; here the call form, context, and args are checked,
 // and the target class key lands in Expr::resolved for interp and codegen
@@ -3468,9 +3614,9 @@ TypeId Checker::check_super_init(const Expr* e) {
             TypeId got = check_expr(e->args[i].get(), params[i]);
             allow_inout_expr_ = saved_inout;
             if (i < ini->params.size() &&
-                ini->params[i].passing == Param::Passing::take) {
+                ini->params[i].passing == Param::Passing::move) {
                 require_move_source(e->args[i].get(), params[i],
-                                    "super.init take argument " + std::to_string(i + 1));
+                                    "super.init move argument " + std::to_string(i + 1));
             }
             if (is_inout) {
                 const Expr* arg = e->args[i].get();
@@ -3507,32 +3653,53 @@ TypeId Checker::check_ctor_call(const Expr* e, const std::string& key,
     // required fields — check_hierarchy enforced that)
     const ClassInfo* owner = nullptr;
     const FnDecl* ini = chain_init(c, &owner);
-    if (!ini) {
-        error_at(e->line, e->col, "'" + shown + "' has no init — build it with " + shown +
-                                      " { field: value }");
-        for (const ExprPtr& a : e->args) check_expr(a.get(), nullptr);
-        return t_poison();
-    }
-    check_pub(owner->decl->qualname, ini->is_pub, e->line, e->col, "init of", shown);
 
-    // generic classes take their type arguments from the spot, like short init
+    // Type arguments may be explicit after the class name or inferred from the
+    // declared result type.
     std::vector<TypeId> targs;
+    for (const TypePtr& arg : e->type_args) targs.push_back(resolve_type(arg.get()));
     if (!c.generic_params.empty()) {
-        if (expected && expected->k == Type::K::class_ && expected->name == key &&
+        if (targs.empty() && expected && expected->k == Type::K::class_ && expected->name == key &&
             expected->args.size() == c.generic_params.size()) {
             targs = expected->args;
-        } else {
+        } else if (targs.empty()) {
             error_at(e->line, e->col, "can't tell the type arguments of '" + shown +
-                                          "' here — the spot needs a declared type");
+                                          "' here — write them or declare the result type");
             for (const ExprPtr& a : e->args) check_expr(a.get(), nullptr);
             return t_poison();
         }
+    } else if (!targs.empty()) {
+        error_at(e->line, e->col, "'" + shown + "' takes no type arguments");
+        targs.clear();
+    }
+    if (targs.size() != c.generic_params.size()) {
+        error_at(e->line, e->col, "'" + shown + "' takes " +
+                                      std::to_string(c.generic_params.size()) +
+                                      " type argument(s), got " +
+                                      std::to_string(targs.size()));
+        for (const ExprPtr& a : e->args) check_expr(a.get(), nullptr);
+        return t_poison();
     }
     std::map<std::string, TypeId> env;
     for (size_t i = 0; i < targs.size(); i++) env[c.generic_params[i]] = targs[i];
+    check_generic_bounds(c.decl->generics, env, e->line, e->col,
+                         "new " + shown);
+
+    // No declared init means the compiler-provided zero-argument initializer.
+    // check_hierarchy has already proved every field has a default.
+    if (!ini) {
+        if (!e->args.empty()) {
+            error_at(e->line, e->col, "implicit init of '" + shown +
+                                          "' takes no arguments");
+            for (const ExprPtr& a : e->args) check_expr(a.get(), nullptr);
+        }
+        e->resolved = key;
+        return pool_.named(Type::K::class_, key, std::move(targs));
+    }
+    check_pub(owner->decl->qualname, ini->is_pub, e->line, e->col, "init of", shown);
 
     // owner's signature: an inherited constructor can't mention this class's
-    // type params (supers take no type arguments), so subst only matters when
+    // type params (bases and interfaces take no type arguments), so subst only matters when
     // owner == the class itself
     TypeId ft = owner->methods.at("init");
     std::vector<TypeId> params;
@@ -3553,9 +3720,9 @@ TypeId Checker::check_ctor_call(const Expr* e, const std::string& key,
             TypeId got = check_expr(e->args[i].get(), params[i]);
             allow_inout_expr_ = saved_inout;
             if (i < ini->params.size() &&
-                ini->params[i].passing == Param::Passing::take) {
+                ini->params[i].passing == Param::Passing::move) {
                 require_move_source(e->args[i].get(), params[i],
-                                    "'" + shown + "' init take argument " +
+                                    "'" + shown + "' init move argument " +
                                         std::to_string(i + 1));
             }
             if (is_inout) {
@@ -3576,7 +3743,7 @@ TypeId Checker::check_ctor_call(const Expr* e, const std::string& key,
             }
         }
     }
-    e->callee->resolved = key; // interp and codegen construct straight from this
+    e->resolved = key; // interp and codegen construct straight from this
     return pool_.named(Type::K::class_, key, std::move(targs));
 }
 
@@ -3830,7 +3997,7 @@ TypeId Checker::check_init(const Expr* e, TypeId expected) {
     std::vector<TypeId> targs;
     for (const TypePtr& t : e->type_args) targs.push_back(resolve_type(t.get()));
 
-    // short form: take the shape from the expected type
+    // A struct literal can take its shape from the expected type.
     if (cname.empty()) {
         if (!expected) {
             error_at(e->line, e->col,
@@ -3896,6 +4063,13 @@ TypeId Checker::check_init(const Expr* e, TypeId expected) {
         error_at(e->line, e->col, "'" + cname + "' is an interface — it can't be built directly");
         return t_poison();
     }
+    if (!c.decl->is_struct && !c.decl->is_union) {
+        error_at(e->line, e->col,
+                 "classes are built with 'new " + c.decl->name + "(...)'; "
+                 "field literals are only for structs");
+        for (const InitEntry& en : e->entries) check_expr(en.value.get(), nullptr);
+        return t_poison();
+    }
     if (c.decl->is_union) {
         if (unsafe_depth_ == 0)
             error_at(e->line, e->col, "union initialization requires unsafe { }");
@@ -3903,14 +4077,6 @@ TypeId Checker::check_init(const Expr* e, TypeId expected) {
             error_at(e->line, e->col,
                      "union initializer sets exactly one field, got " +
                          std::to_string(e->entries.size()));
-    }
-    if (chain_init(c, nullptr)) {
-        // one way in: the raw form would sidestep every invariant the chain's
-        // init holds, whether it is this class's own or an ancestor's
-        error_at(e->line, e->col,
-                 "'" + cname + "' has an init — build it with " + cname + "(...)");
-        for (const InitEntry& en : e->entries) check_expr(en.value.get(), nullptr);
-        return t_poison();
     }
     if (targs.empty() && !c.generic_params.empty() && expected &&
         (expected->k == Type::K::class_ || expected->k == Type::K::struct_) &&

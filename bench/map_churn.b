@@ -4,8 +4,8 @@ import std.os
 
 fn main() {
     let args: List<string> = os.args()
-    let n: int = if args.len() > 0 { args[0].to_int().or(10_000_000) } else { 10_000_000 }
-    let seed: int = if args.len() > 1 { args[1].to_int().or(1) } else { 1 }
+    let n: int = args.get(0).or("").to_int().or(10_000_000)
+    let seed: int = args.get(1).or("").to_int().or(1)
     let keys: int = n / 4 + 1
     var values: Map<int, int> = {}
     values.reserve(keys)

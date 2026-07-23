@@ -4,15 +4,17 @@ pub class Money {
     pub amount: decimal
     pub currency: string = "USD"
 
-    pub fn new(amount: decimal) -> Money {
-        return Money { amount: amount }
+    pub fn init(amount: decimal) {
+        self.amount = amount
     }
 
-    pub fn add(self, other: Money) -> Money {
-        return Money { amount: self.amount + other.amount, currency: self.currency }
+    pub fn add(other: Money) -> Money {
+        let result: Money = new Money(self.amount + other.amount)
+        result.currency = self.currency
+        return result
     }
 
-    pub fn show(self) -> string {
+    pub fn show() -> string {
         return "{self.currency} {self.amount}"
     }
 }
@@ -27,5 +29,5 @@ pub fn total(xs: List<Money>) -> Money {
     for m: Money in xs {
         sum = sum + m.amount
     }
-    return Money.new(sum)
+    return new Money(sum)
 }

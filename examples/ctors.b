@@ -9,18 +9,18 @@ class Res {
     tag: string
     n: int = 0
 
-    pub fn init(self, tag: string) {
+    pub fn init(tag: string) {
         let t: string = tag           // locals are fine before fields
         self.tag = t
         self.n = self.n + 100         // defaults are already assigned
         io.println("open {self.tag}({self.n})")
     }
 
-    fn deinit(self) {
+    fn deinit() {
         io.println("close {self.tag}")
     }
 
-    fn touch(self) {
+    fn touch() {
         self.n = self.n + 1
     }
 }
@@ -28,25 +28,25 @@ class Res {
 // a static factory stays the fallible-construction pattern
 class Port {
     num: int
-    fn init(self, num: int) { self.num = num }
-    fn deinit(self) { io.println("port {self.num} released") }
+    fn init(num: int) { self.num = num }
+    fn deinit() { io.println("port {self.num} released") }
 
-    fn checked(n: int) -> Result<Port> {
+    static fn checked(n: int) -> Result<Port> {
         if n < 1 {
             return err("bad port {n}")
         }
-        return ok(Port(n))
+        return ok(new Port(n))
     }
 }
 
 // deinit chains: subclass first, then parent — no override, ever
 class Parent {
-    a: Res = Res("parent-field")
-    fn deinit(self) { io.println("parent down") }
+    a: Res = new Res("parent-field")
+    fn deinit() { io.println("parent down") }
 }
 
-class Child : Parent {
-    fn deinit(self) {
+class Child extends Parent {
+    fn deinit() {
         if true {
             return                    // early return still chains to Parent
         }
@@ -56,24 +56,24 @@ class Child : Parent {
 // generic class with both hooks
 class OwnedBox<T> {
     item: T
-    fn init(self, item: T) { self.item = item }
-    fn deinit(self) { io.println("box down") }
+    fn init(item: T) { self.item = item }
+    fn deinit() { io.println("box down") }
 }
 
 // a cycle never reaches zero by itself, so deinit is skipped on both sides
 class Ring {
     name: string
     next: Option<Ring> = none
-    fn init(self, name: string) { self.name = name }
-    fn deinit(self) { io.println("ring {self.name} down (acyclic only)") }
+    fn init(name: string) { self.name = name }
+    fn deinit() { io.println("ring {self.name} down (acyclic only)") }
 }
 
 fn scopes_and_reassign() {
     io.println("-- scopes --")
-    let first: Res = Res("first")
-    let second: Res = Res("second")
-    var v: Res = Res("old")
-    v = Res("new")                    // "old" dies right here
+    let first: Res = new Res("first")
+    let second: Res = new Res("second")
+    var v: Res = new Res("old")
+    v = new Res("new")                    // "old" dies right here
     v.touch()
     io.println("frame ends")          // then: new, second, first (newest-first)
 }
@@ -81,30 +81,30 @@ fn scopes_and_reassign() {
 fn containers() {
     io.println("-- containers --")
     var xs: List<Res> = []
-    xs.push(Res("L0"))
-    xs.push(Res("L1"))
+    xs.push(new Res("L0"))
+    xs.push(new Res("L1"))
     xs.clear()                        // back to front: L1 then L0
-    Res("temp")                       // statement temp dies at statement end
+    new Res("temp")                       // statement temp dies at statement end
     var m: Map<int, Res> = {}
-    m[1] = Res("V1")
-    m[2] = Res("V2")
-    m[1] = Res("V1b")                 // overwrite kills V1 now
+    m[1] = new Res("V1")
+    m[2] = new Res("V2")
+    m[1] = new Res("V1b")                 // overwrite kills V1 now
     let had: bool = m.remove(2)       // V2 dies
     io.println("removed {had}")
     io.println("map ends")            // clear order at frame end: V1b last in
-    let some_leaf: Option<Res> = some(Res("wrapped"))
+    let some_leaf: Option<Res> = some(new Res("wrapped"))
     io.println("option ends")         // the some-box cascade frees "wrapped"
 }
 
 fn inheritance() {
     io.println("-- inheritance --")
-    let c: Child = Child {}           // Parent has no init, raw form is fine
+    let c: Child = new Child()           // Parent has no init, raw form is fine
     io.println("child built")         // child deinit, parent deinit, then field
 }
 
 fn generics() {
     io.println("-- generics --")
-    let b: OwnedBox<Res> = OwnedBox(Res("boxed"))
+    let b: OwnedBox<Res> = new OwnedBox(new Res("boxed"))
     io.println("box built")           // box down, then close boxed
 }
 
@@ -114,42 +114,42 @@ fn generics() {
 // for the order).
 class Animal {
     name: string
-    fn init(self, name: string) {
+    fn init(name: string) {
         self.name = name
         io.println("animal init hears: {self.loud()}")
     }
-    fn loud(self) -> string { return self.name }
-    fn deinit(self) { io.println("animal down") }
+    fn loud() -> string { return self.name }
+    fn deinit() { io.println("animal down") }
 }
 
-class Dog : Animal {
+class Dog extends Animal {
     breed: string
-    fn init(self, breed: string, name: string) {
+    fn init(breed: string, name: string) {
         self.breed = breed            // own field, before super.init
         super.init(name)              // parent's turn — exactly once
         io.println("dog built: {self.name} the {self.breed}")
     }
-    override fn loud(self) -> string { return "{self.breed}!" }
-    fn deinit(self) { io.println("dog down") }
+    override fn loud() -> string { return "{self.breed}!" }
+    fn deinit() { io.println("dog down") }
 }
 
 // adds no required fields, so Dog's constructor is inherited
-class Pup : Dog {
+class Pup extends Dog {
     treats: int = 3
 }
 
 fn supers() {
     io.println("-- super.init --")
-    let d: Dog = Dog("corgi", "rex")
+    let d: Dog = new Dog("corgi", "rex")
     io.println(d.loud())
-    let p: Pup = Pup("lab", "sam")    // Pup(args) runs Dog's init
+    let p: Pup = new Pup("lab", "sam")    // new Pup(args) runs Dog's init
     io.println("pup {p.name} gets {p.treats}")
 }                                     // deinits chain: dog down, animal down — twice
 
 fn threads() {
     io.println("-- threads --")
     let t: Thread<int> = thread.spawn(fn() -> int {
-        let worker_res: Res = Res("on-worker")
+        let worker_res: Res = new Res("on-worker")
         worker_res.touch()
         return worker_res.n           // "on-worker" closes on the worker thread
     })
@@ -159,8 +159,8 @@ fn threads() {
 
 fn cycles() {
     io.println("-- cycles --")
-    var a: Ring = Ring("a")
-    var b: Ring = Ring("b")
+    var a: Ring = new Ring("a")
+    var b: Ring = new Ring("b")
     a.next = some(b)
     b.next = some(a)                  // rc never hits zero: no deinit, ever
     io.println("ring linked")
@@ -168,7 +168,7 @@ fn cycles() {
 
 fn defers() {
     io.println("-- defers --")
-    let r: Res = Res("deferred-owner")
+    let r: Res = new Res("deferred-owner")
     defer io.println("defer ran")     // defers first, then the frame releases
     io.println("body done")
 }

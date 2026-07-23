@@ -6,17 +6,22 @@ import std.os
 class P {
     a: int = 0
     b: int = 0
+
+    fn init(a: int, b: int) {
+        self.a = a
+        self.b = b
+    }
 }
 
 fn main() {
     let args: List<string> = os.args()
-    let n: int = if args.len() > 0 { args[0].to_int().or(5_000_000) } else { 5_000_000 }
-    let seed: int = if args.len() > 1 { args[1].to_int().or(1) } else { 1 }
+    let n: int = args.get(0).or("").to_int().or(5_000_000)
+    let seed: int = args.get(1).or("").to_int().or(1)
     var keep: List<P> = []
     keep.reserve(n / 1000 + 1)
     var sum: int = 0
     for i: int in 0..n {
-        var p: P = P { a: i + seed, b: i + seed + 1 }
+        var p: P = new P(i + seed, i + seed + 1)
         var q: P = p
         sum += q.a + p.b
         if i % 1000 == 0 {

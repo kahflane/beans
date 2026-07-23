@@ -721,8 +721,16 @@ const ClassDecl* Interp::find_class(const std::string& name) const {
 }
 
 // parents as qualified keys (the checker pinned them); raw names as fallback
-static const std::vector<std::string>& supers_of(const ClassDecl* c) {
-    return c->supers_resolved.empty() ? c->supers : c->supers_resolved;
+static std::vector<std::string> supers_of(const ClassDecl* c) {
+    std::vector<std::string> out;
+    std::string base = c->base_resolved.empty() ? c->base : c->base_resolved;
+    if (!base.empty()) out.push_back(std::move(base));
+    const std::vector<std::string>& interfaces =
+        c->interfaces_resolved.size() == c->interfaces.size()
+            ? c->interfaces_resolved
+            : c->interfaces;
+    out.insert(out.end(), interfaces.begin(), interfaces.end());
+    return out;
 }
 
 const FnDecl* Interp::find_method(const ClassDecl* cls, const std::string& name,
@@ -850,12 +858,8 @@ Value Interp::make_instance(const ClassDecl* cls,
 // ---- init / deinit ----------------------------------------------------------
 
 const ClassDecl* Interp::parent_of(const ClassDecl* c) const {
-    const std::vector<std::string>& sup =
-        c->supers_resolved.size() == c->supers.size() ? c->supers_resolved : c->supers;
-    for (const std::string& s : sup) {
-        const ClassDecl* p = find_class(s);
-        if (p && !p->is_interface) return p;
-    }
+    std::string name = c->base_resolved.empty() ? c->base : c->base_resolved;
+    if (!name.empty()) return find_class(name);
     return nullptr;
 }
 
@@ -883,7 +887,7 @@ Value Interp::construct(const ClassDecl* cls, const Expr* e, std::shared_ptr<Env
             if (m.has_self && m.name == "init") { ini = &m; owner = k; }
         }
     }
-    if (!ini) panic(e, "'" + cls->name + "' has no init"); // checker stops this earlier
+    if (!ini) return make_instance(cls, {}, env); // compiler-provided init()
     std::vector<Value> args;
     for (size_t i = 0; i < e->args.size(); i++) {
         Hint h = i < ini->params.size() ? Hint::of(ini->params[i].type.get()) : Hint();
@@ -892,6 +896,73 @@ Value Interp::construct(const ClassDecl* cls, const Expr* e, std::shared_ptr<Env
     Value v = make_instance(cls, {}, env); // cls, not owner: the child's layout
     call_fn(ini, &v, std::move(args), pkg_of(owner->qualname));
     return v;
+}
+
+Value Interp::eval_new(const Expr* e, std::shared_ptr<Env>& env, Hint hint) {
+    if (!e->resolved.empty()) {
+        if (const ClassDecl* cls = find_class(e->resolved)) return construct(cls, e, env);
+    }
+    if (const ClassDecl* cls = find_class(e->name)) return construct(cls, e, env);
+    if (const ClassDecl* cls = find_class(qual(e->name))) return construct(cls, e, env);
+
+    const TypeRef* inner = !e->type_args.empty() ? e->type_args[0].get() : hint.arg(0);
+    if (e->name == "Arena") {
+        Value cap = eval(e->args[0].get(), env);
+        if (cap.i < 0) panic(e, "negative arena capacity " + std::to_string(cap.i));
+        if (cap.i > (1LL << 58)) panic(e, "arena capacity too large");
+        Value v;
+        v.k = Value::K::arena;
+        v.arena = std::make_shared<ArenaVal>();
+        v.arena->values.reserve(static_cast<size_t>(cap.i));
+        return v;
+    }
+    if (e->name == "Box") {
+        Value v;
+        v.k = Value::K::box;
+        v.box = std::make_shared<BoxVal>();
+        v.box->inner = eval(e->args[0].get(), env, Hint::of(inner));
+        return v;
+    }
+    if (e->name == "Shared") {
+        Value v;
+        v.k = Value::K::shared;
+        v.shared = std::make_shared<SharedVal>();
+        v.shared->inner = eval(e->args[0].get(), env, Hint::of(inner));
+        return v;
+    }
+    if (e->name == "Mutex") {
+        Value value = eval(e->args[0].get(), env, Hint::of(inner));
+        Value v;
+        v.k = Value::K::mutex;
+        v.mutex = std::make_shared<MutexVal>();
+        v.mutex->inner = std::make_shared<Value>(std::move(value));
+        return v;
+    }
+    if (e->name == "Channel") {
+        Value cap = eval(e->args[0].get(), env);
+        Value v;
+        v.k = Value::K::channel;
+        v.chan = std::make_shared<ChannelVal>();
+        v.chan->cap = cap.i > 0 ? static_cast<size_t>(cap.i) : 1;
+        return v;
+    }
+    if (e->name == "AtomicInt") {
+        Value initial = eval(e->args[0].get(), env);
+        Value v;
+        v.k = Value::K::atomic;
+        v.atomic = std::make_shared<AtomicVal>();
+        v.atomic->v = initial.i;
+        return v;
+    }
+    if (e->name == "Bytes") {
+        for (const BuiltinConstructor& builtin : builtin_constructors()) {
+            if (std::string(builtin.cls) != "Bytes") continue;
+            std::vector<Value> args;
+            args.push_back(eval(e->args[0].get(), env));
+            return builtin.run(e->line, e->col, args);
+        }
+    }
+    panic(e, "cannot build '" + e->name + "'");
 }
 
 void Interp::run_deinit(InstanceVal* inst) {
@@ -1607,7 +1678,7 @@ Value Interp::eval(const Expr* e, std::shared_ptr<Env>& env, Hint hint) {
                 out.inout_ref = env->find(std::string(e->rhs->text));
                 return out;
             }
-            if (e->op == TokenKind::kw_take) {
+            if (e->op == TokenKind::kw_move) {
                 Value* slot = env->find(std::string(e->rhs->text));
                 Value moved = std::move(*slot);
                 *slot = Value::unit();
@@ -1651,6 +1722,8 @@ Value Interp::eval(const Expr* e, std::shared_ptr<Env>& env, Hint hint) {
             v.range->inclusive = e->inclusive;
             return v;
         }
+        case Expr::Kind::new_:
+            return eval_new(e, env, hint);
         case Expr::Kind::call:
             return eval_call(e, env, hint);
         case Expr::Kind::field: {
@@ -2099,8 +2172,13 @@ Value Interp::eval_call(const Expr* e, std::shared_ptr<Env>& env, Hint hint) {
             if (name == "ok") {
                 x.en->payload.push_back(eval(e->args[0].get(), env, Hint::of(hint.arg(0))));
             } else {
-                Value arg = eval(e->args[0].get(), env);
-                if (arg.k == Value::K::string_) arg = make_err(*arg.s);
+                const TypeRef* error_hint = hint.arg(1);
+                Value arg = eval(e->args[0].get(), env, Hint::of(error_hint));
+                bool default_error = !error_hint ||
+                                     (error_hint->kind == TypeRef::Kind::named &&
+                                      error_hint->name == "Error");
+                if (default_error && arg.k == Value::K::string_)
+                    arg = make_err(*arg.s);
                 x.en->payload.push_back(std::move(arg));
             }
             return x;
@@ -2322,54 +2400,6 @@ Value Interp::eval_call(const Expr* e, std::shared_ptr<Env>& env, Hint hint) {
                 if (mname == "null") return value;
             }
 
-            if (n == "Arena" && mname == "new") {
-                Value cap = eval(e->args[0].get(), env);
-                if (cap.i < 0) panic(e, "negative arena capacity " + std::to_string(cap.i));
-                if (cap.i > (1LL << 58)) panic(e, "arena capacity too large");
-                Value v;
-                v.k = Value::K::arena;
-                v.arena = std::make_shared<ArenaVal>();
-                v.arena->values.reserve(static_cast<size_t>(cap.i));
-                return v;
-            }
-            if (n == "Box" && mname == "new") {
-                Value v;
-                v.k = Value::K::box;
-                v.box = std::make_shared<BoxVal>();
-                v.box->inner = eval(e->args[0].get(), env, Hint::of(hint.arg(0)));
-                return v;
-            }
-            if (n == "Shared" && mname == "new") {
-                Value v;
-                v.k = Value::K::shared;
-                v.shared = std::make_shared<SharedVal>();
-                v.shared->inner = eval(e->args[0].get(), env, Hint::of(hint.arg(0)));
-                return v;
-            }
-            if (n == "Mutex" && mname == "new") {
-                Value inner = eval(e->args[0].get(), env, Hint::of(hint.arg(0)));
-                Value v;
-                v.k = Value::K::mutex;
-                v.mutex = std::make_shared<MutexVal>();
-                v.mutex->inner = std::make_shared<Value>(std::move(inner));
-                return v;
-            }
-            if (n == "Channel" && mname == "new") {
-                Value cap = eval(e->args[0].get(), env);
-                Value v;
-                v.k = Value::K::channel;
-                v.chan = std::make_shared<ChannelVal>();
-                v.chan->cap = cap.i > 0 ? static_cast<size_t>(cap.i) : 1;
-                return v;
-            }
-            if (n == "AtomicInt" && mname == "new") {
-                Value init = eval(e->args[0].get(), env);
-                Value v;
-                v.k = Value::K::atomic;
-                v.atomic = std::make_shared<AtomicVal>();
-                v.atomic->v = init.i;
-                return v;
-            }
             if (n == "Bytes" || n == "File" || n == "Dir" || n == "MMap") {
                 for (const BuiltinStatic& b : builtin_statics()) {
                     if (n == b.cls && mname == b.name) {
@@ -2395,7 +2425,7 @@ Value Interp::eval_call(const Expr* e, std::shared_ptr<Env>& env, Hint hint) {
             }
         }
 
-        // `util.Payment.card(...)` / `util.User.new(...)` — the receiver is a
+        // `util.Payment.card(...)` / `util.User.named_static(...)` — the receiver is a
         // field expression the checker resolved to a type
         if (obj->kind == Expr::Kind::field && !obj->resolved.empty()) {
             if (const EnumDecl* ed = resolve_enum(obj, "")) {
@@ -2916,6 +2946,39 @@ Value Interp::eval_builtin_method(const Expr* e, Value& recv, const std::string&
         case Value::K::enum_v: {
             const std::string& variant = recv.en->variant;
             bool has = variant == "some" || variant == "ok";
+            auto invoke = [&](Value function, Value argument) {
+                if (function.k == Value::K::closure)
+                    return call_closure(*function.clo, {std::move(argument)});
+                if (function.k == Value::K::fn_ref)
+                    return call_fn(function.fnr->decl, nullptr, {std::move(argument)},
+                                   pkg_of(function.fnr->decl->qualname));
+                panic(e, "not callable");
+            };
+            if (name == "map") {
+                if (!has || recv.en->payload.empty()) return recv;
+                Value mapped = invoke(args[0], recv.en->payload[0]);
+                Value out;
+                out.k = Value::K::enum_v;
+                out.en = std::make_shared<EnumVal>();
+                out.en->enum_name = recv.en->enum_name;
+                out.en->variant = variant;
+                out.en->payload.push_back(std::move(mapped));
+                return out;
+            }
+            if (name == "and_then") {
+                if (!has || recv.en->payload.empty()) return recv;
+                return invoke(args[0], recv.en->payload[0]);
+            }
+            if (name == "filter") {
+                if (variant != "some" || recv.en->payload.empty()) return recv;
+                return invoke(args[0], recv.en->payload[0]).b ? recv : none();
+            }
+            if (name == "recover") {
+                if (variant == "ok" && !recv.en->payload.empty())
+                    return recv.en->payload[0];
+                if (variant == "err" && !recv.en->payload.empty())
+                    return invoke(args[0], recv.en->payload[0]);
+            }
             if (name == "or") {
                 if (has && !recv.en->payload.empty()) return recv.en->payload[0];
                 return args[0];

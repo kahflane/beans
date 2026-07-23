@@ -12,32 +12,28 @@ struct Plain {
     value: i32
 }
 
-@c_layout
-struct BadNested {
+extern "C" struct BadNested {
     value: Plain
 }
 
-@c_layout
-struct Recursive {
+extern "C" struct Recursive {
     next: Recursive
 }
 
-@c_layout
-struct RecursiveArray {
+extern "C" struct RecursiveArray {
     next: [RecursiveArray; 1]
 }
 
-struct Child : Plain {
+struct Child extends Plain {
     other: i32
 }
 
 struct WithMethod {
     value: i32
-    fn get(self) -> i32 { return self.value }
+    fn get() -> i32 { return self.value }
 }
 
-@c_layout
-struct Packet {
+extern "C" struct Packet {
     value: i32
 }
 

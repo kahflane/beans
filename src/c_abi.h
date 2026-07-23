@@ -26,7 +26,7 @@ struct CAbiText {
 using CAbiRecordLookup =
     std::function<const ClassDecl*(const TypeRef*)>;
 
-// Recreate a checked @c_layout signature as C source. Clang then owns the
+// Recreate a checked extern "C" layout signature as C source. Clang then owns the
 // target-specific aggregate ABI classification in both native wrappers and
 // interpreter trampolines.
 CAbiText describe_c_abi(const FnDecl& function,

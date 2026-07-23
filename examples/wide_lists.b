@@ -13,6 +13,8 @@ struct Event {
 
 class Holder {
     event: Event
+
+    fn init(event: Event) { self.event = event }
 }
 
 fn singleton<T>(value: T) -> List<T> {
@@ -75,7 +77,7 @@ fn main() {
     event.label = label(2)
     var events: List<Event> = [event_copy]
     events.push(event)
-    let holder: Holder = Holder { event: events[0] }
+    let holder: Holder = new Holder(events[0])
     let cloned_events: List<Event> = events.clone()
     events[0] = Event { user: 8, label: label(3), value: 50 }
     events.clear()

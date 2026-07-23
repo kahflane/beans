@@ -9,19 +9,22 @@ class KV {
     pub dir: string = ""
     pub path: string = ""
 
-    pub fn open_in(dir: string) -> Result<KV> {
+    pub static fn open_in(dir: string) -> Result<KV> {
         Dir.make_all(dir)?
-        return ok(KV { dir: dir, path: "{dir}/kv.dat" })
+        let store: KV = new KV()
+        store.dir = dir
+        store.path = "{dir}/kv.dat"
+        return ok(store)
     }
 
-    pub fn set(self, key: string, value: string) -> Result<int> {
-        var rec: Bytes = Bytes.new(8)
+    pub fn set(key: string, value: string) -> Result<int> {
+        var rec: Bytes = new Bytes(8)
         rec.put_u32(0, key.len()).put_u32(4, value.len())
         rec.append_str(key).append_str(value)
         return fs.append_bytes(self.path, rec)
     }
 
-    pub fn get(self, key: string) -> Result<string> {
+    pub fn get(key: string) -> Result<string> {
         let data: Bytes = fs.read_bytes(self.path)?
         var found: string = ""
         var have: bool = false
@@ -47,12 +50,12 @@ class KV {
         return err("key '{key}' not found")
     }
 
-    pub fn size(self) -> Result<int> {
+    pub fn size() -> Result<int> {
         return File.size(self.path)
     }
 
     // rewrite keeping only the last value per key, then commit durably
-    pub fn compact(self) -> Result<int> {
+    pub fn compact() -> Result<int> {
         let data: Bytes = fs.read_bytes(self.path)?
         var names: List<string> = []
         var latest: Map<string, string> = {}
@@ -73,12 +76,12 @@ class KV {
             pos = pos + 8 + kl + vl
         }
 
-        var out: Bytes = Bytes.new(0)
+        var out: Bytes = new Bytes(0)
         var i: int = 0
         for i < names.len() {
             let k: string = names[i]
             let v: string = latest[k]
-            var rec: Bytes = Bytes.new(8)
+            var rec: Bytes = new Bytes(8)
             rec.put_u32(0, k.len()).put_u32(4, v.len())
             rec.append_str(k).append_str(v)
             out.append(rec)
@@ -123,7 +126,7 @@ fn main() {
     // simulate a crash mid-append: a full 8-byte header claiming a 100+100
     // byte key/value that never got written. get/compact must treat this torn
     // tail as EOF, not slice past the end and panic.
-    var torn: Bytes = Bytes.new(8)
+    var torn: Bytes = new Bytes(8)
     torn.put_u32(0, 100).put_u32(4, 100)
     fs.append_bytes(kv.path, torn).expect("torn append")
     io.println(kv.get("name").expect("survives torn tail"))

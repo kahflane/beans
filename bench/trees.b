@@ -9,10 +9,12 @@ class Node {
     left: Option<Node> = none
     right: Option<Node> = none
     value: int = 0
+
+    fn init(value: int) { self.value = value }
 }
 
 fn build(depth: int, seed: int) -> Node {
-    var n: Node = Node { value: depth + seed }
+    var n: Node = new Node(depth + seed)
     if depth > 0 {
         n.left = some(build(depth - 1, seed))
         n.right = some(build(depth - 1, seed))
@@ -35,8 +37,8 @@ fn count(n: Node) -> int {
 
 fn main() {
     let args: List<string> = os.args()
-    let max_depth: int = if args.len() > 0 { args[0].to_int().or(16) } else { 16 }
-    let seed: int = if args.len() > 1 { args[1].to_int().or(1) } else { 1 }
+    let max_depth: int = args.get(0).or("").to_int().or(16)
+    let seed: int = args.get(1).or("").to_int().or(1)
     let long_lived: Node = build(max_depth, seed) // stays alive to the very end
     var total: int = 0
 

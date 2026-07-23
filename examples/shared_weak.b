@@ -5,11 +5,13 @@ import std.thread
 class Token {
     value: int
 
-    fn deinit(self) { io.println("drop {self.value}") }
+    fn init(value: int) { self.value = value }
+
+    fn deinit() { io.println("drop {self.value}") }
 }
 
 fn build_weak() -> Weak<string> {
-    let shared: Shared<string> = Shared.new("beans")
+    let shared: Shared<string> = new Shared("beans")
     let alias: Shared<string> = shared
     let weak: Weak<string> = shared.downgrade()
     io.println("{shared.get()} {alias.get()} {weak.expired()}")
@@ -18,7 +20,7 @@ fn build_weak() -> Weak<string> {
 }
 
 fn build_dead_token() -> Weak<Token> {
-    let shared: Shared<Token> = Shared.new(Token { value: 7 })
+    let shared: Shared<Token> = new Shared(new Token(7))
     return shared.downgrade()
 }
 
@@ -29,11 +31,11 @@ fn main() {
     let dead: Weak<Token> = build_dead_token()
     io.println("{dead.expired()} {dead.upgrade().is_none()}")
 
-    let amount: Shared<decimal> = Shared.new(19.99)
+    let amount: Shared<decimal> = new Shared(19.99)
     let amount_weak: Weak<decimal> = amount.downgrade()
     io.println("{amount.get() + 0.01} {amount_weak.upgrade().expect("amount").get()}")
 
-    let number: Shared<int> = Shared.new(41)
+    let number: Shared<int> = new Shared(41)
     let worker: Thread<int> = thread.spawn(fn() -> int { return number.get() + 1 })
     io.println(worker.join())
 }

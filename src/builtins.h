@@ -58,6 +58,15 @@ struct BuiltinStatic {
     Value (*run)(uint32_t line, uint32_t col, std::vector<Value>& args);
 };
 
+struct BuiltinConstructor {
+    const char* cls;
+    std::vector<BT> params;
+    BT ret;
+    const char* sym;
+    bool panics;
+    Value (*run)(uint32_t line, uint32_t col, std::vector<Value>& args);
+};
+
 // module-level std functions ("std.os" and friends); println/eprintln stay
 // special — they take any printable
 struct BuiltinFn {
@@ -71,6 +80,7 @@ struct BuiltinFn {
 };
 
 const std::vector<BuiltinMethod>& builtin_methods();
+const std::vector<BuiltinConstructor>& builtin_constructors();
 const std::vector<BuiltinStatic>& builtin_statics();
 const std::vector<BuiltinFn>& builtin_fns();
 

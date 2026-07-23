@@ -9,17 +9,17 @@ pub class Reader {
     offset: int
     eof: bool
 
-    pub fn init(self, file: File) {
+    pub fn init(file: File) {
         self.file = file
-        self.buffer = Bytes.new(0)
+        self.buffer = new Bytes(0)
         self.position = 0
         self.limit = 0
         self.offset = 0
         self.eof = false
     }
 
-    pub fn read_line(self) -> Result<Option<string>> {
-        var output: Bytes = Bytes.new(0)
+    pub fn read_line() -> Result<Option<string>> {
+        var output: Bytes = new Bytes(0)
         for true {
             if self.position == self.limit {
                 if self.eof {
@@ -35,7 +35,7 @@ pub class Reader {
                 self.offset += next.len()
                 self.position = 0
                 self.limit = next.len()
-                self.buffer = take next
+                self.buffer = move next
             }
 
             var end: int = self.position

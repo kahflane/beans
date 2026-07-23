@@ -401,8 +401,16 @@ struct CG2 {
         size_t dot = qualname.find('.');
         return dot == std::string::npos ? "" : qualname.substr(0, dot);
     }
-    static const std::vector<std::string>& supers_of(const ClassDecl* c) {
-        return c->supers_resolved.empty() ? c->supers : c->supers_resolved;
+    static std::vector<std::string> supers_of(const ClassDecl* c) {
+        std::vector<std::string> out;
+        std::string base = c->base_resolved.empty() ? c->base : c->base_resolved;
+        if (!base.empty()) out.push_back(std::move(base));
+        const std::vector<std::string>& interfaces =
+            c->interfaces_resolved.size() == c->interfaces.size()
+                ? c->interfaces_resolved
+                : c->interfaces;
+        out.insert(out.end(), interfaces.begin(), interfaces.end());
+        return out;
     }
     std::string binding_path(const std::string& binding) const {
         auto pit = pkg_imports.find(cur_pkg);
@@ -2207,6 +2215,9 @@ struct FreeVars {
                 expr(e->callee.get());
                 for (const ExprPtr& a : e->args) expr(a.get());
                 break;
+            case Expr::Kind::new_:
+                for (const ExprPtr& a : e->args) expr(a.get());
+                break;
             case Expr::Kind::field:
                 expr(e->object.get());
                 break;
@@ -2294,7 +2305,7 @@ struct ClosureScan {
     }
     void expr(const Expr* e) {
         if (!e) return;
-        if (e->kind == Expr::Kind::unary && e->op == TokenKind::kw_take && e->rhs &&
+        if (e->kind == Expr::Kind::unary && e->op == TokenKind::kw_move && e->rhs &&
             e->rhs->kind == Expr::Kind::ident) {
             taken.insert(std::string(e->rhs->text));
         }
@@ -3674,14 +3685,14 @@ struct FnEmit {
                     }
                     return {var_ptr(var), var->ty};
                 }
-                if (e->op == TokenKind::kw_take) {
+                if (e->op == TokenKind::kw_move) {
                     if (!e->rhs || e->rhs->kind != Expr::Kind::ident) {
-                        err(e, "take here");
+                        err(e, "move here");
                         return {"0", cg.t_i64()};
                     }
                     Var* var = find_var(std::string(e->rhs->text));
                     if (!var) {
-                        err(e, "taking this local");
+                        err(e, "moving this local");
                         return {"0", cg.t_i64()};
                     }
                     std::string value = var_read(var);
@@ -3730,6 +3741,8 @@ struct FnEmit {
             case Expr::Kind::range:
                 err(e, "a range outside a for loop");
                 return {"0", cg.t_i64()};
+            case Expr::Kind::new_:
+                return eval_new(e, hint);
             case Expr::Kind::call:
                 return eval_call(e, hint);
             case Expr::Kind::field:
@@ -4104,6 +4117,12 @@ struct FnEmit {
             args.push_back(eval(e->args[i].get(), h));
         }
         Ty* ret = fty->fn_ret() ? fty->fn_ret() : cg.t_unit();
+        std::string fp = load_at(fnv.first, 0, cg.t_str());
+        return emit_call(fp, ret, args_text(args, fnv.first));
+    }
+
+    EV call_fn_value_with(const EV& fnv, std::vector<EV> args) {
+        Ty* ret = fnv.second->fn_ret() ? fnv.second->fn_ret() : cg.t_unit();
         std::string fp = load_at(fnv.first, 0, cg.t_str());
         return emit_call(fp, ret, args_text(args, fnv.first));
     }
@@ -5228,13 +5247,174 @@ struct FnEmit {
         line("store i64 " + rcn + ", ptr " + rcp);
     }
 
-    // ClassName(args): fresh object — defaults in, the rest zero, which the
+    EV eval_new(const Expr* e, Ty* hint) {
+        auto explicit_inner = [&]() -> Ty* {
+            if (e->type_args.size() == 1)
+                return cg.resolve(e->type_args[0].get(), env, e->line, e->col);
+            return nullptr;
+        };
+
+        std::string key = e->resolved.empty() ? cg.qual(e->name) : e->resolved;
+        auto class_it = cg.class_decls.find(key);
+        if (class_it == cg.class_decls.end() && e->resolved.empty())
+            class_it = cg.class_decls.find(e->name);
+        if (class_it != cg.class_decls.end())
+            return eval_ctor(e, class_it->second, hint);
+
+        if (e->name == "Arena") {
+            EV cap = eval(e->args[0].get(), cg.t_i64());
+            Ty* inner = explicit_inner();
+            if (!inner && hint && hint->k == Ty::arena_) inner = hint->args[0];
+            if (!inner) inner = cg.t_i64();
+            std::string r = reg();
+            if (uses_typed_owned_storage(inner)) {
+                if (has_owned_refs(inner) && !pointer_mask_fits(inner))
+                    cg.err(e->line, e->col,
+                           "arena element ARC layout exceeds runtime metadata capacity");
+                line(r + " = call ptr @beans_arena_new_typed(i64 " + cap.first +
+                     ", i64 " + std::to_string(CG2::value_size(inner)) +
+                     ", i64 " + std::to_string(pointer_mask(inner)) +
+                     ", i64 " + std::to_string(cycle_pointer_mask(inner)) +
+                     ", i64 " + std::to_string(e->line) + ", i64 " +
+                     std::to_string(e->col) + ")");
+            } else {
+                line(r + " = call ptr @beans_arena_new(i64 " + cap.first +
+                     ", i64 " + std::string(is_slot_rc(inner) ? "1" : "0") +
+                     ", i64 " + std::to_string(e->line) + ", i64 " +
+                     std::to_string(e->col) + ")");
+            }
+            Ty* result = cg.t_arena(inner);
+            own(r, result);
+            return {r, result};
+        }
+        if (e->name == "Box" || e->name == "Shared" || e->name == "Mutex") {
+            Ty* inner = explicit_inner();
+            if (!inner && hint) {
+                if (e->name == "Box" && hint->k == Ty::box_) inner = hint->args[0];
+                if (e->name == "Shared" && hint->k == Ty::shared_) inner = hint->args[0];
+                if (e->name == "Mutex" && hint->k == Ty::mutex_) inner = hint->args[0];
+            }
+            EV value = eval(e->args[0].get(), inner);
+            Ty* value_type = inner ? inner : value.second;
+            transfer_in(value);
+            std::string r = reg();
+            if (e->name == "Box") {
+                if (uses_typed_owned_storage(value_type)) {
+                    if (has_owned_refs(value_type) && !pointer_mask_fits(value_type))
+                        cg.err(e->line, e->col,
+                               "box value ARC layout exceeds runtime metadata capacity");
+                    std::string slot = spill_list_element(value, "box.value");
+                    line(r + " = call ptr @beans_box_new_typed(ptr " + slot +
+                         ", i64 " + std::to_string(CG2::value_size(value_type)) +
+                         ", i64 " + std::to_string(pointer_mask(value_type)) +
+                         ", i64 " + std::to_string(cycle_pointer_mask(value_type)) +
+                         ")");
+                } else {
+                    line(r + " = call ptr @beans_box_new(i64 " + to_slot(value, true) +
+                         ", i64 " + std::string(is_slot_rc(value_type) ? "1" : "0") +
+                         ")");
+                }
+                Ty* result = cg.t_box(value_type);
+                own(r, result);
+                return {r, result};
+            }
+            if (e->name == "Shared") {
+                if (is_typed_list_element(value_type)) {
+                    if (has_owned_refs(value_type) && !pointer_mask_fits(value_type))
+                        cg.err(e->line, e->col,
+                               "shared value ARC layout exceeds runtime metadata capacity");
+                    std::string slot = spill_list_element(value, "shared.value");
+                    line(r + " = call ptr @beans_shared_new_typed(ptr " + slot +
+                         ", i64 " + std::to_string(CG2::value_size(value_type)) +
+                         ", i64 " + std::to_string(pointer_mask(value_type)) + ")");
+                } else {
+                    line(r + " = call ptr @beans_shared_new(i64 " +
+                         to_slot(value, true) + ", i64 " +
+                         std::string(is_slot_rc(value_type) ? "1" : "0") + ")");
+                }
+                Ty* result = cg.t_shared(value_type);
+                own(r, result);
+                return {r, result};
+            }
+            if (is_typed_list_element(value_type)) {
+                if (has_owned_refs(value_type) && !pointer_mask_fits(value_type))
+                    cg.err(e->line, e->col,
+                           "mutex value ARC layout exceeds runtime metadata capacity");
+                std::string slot = spill_list_element(value, "mutex.value");
+                line(r + " = call ptr @beans_mutex_new_typed(ptr " + slot +
+                     ", i64 " + std::to_string(CG2::value_size(value_type)) +
+                     ", i64 " + std::to_string(pointer_mask(value_type)) + ")");
+            } else {
+                line(r + " = call ptr @beans_mutex_new(i64 " + to_slot(value, true) +
+                     ", i64 " + std::string(is_slot_rc(value_type) ? "1" : "0") +
+                     ")");
+            }
+            Ty* result = cg.t_kind1(Ty::mutex_, value_type);
+            own(r, result);
+            return {r, result};
+        }
+        if (e->name == "Channel") {
+            EV cap = eval(e->args[0].get(), cg.t_i64());
+            Ty* elem = explicit_inner();
+            if (!elem && hint && hint->k == Ty::chan_) elem = hint->args[0];
+            if (!elem) elem = cg.t_i64();
+            std::string r = reg();
+            if (is_typed_list_element(elem)) {
+                if (has_owned_refs(elem) && !pointer_mask_fits(elem))
+                    cg.err(e->line, e->col,
+                           "channel element ARC layout exceeds runtime metadata capacity");
+                line(r + " = call ptr @beans_chan_new_typed(i64 " + cap.first +
+                     ", i64 " + std::to_string(CG2::value_size(elem)) +
+                     ", i64 " + std::to_string(pointer_mask(elem)) + ")");
+            } else {
+                line(r + " = call ptr @beans_chan_new(i64 " + cap.first + ", i64 " +
+                     std::string(is_slot_rc(elem) ? "1" : "0") + ")");
+            }
+            Ty* result = cg.t_kind1(Ty::chan_, elem);
+            own(r, result);
+            return {r, result};
+        }
+        if (e->name == "AtomicInt") {
+            EV value = eval(e->args[0].get(), cg.t_i64());
+            std::string r = reg();
+            line(r + " = call ptr @beans_atomic_new(i64 " + value.first + ")");
+            own(r, cg.t_atomic());
+            return {r, cg.t_atomic()};
+        }
+        if (e->name == "Bytes") {
+            for (const BuiltinConstructor& builtin : builtin_constructors()) {
+                if (std::string(builtin.cls) != "Bytes") continue;
+                std::string args;
+                for (size_t i = 0; i < builtin.params.size(); i++) {
+                    Ty* parameter = bty(builtin.params[i]);
+                    EV argument = eval(e->args[i].get(), parameter);
+                    if (i) args += ", ";
+                    args += barg(argument, parameter);
+                }
+                if (builtin.panics) {
+                    if (!args.empty()) args += ", ";
+                    args += "i64 " + std::to_string(e->line) + ", i64 " +
+                            std::to_string(e->col);
+                }
+                return emit_bcall(builtin.sym, builtin.ret, args, nullptr, e);
+            }
+        }
+        err(e, "building '" + e->name + "'");
+        return {"null", cg.t_bad()};
+    }
+
+    // new Class(args): fresh object — defaults in, the rest zero, which the
     // checker proved init assigns before anything reads — then the init call.
     // Args are evaluated before the allocation, matching the interpreter.
     EV eval_ctor(const Expr* e, const ClassDecl* cd, Ty* hint) {
         CImpl* im = nullptr;
         if (cd->generics.empty()) {
             im = cg.request_impl(cd, {}, e->line, e->col);
+        } else if (e->type_args.size() == cd->generics.size()) {
+            std::vector<Ty*> args;
+            for (const TypePtr& arg : e->type_args)
+                args.push_back(cg.resolve(arg.get(), env, e->line, e->col));
+            im = cg.request_impl(cd, std::move(args), e->line, e->col);
         } else if (hint && (hint->k == Ty::obj_ || hint->k == Ty::struct_)) {
             auto it = cg.impl_by_name.find(hint->name);
             if (it != cg.impl_by_name.end()) im = it->second;
@@ -5248,12 +5428,13 @@ struct FnEmit {
                 if (m.has_self && m.name == "init") { ini = &m; owner = p; }
             }
         }
-        if (!im || !ini) {
+        if (!im) {
             err(e, "building this");
             return {"null", cg.t_bad()};
         }
 
-        std::vector<EV> args = eval_args(e, ini->params, owner->env);
+        std::vector<EV> args;
+        if (ini) args = eval_args(e, ini->params, owner->env);
 
         long long mask = 0;
         for (const CImpl::FieldInfo& f : im->fields) {
@@ -5274,13 +5455,16 @@ struct FnEmit {
             } else if (f.ty->k == Ty::i64_ || f.ty->k == Ty::i1_ ||
                        f.ty->k == Ty::dec_) {
                 store_at(o, f.offset, "0", f.ty);
-            } else {
+            } else if (is_rc(f.ty) || f.ty->k == Ty::rawptr_) {
                 store_at(o, f.offset, "null", f.ty);
+            } else {
+                store_at(o, f.offset, "zeroinitializer", f.ty);
             }
         }
         emit_fin_flag(o, im);
-        emit_call("@m_" + owner->mangled + "_init", cg.t_unit(),
-                  args_text(args, o, &ini->params));
+        if (ini)
+            emit_call("@m_" + owner->mangled + "_init", cg.t_unit(),
+                      args_text(args, o, &ini->params));
         own(o, cg.t_obj(im->mangled));
         return {o, cg.t_obj(im->mangled)};
     }
@@ -5396,8 +5580,10 @@ struct FnEmit {
             } else if (f.ty->k == Ty::i64_ || f.ty->k == Ty::i1_ ||
                        f.ty->k == Ty::dec_) {
                 store_at(o, f.offset, "0", f.ty);
-            } else {
+            } else if (is_rc(f.ty) || f.ty->k == Ty::rawptr_) {
                 store_at(o, f.offset, "null", f.ty);
+            } else {
+                store_at(o, f.offset, "zeroinitializer", f.ty);
             }
         }
         emit_fin_flag(o, im);
@@ -5415,7 +5601,7 @@ struct FnEmit {
                         : nullptr;
             EV v = eval(e->args[i].get(), h);
             pin_borrow(e->args[i].get(), v);
-            if (i < params.size() && params[i].passing == Param::Passing::take)
+            if (i < params.size() && params[i].passing == Param::Passing::move)
                 transfer_in(v);
             out.push_back(v);
         }
@@ -5490,7 +5676,7 @@ struct FnEmit {
                 cg.unify_tref(f->params[i].type.get(), a.second, gens, fenv);
             }
             if (i < f->params.size() &&
-                f->params[i].passing == Param::Passing::take)
+                f->params[i].passing == Param::Passing::move)
                 transfer_in(a);
             args.push_back(std::move(a));
         }
@@ -5545,17 +5731,24 @@ struct FnEmit {
                 return {b, cg.t_result(ok_type, error_type)};
             }
             if (name == "err") {
-                EV v = eval(e->args[0].get());
+                Ty* hinted_error = hint && hint->args.size() >= 2
+                                        ? hint->args[1]
+                                        : nullptr;
+                bool default_error = !hinted_error ||
+                                     (hinted_error->k == Ty::obj_ &&
+                                      hinted_error->name == "Error");
+                EV v = eval(e->args[0].get(),
+                            default_error ? nullptr : hinted_error);
                 std::string payload = v.first;
                 Ty* pty = v.second;
-                if (v.second->k == Ty::str_) {
+                if (default_error && v.second->k == Ty::str_) {
                     payload = make_error(v.first);
                     pty = cg.t_error();
                 }
                 Ty* ok = hint && hint->k == Ty::enum_ && !hint->args.empty()
                              ? hint->args[0]
                              : cg.t_i64();
-                Ty* error_type = hint && hint->args.size() >= 2 ? hint->args[1] : pty;
+                Ty* error_type = hinted_error ? hinted_error : pty;
                 std::string b = make_result_value(false, {payload, pty}, ok, error_type);
                 return {b, cg.t_result(ok, error_type)};
             }
@@ -5892,125 +6085,6 @@ struct FnEmit {
                 }
                 if (mname == "null") return {"null", result};
             }
-            if (n == "Arena" && mname == "new") {
-                EV cap = eval(e->args[0].get(), cg.t_i64());
-                Ty* inner = hint && hint->k == Ty::arena_ ? hint->args[0] : cg.t_i64();
-                std::string r = reg();
-                if (uses_typed_owned_storage(inner)) {
-                    if (has_owned_refs(inner) && !pointer_mask_fits(inner))
-                        cg.err(e->line, e->col,
-                               "arena element ARC layout exceeds runtime metadata capacity");
-                    line(r + " = call ptr @beans_arena_new_typed(i64 " + cap.first +
-                         ", i64 " + std::to_string(CG2::value_size(inner)) +
-                         ", i64 " + std::to_string(pointer_mask(inner)) +
-                         ", i64 " + std::to_string(cycle_pointer_mask(inner)) +
-                         ", i64 " + std::to_string(e->line) + ", i64 " +
-                         std::to_string(e->col) + ")");
-                } else {
-                    line(r + " = call ptr @beans_arena_new(i64 " + cap.first +
-                         ", i64 " + std::string(is_slot_rc(inner) ? "1" : "0") +
-                         ", i64 " + std::to_string(e->line) + ", i64 " +
-                         std::to_string(e->col) + ")");
-                }
-                Ty* result = cg.t_arena(inner);
-                own(r, result);
-                return {r, result};
-            }
-            if (n == "Box" && mname == "new") {
-                Ty* inner = hint && hint->k == Ty::box_ ? hint->args[0] : nullptr;
-                EV v = eval(e->args[0].get(), inner);
-                transfer_in(v);
-                std::string r = reg();
-                Ty* value_type = inner ? inner : v.second;
-                if (uses_typed_owned_storage(value_type)) {
-                    if (has_owned_refs(value_type) && !pointer_mask_fits(value_type))
-                        cg.err(e->line, e->col,
-                               "box value ARC layout exceeds runtime metadata capacity");
-                    std::string slot = spill_list_element(v, "box.new");
-                    line(r + " = call ptr @beans_box_new_typed(ptr " + slot +
-                         ", i64 " + std::to_string(CG2::value_size(value_type)) +
-                         ", i64 " + std::to_string(pointer_mask(value_type)) +
-                         ", i64 " + std::to_string(cycle_pointer_mask(value_type)) +
-                         ")");
-                } else {
-                    line(r + " = call ptr @beans_box_new(i64 " + to_slot(v, true) +
-                         ", i64 " + std::string(is_slot_rc(v.second) ? "1" : "0") +
-                         ")");
-                }
-                Ty* result = cg.t_box(value_type);
-                own(r, result);
-                return {r, result};
-            }
-            if (n == "Shared" && mname == "new") {
-                Ty* inner = hint && hint->k == Ty::shared_ ? hint->args[0] : nullptr;
-                EV v = eval(e->args[0].get(), inner);
-                transfer_in(v);
-                std::string r = reg();
-                Ty* value_type = inner ? inner : v.second;
-                if (is_typed_list_element(value_type)) {
-                    if (has_owned_refs(value_type) && !pointer_mask_fits(value_type))
-                        cg.err(e->line, e->col,
-                               "shared value ARC layout exceeds runtime metadata capacity");
-                    std::string slot = spill_list_element(v, "shared.new");
-                    line(r + " = call ptr @beans_shared_new_typed(ptr " + slot +
-                         ", i64 " + std::to_string(CG2::value_size(value_type)) +
-                         ", i64 " + std::to_string(pointer_mask(value_type)) + ")");
-                } else {
-                    line(r + " = call ptr @beans_shared_new(i64 " + to_slot(v, true) +
-                         ", i64 " + std::string(is_slot_rc(v.second) ? "1" : "0") +
-                         ")");
-                }
-                Ty* result = cg.t_shared(value_type);
-                own(r, result);
-                return {r, result};
-            }
-            if (n == "Mutex" && mname == "new") {
-                Ty* inner = hint && hint->k == Ty::mutex_ ? hint->args[0] : nullptr;
-                EV v = eval(e->args[0].get(), inner);
-                transfer_in(v);
-                std::string r = reg();
-                Ty* value_type = inner ? inner : v.second;
-                if (is_typed_list_element(value_type)) {
-                    if (has_owned_refs(value_type) && !pointer_mask_fits(value_type))
-                        cg.err(e->line, e->col,
-                               "mutex value ARC layout exceeds runtime metadata capacity");
-                    std::string slot = spill_list_element(v, "mutex.new");
-                    line(r + " = call ptr @beans_mutex_new_typed(ptr " + slot +
-                         ", i64 " + std::to_string(CG2::value_size(value_type)) +
-                         ", i64 " + std::to_string(pointer_mask(value_type)) + ")");
-                } else {
-                    line(r + " = call ptr @beans_mutex_new(i64 " + to_slot(v, true) +
-                         ", i64 " + std::string(is_slot_rc(v.second) ? "1" : "0") +
-                         ")");
-                }
-                own(r, cg.t_kind1(Ty::mutex_, v.second));
-                return {r, cg.t_kind1(Ty::mutex_, value_type)};
-            }
-            if (n == "Channel" && mname == "new") {
-                EV cap = eval(e->args[0].get());
-                Ty* elem = hint && hint->k == Ty::chan_ ? hint->args[0] : cg.t_i64();
-                std::string r = reg();
-                if (is_typed_list_element(elem)) {
-                    if (has_owned_refs(elem) && !pointer_mask_fits(elem))
-                        cg.err(e->line, e->col,
-                               "channel element ARC layout exceeds runtime metadata capacity");
-                    line(r + " = call ptr @beans_chan_new_typed(i64 " + cap.first +
-                         ", i64 " + std::to_string(CG2::value_size(elem)) +
-                         ", i64 " + std::to_string(pointer_mask(elem)) + ")");
-                } else {
-                    line(r + " = call ptr @beans_chan_new(i64 " + cap.first + ", i64 " +
-                         std::string(is_slot_rc(elem) ? "1" : "0") + ")");
-                }
-                own(r, cg.t_kind1(Ty::chan_, elem));
-                return {r, cg.t_kind1(Ty::chan_, elem)};
-            }
-            if (n == "AtomicInt" && mname == "new") {
-                EV v = eval(e->args[0].get());
-                std::string r = reg();
-                line(r + " = call ptr @beans_atomic_new(i64 " + v.first + ")");
-                own(r, cg.t_atomic());
-                return {r, cg.t_atomic()};
-            }
             if (n == "Bytes" || n == "File" || n == "Dir" || n == "MMap") {
                 for (const BuiltinStatic& b : builtin_statics()) {
                     if (n != b.cls || mname != b.name) continue;
@@ -6031,7 +6105,7 @@ struct FnEmit {
             }
         }
 
-        // `money.Payment.card(...)` / `money.Money.new(...)` — the receiver is
+        // `money.Payment.card(...)` / `money.Money.named_static(...)` — the receiver is
         // a field expression the checker resolved to a type
         if (obj->kind == Expr::Kind::field && !obj->resolved.empty()) {
             const std::string& tn = obj->resolved;
@@ -6451,6 +6525,112 @@ struct FnEmit {
                 }
             }
             Ty* inner = rt_->args.empty() ? cg.t_i64() : rt_->args[0];
+            if (mname == "map" || mname == "and_then" || mname == "filter" ||
+                mname == "recover") {
+                EV function = eval(e->args[0].get());
+                Ty* output = rt_;
+                if (mname == "map") {
+                    Ty* mapped = function.second->fn_ret();
+                    output = rt_->name == "Option"
+                                 ? cg.t_option(mapped)
+                                 : cg.t_result(mapped, rt_->args[1]);
+                } else if (mname == "and_then") {
+                    output = function.second->fn_ret();
+                } else if (mname == "recover") {
+                    output = inner;
+                }
+
+                std::string condition = rt_->name == "Option"
+                                            ? option_has(recv)
+                                            : result_is_ok(recv);
+                std::string active = bb(), inactive = bb(), end = bb();
+                std::string slot = fresh_slot("combinator", output);
+                line("br i1 " + condition + ", label %" + active + ", label %" +
+                     inactive);
+
+                auto store_owned = [&](const EV& value) {
+                    transfer_in(value);
+                    line("store " + std::string(ll(output)) + " " + value.first +
+                         ", ptr " + slot);
+                };
+
+                label(active);
+                size_t active_mark = temps.size();
+                std::string payload = rt_->name == "Option"
+                                          ? option_payload(recv, inner)
+                                          : result_payload(recv, true);
+                if (mname == "recover") {
+                    store_owned({payload, inner});
+                } else if (mname == "filter") {
+                    EV keep = call_fn_value_with(function, {{payload, inner}});
+                    std::string kept = bb(), dropped = bb();
+                    line("br i1 " + keep.first + ", label %" + kept + ", label %" +
+                         dropped);
+                    label(kept);
+                    size_t kept_mark = temps.size();
+                    store_owned(recv);
+                    flush_temps(kept_mark);
+                    line("br label %" + end);
+                    label(dropped);
+                    size_t dropped_mark = temps.size();
+                    std::string empty = make_option_none(inner);
+                    store_owned({empty, output});
+                    flush_temps(dropped_mark);
+                    line("br label %" + end);
+                    label(inactive);
+                    size_t inactive_filter_mark = temps.size();
+                    std::string inactive_empty = make_option_none(inner);
+                    store_owned({inactive_empty, output});
+                    flush_temps(inactive_filter_mark);
+                    line("br label %" + end);
+                    label(end);
+                    std::string result = reg();
+                    line(result + " = load " + std::string(ll(output)) + ", ptr " +
+                         slot);
+                    own(result, output);
+                    return {result, output};
+                } else {
+                    EV mapped = call_fn_value_with(function, {{payload, inner}});
+                    if (mname == "and_then") {
+                        store_owned(mapped);
+                    } else if (rt_->name == "Option") {
+                        std::string wrapped = make_option_some(mapped, mapped.second);
+                        store_owned({wrapped, output});
+                    } else {
+                        std::string wrapped = make_result_value(
+                            true, mapped, mapped.second, rt_->args[1]);
+                        store_owned({wrapped, output});
+                    }
+                }
+                flush_temps(active_mark);
+                line("br label %" + end);
+
+                label(inactive);
+                size_t inactive_mark = temps.size();
+                if (mname == "recover") {
+                    Ty* error_type = rt_->args[1];
+                    std::string error = result_payload(recv, false);
+                    EV recovered =
+                        call_fn_value_with(function, {{error, error_type}});
+                    store_owned(recovered);
+                } else if (rt_->name == "Option") {
+                    std::string empty = make_option_none(output->args[0]);
+                    store_owned({empty, output});
+                } else {
+                    Ty* error_type = rt_->args[1];
+                    EV error = {result_payload(recv, false), error_type};
+                    std::string wrapped = make_result_value(
+                        false, error, output->args[0], error_type);
+                    store_owned({wrapped, output});
+                }
+                flush_temps(inactive_mark);
+                line("br label %" + end);
+                label(end);
+                std::string result = reg();
+                line(result + " = load " + std::string(ll(output)) + ", ptr " + slot);
+                own(result, output);
+                return {result, output};
+            }
             if (mname == "or") {
                 EV dflt = eval(e->args[0].get(), inner);
                 if (has_owned_refs(inner)) transfer_in(dflt);
@@ -8634,7 +8814,7 @@ struct FnEmit {
             header += std::string(ll(pt)) + " " + preg;
             std::string slot = alloc_slot(params_ref[i].name, pt, true);
             bool bx = scopes.back()[params_ref[i].name].boxed;
-            bool takes = params_ref[i].passing == Param::Passing::take;
+            bool takes = params_ref[i].passing == Param::Passing::move;
             store_param(preg, slot, ll(pt), bx, pt, takes);
             Var& param_var = scopes.back()[params_ref[i].name];
             if (bx || takes) param_var.owned = true;
@@ -8926,6 +9106,15 @@ std::string CodeGen::generate() {
         out += "declare " + std::string(irty(b.ret)) + " @" + b.sym + "(ptr";
         for (BT p : b.params) out += std::string(", ") + irty(p);
         if (b.panics) out += ", i64, i64";
+        out += ")\n";
+    }
+    for (const BuiltinConstructor& b : builtin_constructors()) {
+        out += "declare " + std::string(irty(b.ret)) + " @" + b.sym + "(";
+        for (size_t i = 0; i < b.params.size(); i++) {
+            if (i) out += ", ";
+            out += irty(b.params[i]);
+        }
+        if (b.panics) out += std::string(b.params.empty() ? "" : ", ") + "i64, i64";
         out += ")\n";
     }
     for (const BuiltinStatic& b : builtin_statics()) {

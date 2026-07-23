@@ -5,7 +5,7 @@ fn hex_impl(value: int) -> string {
     let digits: string = "0123456789abcdef"
     var remaining: u64 = value as u64
     if remaining == 0 { return "0" }
-    var out: Bytes = Bytes.new(16)
+    var out: Bytes = new Bytes(16)
     var index: int = 16
     for remaining != 0 {
         index -= 1
@@ -19,7 +19,7 @@ fn hex_impl(value: int) -> string {
 fn bin_impl(value: int) -> string {
     var remaining: u64 = value as u64
     if remaining == 0 { return "0" }
-    var out: Bytes = Bytes.new(64)
+    var out: Bytes = new Bytes(64)
     var index: int = 64
     for remaining != 0 {
         index -= 1
@@ -33,7 +33,7 @@ fn magnitude_text(value: int) -> string {
     var magnitude: u64 = value as u64
     if value < 0 { magnitude = (0 as u64) - magnitude }
     if magnitude == 0 { return "0" }
-    var out: Bytes = Bytes.new(20)
+    var out: Bytes = new Bytes(20)
     var index: int = 20
     for magnitude != 0 {
         index -= 1

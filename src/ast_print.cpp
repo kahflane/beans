@@ -48,7 +48,7 @@ std::string params_str(const std::vector<Param>& ps, bool self_first) {
     for (const Param& p : ps) {
         if (!first) s += ", ";
         first = false;
-        if (p.passing == Param::Passing::take) s += "take ";
+        if (p.passing == Param::Passing::move) s += "move ";
         if (p.passing == Param::Passing::inout) s += "inout ";
         s += p.name;
         if (p.type) s += ": " + type_str(p.type.get());
@@ -114,6 +114,23 @@ std::string expr_str(const Expr* e, int depth) {
                    expr_str(e->rhs.get(), depth) + ")";
         case Expr::Kind::call: {
             std::string s = expr_str(e->callee.get(), depth) + "(";
+            for (size_t i = 0; i < e->args.size(); i++) {
+                if (i) s += ", ";
+                s += expr_str(e->args[i].get(), depth);
+            }
+            return s + ")";
+        }
+        case Expr::Kind::new_: {
+            std::string s = "new " + e->name;
+            if (!e->type_args.empty()) {
+                s += "<";
+                for (size_t i = 0; i < e->type_args.size(); i++) {
+                    if (i) s += ", ";
+                    s += type_str(e->type_args[i].get());
+                }
+                s += ">";
+            }
+            s += "(";
             for (size_t i = 0; i < e->args.size(); i++) {
                 if (i) s += ", ";
                 s += expr_str(e->args[i].get(), depth);
@@ -258,7 +275,13 @@ std::string generics_str(const std::vector<GenericParam>& gs) {
     for (size_t i = 0; i < gs.size(); i++) {
         if (i) s += ", ";
         s += gs[i].name;
-        if (!gs[i].bound.empty()) s += ": " + gs[i].bound;
+        if (!gs[i].bounds.empty()) {
+            s += " implements ";
+            for (size_t j = 0; j < gs[i].bounds.size(); j++) {
+                if (j) s += " & ";
+                s += gs[i].bounds[j];
+            }
+        }
     }
     return s + ">";
 }
@@ -267,9 +290,10 @@ void fn_str(std::string& out, const FnDecl& f, int depth) {
     out += ind(depth);
     if (f.is_pub) out += "pub ";
     if (f.is_override) out += "override ";
+    if (f.is_static) out += "static ";
     if (f.is_extern_c) out += "extern \"C\" ";
     out += "fn " + f.name + generics_str(f.generics) +
-           params_str(f.params, f.has_self);
+           params_str(f.params, false);
     if (f.ret) out += " -> " + type_str(f.ret.get());
     if (f.has_body) out += " " + block_str(f.body, depth);
     else out += "   [signature]";
@@ -291,19 +315,20 @@ std::string dump(const Module& m) {
         switch (kind) {
             case Module::DeclKind::class_: {
                 const ClassDecl& c = m.classes[idx];
-                if (c.is_move_only) out += "@move_only ";
-                if (c.is_c_layout) out += "@c_layout ";
                 if (c.is_pub) out += "pub ";
+                if (c.is_move_only) out += "unique ";
+                if (c.is_c_layout) out += "extern \"C\" ";
                 out += c.is_interface ? "interface "
                        : c.is_union    ? "union "
                        : c.is_struct   ? "struct "
                                        : "class ";
                 out += c.name + generics_str(c.generics);
-                if (!c.supers.empty()) {
-                    out += " : ";
-                    for (size_t i = 0; i < c.supers.size(); i++) {
+                if (!c.base.empty()) out += " extends " + c.base;
+                if (!c.interfaces.empty()) {
+                    out += c.is_interface ? " extends " : " implements ";
+                    for (size_t i = 0; i < c.interfaces.size(); i++) {
                         if (i) out += ", ";
-                        out += c.supers[i];
+                        out += c.interfaces[i];
                     }
                 }
                 out += " {\n";

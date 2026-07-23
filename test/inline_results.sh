@@ -16,4 +16,4 @@ grep -q 'insertvalue {i1, %bs.Pair, ptr} zeroinitializer, i1 false, 0' build/inl
 grep -q 'call void @beans_retain(ptr' build/inline_results.ll
 grep -q 'call void @beans_release(ptr' build/inline_results.ll
 
-echo "ok inline Result structs, ARC payloads, nesting, capture, match, try, and assignment"
+echo "ok Result methods across scalars, ARC, structs, arrays, SIMD, slices, and nesting"

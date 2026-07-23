@@ -26,6 +26,7 @@ test: $(BIN)
 	./test/moves.sh
 	./test/maps.sh
 	./test/traits.sh
+	bash ./test/syntax_v07.sh
 	bash ./test/unsafe.sh
 	./test/fixed_arrays.sh
 	./test/raw_slices.sh

@@ -1,8 +1,9 @@
 inline option true true true true
 option values 20 3 11 true 20
+option methods 6 beans 23 true true
 option match 10 20
-option array 7
-option nested 20
+option array 7 8
+option nested 20 10
 option capture 10
-option simd 10
-option slice 32
+option simd 10 10
+option slice 32 31

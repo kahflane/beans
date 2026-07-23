@@ -3,28 +3,28 @@
 import std.io
 
 interface Shape {
-    fn area(self) -> f64
+    fn area() -> f64
 
     // default method body — most "abstract class" jobs die here
-    fn describe(self) -> string {
+    fn describe() -> string {
         return "shape with area {self.area()}"
     }
 }
 
-class Circle : Shape {
+class Circle implements Shape {
     r: f64
 
-    fn new(r: f64) -> Circle {
-        return Circle { r: r }
+    fn init(r: f64) {
+        self.r = r
     }
 
-    fn area(self) -> f64 {
+    fn area() -> f64 {
         return 3.14159265 * self.r * self.r
     }
 }
 
-class LoudCircle : Circle {
-    override fn describe(self) -> string {
+class LoudCircle extends Circle {
+    override fn describe() -> string {
         return "A CIRCLE. AREA {self.area()}."
     }
 }
@@ -33,8 +33,9 @@ class User {
     name: string
     age: int = 0
 
-    fn new(name: string, age: int) -> User {
-        return User { name: name, age: age }
+    fn init(name: string, age: int) {
+        self.name = name
+        self.age = age
     }
 }
 
@@ -76,8 +77,8 @@ fn find(users: List<User>, name: string) -> Option<User> {
 class Stack<T> {
     items: List<T> = []
 
-    fn push(self, x: T) { self.items.push(x) }
-    fn pop(self) -> Option<T> { return self.items.pop() }
+    fn push(x: T) { self.items.push(x) }
+    fn pop() -> Option<T> { return self.items.pop() }
 }
 
 fn main() {
@@ -92,20 +93,20 @@ fn main() {
     io.println("total: {total}")     // total: 59.97, exactly
 
     // shapes + inheritance + override
-    let shapes: List<Shape> = [Circle.new(1.0), LoudCircle { r: 2.0 }]
+    let shapes: List<Shape> = [new Circle(1.0), new LoudCircle(2.0)]
     for s: Shape in shapes {
         io.println(s.describe())
     }
 
     // as? — checked downcast, returns Option, never crashes
-    let first: Shape = Circle.new(1.0)
+    let first: Shape = new Circle(1.0)
     match first as? LoudCircle {
         some(lc) => io.println("loud: {lc.describe()}"),
         none     => io.println("just a normal circle"),
     }
 
     // option / result
-    let users: List<User> = [User.new("jul", 30), User.new("mia", 25)]
+    let users: List<User> = [new User("jul", 30), new User("mia", 25)]
 
     match find(users, "jul") {
         some(u) => io.println("found {u.name}, age {u.age}"),
@@ -130,7 +131,7 @@ fn main() {
     }
 
     // generics in use — short init: left side already says the type
-    var st: Stack<int> = {}
+    var st: Stack<int> = new Stack()
     st.push(1)
     st.push(2)
     io.println(st.pop().or(-1))      // 2

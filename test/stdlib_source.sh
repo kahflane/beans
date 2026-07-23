@@ -33,4 +33,4 @@ if grep -Eq 'call .*@beans_bytes_(append_varint|get_varint|crc32)' build/bytes.l
     exit 1
 fi
 
-echo "ok Beans collection policies, option/result, math, bytes, path, and fmt packages"
+echo "ok Beans collection policies, Option/Result methods, math, bytes, path, and fmt packages"

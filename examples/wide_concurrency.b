@@ -17,6 +17,8 @@ struct ChannelEdge {
 
 class ChannelOwner {
     messages: Channel<ChannelEdge>
+
+    fn init(messages: Channel<ChannelEdge>) { self.messages = messages }
 }
 
 fn send_one<T>(channel: Channel<T>, value: T) {
@@ -24,15 +26,15 @@ fn send_one<T>(channel: Channel<T>, value: T) {
 }
 
 fn make_channel_cycle() {
-    let target: Box<Option<ChannelOwner>> = Box.new(none)
-    let messages: Channel<ChannelEdge> = Channel.new(1)
-    let owner: ChannelOwner = ChannelOwner { messages: messages }
+    let target: Box<Option<ChannelOwner>> = new Box(none)
+    let messages: Channel<ChannelEdge> = new Channel(1)
+    let owner: ChannelOwner = new ChannelOwner(messages)
     target.set(some(owner))
-    messages.send(ChannelEdge { target: take target })
+    messages.send(ChannelEdge { target: move target })
 }
 
 fn main() {
-    let messages: Channel<Event> = Channel.new(1)
+    let messages: Channel<Event> = new Channel(1)
     let sender: Thread<[i64; 2]> = thread.spawn(fn() -> [i64; 2] {
         send_one(messages, Event { label: "from worker", value: 41 })
         return [7, 8]
@@ -44,17 +46,17 @@ fn main() {
     messages.close()
     io.println("channel closed {messages.recv().is_none()}")
 
-    let integers: Channel<int> = Channel.new(1)
+    let integers: Channel<int> = new Channel(1)
     integers.send(12)
     let integer: int = integers.recv().or(-1)
     io.println("channel int {integer}")
 
-    let decimals: Channel<decimal> = Channel.new(2)
+    let decimals: Channel<decimal> = new Channel(2)
     decimals.send(1.25)
     decimals.send(2.50)
     io.println("channel decimal {decimals.recv().or(0.0) + decimals.recv().or(0.0)}")
 
-    let guarded: Channel<Result<Pair>> = Channel.new(1)
+    let guarded: Channel<Result<Pair>> = new Channel(1)
     guarded.send(err("channel error"))
     match guarded.recv().expect("result") {
         ok(pair) => { io.println("bad {pair.left}") },

@@ -1,5 +1,4 @@
-@c_layout
-union RawKey {
+extern "C" union RawKey {
     signed: i64
     unsigned: u64
 }

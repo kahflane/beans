@@ -6,7 +6,7 @@ import std.fs
 
 fn main() {
     let p: string = "{Dir.temp()}/beans_mmap_example.dat"
-    fs.write_bytes(p, Bytes.new(64)).expect("seed")
+    fs.write_bytes(p, new Bytes(64)).expect("seed")
 
     let m: MMap = MMap.open(p, true).expect("open rw")
     io.println("{m.len()}")
@@ -41,7 +41,7 @@ fn main() {
 
     // resize: grow in place, patch the new tail, shrink back — the handle
     // keeps its fd exactly for this
-    fs.write_bytes(p, Bytes.new(8)).expect("seed resize")
+    fs.write_bytes(p, new Bytes(8)).expect("seed resize")
     let g: MMap = MMap.open(p, true).expect("open grow")
     g.resize(32).expect("grow")
     g.put_u64(24, 777)
@@ -59,7 +59,7 @@ fn main() {
 
     // POSIX: the mapping outlives the file — remove the path, keep reading,
     // and the temp dir is already clean when the final panic fires
-    fs.write_bytes(p, Bytes.new(8).put_u32(0, 77)).expect("reseed")
+    fs.write_bytes(p, new Bytes(8).put_u32(0, 77)).expect("reseed")
     let last: MMap = MMap.open(p, false).expect("open last")
     File.remove(p).expect("rm")
     io.println("{last.get_u32(0)} {File.exists(p)}")

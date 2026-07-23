@@ -2,29 +2,29 @@ import std.io
 import std.thread
 
 interface Greeter {
-    fn name(self) -> string
-    fn greet(self) -> string {
+    fn name() -> string
+    fn greet() -> string {
         return "hi {self.name()}"
     }
 }
 
-class Counter : Greeter {
+class Counter implements Greeter {
     count: int = 0
     pub label: string
 
-    fn new(label: string) -> Counter {
-        return Counter { label: label }
+    fn init(label: string) {
+        self.label = label
     }
 
-    fn name(self) -> string {
+    fn name() -> string {
         return self.label
     }
 
-    override fn greet(self) -> string {
+    override fn greet() -> string {
         return "counter {self.label} at {self.count}"
     }
 
-    fn bump(self, by: int) {
+    fn bump(by: int) {
         self.count += by
     }
 }
@@ -32,9 +32,9 @@ class Counter : Greeter {
 class Stack<T> {
     items: List<T> = []
 
-    fn push(self, x: T) { self.items.push(x) }
-    fn pop(self) -> Option<T> { return self.items.pop() }
-    fn size(self) -> int { return self.items.len() }
+    fn push(x: T) { self.items.push(x) }
+    fn pop() -> Option<T> { return self.items.pop() }
+    fn size() -> int { return self.items.len() }
 }
 
 enum Payment {
@@ -42,7 +42,7 @@ enum Payment {
     card(number: string)
     transfer(iban: string, amount: decimal)
 
-    fn label(self) -> string {
+    fn label() -> string {
         return match self {
             cash => "cash",
             card(n) => "card {n.last(4)}",
@@ -51,7 +51,7 @@ enum Payment {
     }
 }
 
-fn largest<T: Comparable>(xs: List<T>) -> Option<T> {
+fn largest<T implements Order>(xs: List<T>) -> Option<T> {
     return xs.max()
 }
 
@@ -71,7 +71,7 @@ fn main() {
     io.println("total {total}")
 
     // generic class
-    var st: Stack<int> = {}
+    var st: Stack<int> = new Stack()
     st.push(1)
     st.push(2)
     io.println(st.pop().or(-1))
@@ -94,7 +94,7 @@ fn main() {
     }
 
     // inheritance, interfaces, upcast, downcast
-    let g: Greeter = Counter.new("jobs")
+    let g: Greeter = new Counter("jobs")
     io.println(g.greet())
     match g as? Counter {
         some(c) => c.bump(1),
@@ -116,12 +116,12 @@ fn main() {
     })
     io.println(t.join())
 
-    let shared: Mutex<Counter> = Mutex.new(Counter.new("shared"))
+    let shared: Mutex<Counter> = new Mutex(new Counter("shared"))
     shared.with(fn(c: Counter) {
         c.bump(5)
     })
 
-    let ch: Channel<string> = Channel.new(8)
+    let ch: Channel<string> = new Channel(8)
     ch.send("job")
     defer ch.close()
 

@@ -6,13 +6,15 @@ import std.io
 class Node {
     id: int = 0
     next: Option<Node> = none
+
+    fn init(id: int) { self.id = id }
 }
 
 fn ring(n: int) -> Node {
-    var first: Node = Node { id: 0 }
+    var first: Node = new Node(0)
     var prev: Node = first
     for i: int in 1..n {
-        var cur: Node = Node { id: i }
+        var cur: Node = new Node(i)
         prev.next = some(cur)
         prev = cur
     }
@@ -22,8 +24,8 @@ fn ring(n: int) -> Node {
 
 fn churn(iters: int) {
     for i: int in 0..iters {
-        var a: Node = Node { id: i }
-        var b: Node = Node { id: i + 1 }
+        var a: Node = new Node(i)
+        var b: Node = new Node(i + 1)
         a.next = some(b)
         b.next = some(a) // pair cycle, dropped every iteration
     }
@@ -41,13 +43,13 @@ fn main() {
     }
 
     // self cycle
-    var s: Node = Node { id: 99 }
+    var s: Node = new Node(99)
     s.next = some(s)
     io.println("self {s.id}")
 
     // a big dropped ring exercises the iterative walk — must not smash the C stack
     var big: Node = ring(300000)
-    big = Node { id: -1 }
+    big = new Node(-1)
     churn(1000)
     io.println("big dropped, now {big.id}")
 

@@ -6,8 +6,8 @@ import std.os
 
 fn main() {
     let args: List<string> = os.args()
-    let size: int = if args.len() > 0 { args[0].to_int().or(1800) } else { 1800 }
-    let seed: int = if args.len() > 1 { args[1].to_int().or(1) } else { 1 }
+    let size: int = args.get(0).or("").to_int().or(1800)
+    let seed: int = args.get(1).or("").to_int().or(1)
     let w: int = size
     let h: int = size
     let max_iter: int = 80 + seed % 41

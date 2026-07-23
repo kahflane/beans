@@ -4,26 +4,30 @@ import shop.money
 import shop.util as u
 
 // implementing an interface from another package
-class Till : u.Device {
+class Till implements u.Device {
     id: int = 7
 
-    fn label(self) -> string {
+    fn label() -> string {
         return "till-{self.id}"
     }
+}
+
+fn imported_label<T implements u.Device>(value: T) -> string {
+    return value.label()
 }
 
 fn main() {
     banner("beans shop")
 
-    let log: u.Logger = {}
+    let log: u.Logger = new u.Logger()
     log.log("open")
 
-    var cart: Cart = {}
-    cart.add(money.Money.new(19.99))
-    cart.add(money.Money.new(0.01))
+    var cart: Cart = new Cart()
+    cart.add(new money.Money(19.99))
+    cart.add(new money.Money(0.01))
     io.println(cart.total().show())
 
-    let m: money.Money = money.Money.new(5.00).add(money.Money.new(2.50))
+    let m: money.Money = new money.Money(5.00).add(new money.Money(2.50))
     io.println(m.show())
 
     let p: money.Payment = money.Payment.card("4242")
@@ -36,8 +40,9 @@ fn main() {
         }
     }
 
-    let till: Till = {}
+    let till: Till = new Till()
     io.println(till.describe())
+    io.println(imported_label(till))
     let d: u.Device = till
     io.println("as a device: {d.label()}")
 

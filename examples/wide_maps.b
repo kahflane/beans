@@ -17,6 +17,8 @@ struct Edge {
 
 class Node {
     edges: Map<int, Edge>
+
+    fn init(move edges: Map<int, Edge>) { self.edges = move edges }
 }
 
 struct KeyEdge {
@@ -25,6 +27,8 @@ struct KeyEdge {
 
 class KeyNode {
     edges: Map<KeyEdge, int>
+
+    fn init(move edges: Map<KeyEdge, int>) { self.edges = move edges }
 }
 
 fn event(number: int, value: int) -> Event {
@@ -32,12 +36,12 @@ fn event(number: int, value: int) -> Event {
 }
 
 fn make_typed_map_cycle() {
-    let node: Node = Node { edges: {} }
+    let node: Node = new Node({})
     node.edges[1] = Edge { target: node }
 }
 
 fn make_typed_key_cycle() {
-    let node: KeyNode = KeyNode { edges: {} }
+    let node: KeyNode = new KeyNode({})
     node.edges[KeyEdge { target: node }] = 1
 }
 

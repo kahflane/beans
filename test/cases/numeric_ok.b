@@ -10,6 +10,7 @@ fn add_cent(v: decimal) -> decimal {
 
 class Tiny {
     value: i8
+    fn init(value: i8) { self.value = value }
 }
 
 class Packed {
@@ -18,12 +19,26 @@ class Packed {
     c: u32
     d: u64
     f: f32
+
+    fn init(a: u8, b: i16, c: u32, d: u64, f: f32) {
+        self.a = a
+        self.b = b
+        self.c = c
+        self.d = d
+        self.f = f
+    }
 }
 
 class MoneyPad {
     tag: u8
     amount: decimal
     tail: u8
+
+    fn init(tag: u8, amount: decimal, tail: u8) {
+        self.tag = tag
+        self.amount = amount
+        self.tail = tail
+    }
 }
 
 fn main() {
@@ -49,14 +64,9 @@ fn main() {
     let single: f32 = 16777217.0
     let half: f32 = 0.1
     let sum: f32 = half + 0.1
-    let tiny: Tiny = { value: 127 }
-    let packed: Packed = {
-        a: 255,
-        b: -32768,
-        c: 4294967295,
-        d: 18446744073709551615,
-        f: 0.1,
-    }
+    let tiny: Tiny = new Tiny(127)
+    let packed: Packed = new Packed(255, -32768, 4294967295,
+        18446744073709551615, 0.1)
     let optional: Option<i8> = some(-1)
     let ordered: List<u64> = [wide, 1, high]
     ordered.sort()
@@ -64,7 +74,7 @@ fn main() {
     floats.sort()
     var float_map: Map<f32, int> = {}
     float_map[0.5] = 7
-    let money: MoneyPad = { tag: 1, amount: 19.99, tail: 2 }
+    let money: MoneyPad = new MoneyPad(1, 19.99, 2)
     let decimals: List<decimal> = [1.25, 2.50]
     var decimal_map: Map<decimal, int> = {}
     decimal_map[2.5] = 9

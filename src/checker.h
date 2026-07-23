@@ -43,7 +43,7 @@ struct EnumInfo {
 // package-qualified name ("util.User"); the root package's prefix is empty, so
 // single-file programs behave exactly as before. Cross-package references are
 // resolved here once and written into the AST (Expr::resolved,
-// TypeRef::resolved, ClassDecl::supers_resolved) so the interpreter and
+// TypeRef::resolved and resolved class hierarchy fields) so the interpreter and
 // codegen never look at imports.
 class Checker {
 public:
@@ -95,7 +95,6 @@ private:
     bool trait_satisfied(TypeId t, const std::string& trait);
     bool trait_satisfied_rec(TypeId t, const std::string& trait,
                              std::set<std::pair<TypeId, std::string>>& seen);
-    static std::vector<std::string> split_traits(const std::string& bounds);
     static std::string canonical_trait(const std::string& trait);
     void set_type_params(const std::vector<GenericParam>& params);
     void validate_generic_params(const std::vector<GenericParam>& params,
@@ -143,6 +142,7 @@ private:
     TypeId check_expr(const Expr* e, TypeId expected);
     TypeId check_expr_impl(const Expr* e, TypeId expected);
     TypeId check_call(const Expr* e, TypeId expected);
+    TypeId check_new(const Expr* e, TypeId expected);
     TypeId check_init(const Expr* e, TypeId expected);
     TypeId check_field(const Expr* e, bool for_call, TypeId* self_type_out);
     TypeId check_match(const Expr* e, TypeId expected, bool as_stmt = false);

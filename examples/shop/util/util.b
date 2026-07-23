@@ -2,10 +2,10 @@
 import std.io
 
 pub interface Device {
-    fn label(self) -> string
+    fn label() -> string
 
     // default method: runs for any Device, even ones from other packages
-    fn describe(self) -> string {
+    fn describe() -> string {
         return "device: {self.label()}"
     }
 }
@@ -13,12 +13,12 @@ pub interface Device {
 pub class Logger {
     pub prefix: string = "[shop]"
 
-    pub fn log(self, msg: string) {
+    pub fn log(msg: string) {
         io.println("{self.prefix} {msg}")
     }
 }
 
-pub fn largest<T: Order>(xs: List<T>) -> Option<T> {
+pub fn largest<T implements Order>(xs: List<T>) -> Option<T> {
     return xs.max()
 }
 

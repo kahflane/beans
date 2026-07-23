@@ -5,9 +5,9 @@ import std.bytes as byte_algo
 
 fn main() {
     let args: List<string> = os.args()
-    let n: int = if args.len() > 0 { args[0].to_int().or(500_000) } else { 500_000 }
-    let seed: int = if args.len() > 1 { args[1].to_int().or(1) } else { 1 }
-    let data: Bytes = Bytes.new(0)
+    let n: int = args.get(0).or("").to_int().or(500_000)
+    let seed: int = args.get(1).or("").to_int().or(1)
+    let data: Bytes = new Bytes(0)
     data.reserve(n * 3)
     var i: int = 0
     for i < n {

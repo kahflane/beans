@@ -1,7 +1,6 @@
 import std.io
 
-@c_layout
-struct Point {
+extern "C" struct Point {
     x: i32
     y: i32
 }

@@ -6,15 +6,15 @@ import std.io
 class Wallet {
     pub cents: int = 0
 
-    pub fn new(c: int) -> Wallet {
-        return Wallet { cents: c }
+    pub fn init(c: int) {
+        self.cents = c
     }
 
-    pub fn add(self, c: int) -> Wallet {
-        return Wallet.new(self.cents + c)
+    pub fn add(c: int) -> Wallet {
+        return new Wallet(self.cents + c)
     }
 
-    pub fn show(self) -> string {
+    pub fn show() -> string {
         return "{self.cents}c"
     }
 }
@@ -28,7 +28,7 @@ fn parse_both(a: string, b: string) -> Result<int> {
 
 fn main() {
     // statics -> methods -> methods
-    io.println(Wallet.new(120).add(80).add(50).show())
+    io.println(new Wallet(120).add(80).add(50).show())
 
     // string chains
     let s: string = "beans language"
@@ -38,7 +38,7 @@ fn main() {
 
     // map index reads, chained onward
     var m: Map<string, Wallet> = {}
-    m["a"] = Wallet.new(500)
+    m["a"] = new Wallet(500)
     m["b"] = m["a"].add(25)
     io.println(m["b"].show())
     let total: int = m["a"].cents + m["b"].cents

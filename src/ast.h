@@ -45,7 +45,7 @@ struct TypeRef {
 };
 
 struct Param {
-    enum class Passing { borrow, take, inout };
+    enum class Passing { borrow, move, inout };
     Passing passing = Passing::borrow;
     std::string name;
     TypePtr type; // may be null for untyped match bindings
@@ -54,7 +54,8 @@ struct Param {
 
 struct GenericParam {
     std::string name;
-    std::string bound; // empty = unbounded
+    std::vector<std::string> bounds; // compiler or user interfaces
+    mutable std::vector<std::string> bounds_resolved;
 };
 
 // ---- patterns -------------------------------------------------------------
@@ -99,6 +100,7 @@ struct Expr {
         binary, // lhs op rhs
         range,  // lhs .. rhs / lhs ..= rhs
         call,   // callee(args)
+        new_,   // new Name<type_args>(args)
         field,  // object.name
         index,  // object[index_expr]
         list_lit, // [args...]
@@ -200,6 +202,7 @@ struct Stmt {
 struct FnDecl {
     bool is_pub = false;
     bool is_override = false;
+    bool is_static = false;
     bool has_self = false;
     bool has_body = true; // false = interface signature
     bool is_extern_c = false;
@@ -227,14 +230,15 @@ struct ClassDecl { // also interfaces (is_interface)
     bool is_interface = false;
     bool is_struct = false;   // inline value, never an ARC object
     bool is_union = false;    // inline overlapping value, unsafe field access
-    bool is_c_layout = false; // target C field order/alignment is part of its ABI
-    bool is_move_only = false;
+    bool is_c_layout = false; // declared with extern "C"
+    bool is_move_only = false; // declared with unique
     std::string name;
     std::string qualname;
     std::vector<GenericParam> generics;
-    std::vector<std::string> supers;
-    // checker fills: supers as package-qualified names, same order as supers
-    mutable std::vector<std::string> supers_resolved;
+    std::string base;
+    std::vector<std::string> interfaces;
+    mutable std::string base_resolved;
+    mutable std::vector<std::string> interfaces_resolved;
     std::vector<FieldDecl> fields;
     std::vector<FnDecl> methods;
     uint32_t line = 0, col = 0;

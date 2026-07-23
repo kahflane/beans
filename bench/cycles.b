@@ -5,17 +5,19 @@ import std.os
 class Node {
     value: int
     next: Option<Node> = none
+
+    fn init(value: int) { self.value = value }
 }
 
 fn main() {
     let args: List<string> = os.args()
-    let n: int = if args.len() > 0 { args[0].to_int().or(2_000_000) } else { 2_000_000 }
-    let seed: int = if args.len() > 1 { args[1].to_int().or(1) } else { 1 }
+    let n: int = args.get(0).or("").to_int().or(2_000_000)
+    let seed: int = args.get(1).or("").to_int().or(1)
     var checksum: int = 0
     var i: int = 0
     for i < n {
-        let left: Node = Node { value: i + seed }
-        let right: Node = Node { value: i + seed + 1 }
+        let left: Node = new Node(i + seed)
+        let right: Node = new Node(i + seed + 1)
         left.next = some(right)
         right.next = some(left)
         checksum += left.value + right.value

@@ -5,6 +5,8 @@ import std.thread
 
 class Counter {
     value: int = 0
+
+    fn init(value: int) { self.value = value }
 }
 
 fn bump_many(counter: Mutex<Counter>, n: int) -> int {
@@ -18,9 +20,9 @@ fn bump_many(counter: Mutex<Counter>, n: int) -> int {
 
 fn main() {
     let args: List<string> = os.args()
-    let n: int = if args.len() > 0 { args[0].to_int().or(5_000_000) } else { 5_000_000 }
-    let seed: int = if args.len() > 1 { args[1].to_int().or(1) } else { 1 }
-    let counter: Mutex<Counter> = Mutex.new(Counter { value: seed })
+    let n: int = args.get(0).or("").to_int().or(5_000_000)
+    let seed: int = args.get(1).or("").to_int().or(1)
+    let counter: Mutex<Counter> = new Mutex(new Counter(seed))
     let q: int = n / 4
     let t0: Thread<int> = thread.spawn(fn() -> int { return bump_many(counter, q) })
     let t1: Thread<int> = thread.spawn(fn() -> int { return bump_many(counter, q) })

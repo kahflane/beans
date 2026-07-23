@@ -5,10 +5,10 @@ import std.os
 
 fn main() {
     let args: List<string> = os.args()
-    let n: int = if args.len() > 0 { args[0].to_int().or(3_000_000) } else { 3_000_000 }
-    let seed: int = if args.len() > 1 { args[1].to_int().or(1) } else { 1 }
+    let n: int = args.get(0).or("").to_int().or(3_000_000)
+    let seed: int = args.get(1).or("").to_int().or(1)
     let key_count: int = n / 4 + 1
-    let log: Bytes = Bytes.new(0)
+    let log: Bytes = new Bytes(0)
     log.reserve(n * 24)
     var latest: Map<int, int> = {}
     latest.reserve(key_count)
@@ -29,7 +29,7 @@ fn main() {
         pos += 24
     }
 
-    let compact: Bytes = Bytes.new(0)
+    let compact: Bytes = new Bytes(0)
     compact.reserve(key_count * 24)
     var checksum: int = 0
     i = 0

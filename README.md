@@ -10,7 +10,7 @@ A small OOP language: Java-style objects, Go-sized grammar, with C++-class perfo
 
 | piece | state |
 |---|---|
-| syntax draft | v0.5 |
+| syntax draft | v0.7 |
 | lexer | done |
 | parser | done |
 | module loader | done (v6) — modules, git imports, compiler-shipped `.b` std packages |
@@ -43,7 +43,7 @@ make bench-profile NAME=trees
 The interpreter is the reference implementation: exact `decimal` math, real OS threads for `thread.spawn`, real mutexes and blocking channels, `defer`, dynamic dispatch, and runtime panics with line numbers.
 
 The low-level layer has started: `RawPtr<T>` can allocate and access primitive
-scalar, raw-pointer, fixed-array, or nested `@c_layout struct`/`union` memory
+scalar, raw-pointer, fixed-array, or nested `extern "C" struct`/`union` memory
 inside an explicit `unsafe {}` block, including LLVM volatile
 loads/stores and sequentially consistent raw integer atomics. Top-level
 `extern "C" fn` declarations can call mixed integer, bool, raw-pointer,
@@ -51,9 +51,9 @@ floating-point, and C-layout aggregate functions in both backends. `Simd4f32` is
 four-lane LLVM vector with arithmetic, reduction, and unaligned-safe raw
 load/store. `[T; N]` is an inline fixed array for inline scalar, pointer, array,
 and struct elements, and `Slice<T>` is an inline pointer/length view with
-checked access over raw-compatible memory. `struct` values copy, pass, and return inline; `@c_layout struct`
+checked access over raw-compatible memory. `struct` values copy, pass, and return inline; `extern "C" struct`
 uses target C field order and alignment and can be read or written through
-`RawPtr` and `Slice`. `@c_layout union` adds overlapping scalar storage with
+`RawPtr` and `Slice`. `extern "C" union` adds overlapping scalar storage with
 field access kept behind `unsafe`. Struct and union fields accept nested inline
 values; infinite inline recursion is rejected. `extern "C"` accepts these
 records by value in arguments and returns. Small generated C wrappers leave
@@ -65,8 +65,8 @@ the ABI only for the duration of that call and on the same thread.
 The native backend emits textual LLVM IR and hands it to clang — no LLVM library dependency. The C runtime lives in `runtime/beans_rt.c`, not inside the compiler binary. Development builds link a cached runtime object; `--release --lto` links cached runtime bitcode so LLVM can optimize across the boundary. `BEANS_RUNTIME` can point at another runtime source. The backend covers the whole language: classes (descriptor/vtable dispatch, inheritance, interface defaults, `override`, `as?`), monomorphized generics on classes *and* functions, enums + `match` (block-bodied arms included), Option/Result + `?`, exact-width integers and `f32`, exact `decimal`, lists and maps, closures (lambda-lifted, captured variables live in shared heap cells — mutation works, escaping works), real pthreads for `thread.spawn`/`Mutex`/`Channel`/`AtomicInt`, `defer`, string interpolation, and multi-package programs (symbols are package-qualified; cross-package calls, inheritance, generics, and interface dispatch all compile into one flat module). Every test file produces byte-identical output under `beansc build` and `beansc run` — panics included, same message, same exit code.
 
 High-level standard-library code can now be written in Beans. The loader ships
-packages from `lib/std/`; `std.collections`, `std.option`, `std.result`,
-`std.math`, `std.bytes`, `std.path`, `std.fmt`, `std.fs`, and `std.reader` are the first ones. Generic collection
+packages from `lib/std/`; `std.collections`, `std.math`, `std.bytes`,
+`std.path`, `std.fmt`, `std.fs`, and `std.reader` are the first ones. Generic collection
 `filter`/`transform`, inout Map increment/insert/merge/remove/map policies,
 Option and Result combinators, `frequencies`, `unique`, `gcd`, `clamp_int`,
 CRC32, unsigned varint append/encoding/decoding, path handling,
@@ -85,7 +85,7 @@ Reference cycles (`a.next = some(b); b.next = some(a)`) are caught by trial dele
 
 Verified with Apple's `leaks` tool: **0 leaked bytes** on every test program — including [examples/cycles.b](examples/cycles.b), which drops 400k cycle pairs, a self-cycle, a 300k ring, and a closure that captures its own cell. **2M dropped cycle pairs run in 1.4MB flat**, same as the acyclic stress test, and live rings survive collections untouched.
 
-The design keeps RC off hot paths: function arguments, loop variables, and reads borrow instead of retaining. `take local` moves an owned value with compile-time use-after-move checks, and `return take local` transfers its last reference instead of retaining it. List, Map, OrderedMap, `Box<T>`, and the typed append-only `Arena<T>` are move-only outer handles; collections copy only through explicit `clone()`, and Arena values drop in bulk on `clear` or scope exit. `Shared<T>`/`Weak<T>` add an explicit atomic control block for cross-thread ownership without making local classes pay that cost. `Send`/`Sync` trait bounds are enforced, and `thread.spawn` rejects non-`Send` captures and returns. Pointer-valued `Option` uses a null niche in native code, while structs, fixed arrays, SIMD vectors, slices, and nested wide Options use an inline `{has_value, payload}` aggregate. A Result with a wide branch is also inline. Ordinary structs can own ARC fields. Typed-width List, Map-value, Box, Arena, Shared, Mutex, Channel, Thread-result, and user-enum payload storage keeps wide values and 16-byte decimals inline with ARC pointer masks. Map keeps its existing narrow fast path and uses a parallel buffer only for wide values. Wide value keys are boxed once when stored; lookup uses a stack copy and generated field-wise equality and hashing, so queries do not allocate. The compiler tracks nested references through copies, calls, captures, assignments, class nesting, collection operations, matches, and `?`. Inline Option/Result forms do not allocate their own aggregate box; user enums remain ARC values but keep wide payloads inline inside that allocation. The benchmark numbers below are measured *with* ARC and the collector enabled. Known limits: collection is deferred while worker threads run (a program that churns cycles forever while never letting its threads drain will grow until they do), nested move-only collection clones, consuming Map reads, and a `?` early-return that can hold mid-statement temporaries a little longer.
+The design keeps RC off hot paths: function arguments, loop variables, and reads borrow instead of retaining. `move local` moves an owned value with compile-time use-after-move checks, and `return move local` transfers its last reference instead of retaining it. List, Map, OrderedMap, `Box<T>`, and the typed append-only `Arena<T>` are move-only outer handles; collections copy only through explicit `clone()`, and Arena values drop in bulk on `clear` or scope exit. `Shared<T>`/`Weak<T>` add an explicit atomic control block for cross-thread ownership without making local classes pay that cost. `Send`/`Sync` interface bounds are enforced, and `thread.spawn` rejects non-`Send` captures and returns. Pointer-valued `Option` uses a null niche in native code, while structs, fixed arrays, SIMD vectors, slices, and nested wide Options use an inline `{has_value, payload}` aggregate. A Result with a wide branch is also inline. Ordinary structs can own ARC fields. Typed-width List, Map-value, Box, Arena, Shared, Mutex, Channel, Thread-result, and user-enum payload storage keeps wide values and 16-byte decimals inline with ARC pointer masks. Map keeps its existing narrow fast path and uses a parallel buffer only for wide values. Wide value keys are boxed once when stored; lookup uses a stack copy and generated field-wise equality and hashing, so queries do not allocate. The compiler tracks nested references through copies, calls, captures, assignments, class nesting, collection operations, matches, and `?`. Inline Option/Result forms do not allocate their own aggregate box; user enums remain ARC values but keep wide payloads inline inside that allocation. The benchmark numbers below are measured *with* ARC and the collector enabled. Known limits: collection is deferred while worker threads run (a program that churns cycles forever while never letting its threads drain will grow until they do), nested move-only collection clones, consuming Map reads, and a `?` early-return that can hold mid-statement temporaries a little longer.
 
 ## Benchmarks
 

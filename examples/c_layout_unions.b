@@ -1,13 +1,11 @@
 import std.io
 
-@c_layout
-union Word {
+extern "C" union Word {
     bits: u32
     number: f32
 }
 
-@c_layout
-union AlignedBlock {
+extern "C" union AlignedBlock {
     bytes: [u8; 16]
     word: u64
 }

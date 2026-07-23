@@ -1,29 +1,23 @@
-@c_layout
-union Empty {}
+extern "C" union Empty {}
 
-@c_layout
-union TextField {
+extern "C" union TextField {
     text: string
 }
 
-@c_layout
-union Generic<T> {
+extern "C" union Generic<T> {
     value: i32
 }
 
-@c_layout
-union DefaultField {
+extern "C" union DefaultField {
     value: i32 = 1
 }
 
-@c_layout
-union WithMethod {
+extern "C" union WithMethod {
     value: i32
-    fn get(self) -> i32 { return self.value }
+    fn get() -> i32 { return self.value }
 }
 
-@c_layout
-union Word {
+extern "C" union Word {
     bits: u32
     number: f32
 }

@@ -5,17 +5,22 @@ import std.os
 class Record {
     key: int
     order: int
+
+    fn init(key: int, order: int) {
+        self.key = key
+        self.order = order
+    }
 }
 
 fn main() {
     let args: List<string> = os.args()
-    let n: int = if args.len() > 0 { args[0].to_int().or(2_000_000) } else { 2_000_000 }
-    let seed: int = if args.len() > 1 { args[1].to_int().or(1) } else { 1 }
+    let n: int = args.get(0).or("").to_int().or(2_000_000)
+    let seed: int = args.get(1).or("").to_int().or(1)
     var records: List<Record> = []
     records.reserve(n)
     var i: int = 0
     for i < n {
-        records.push(Record { key: (i * 48271 + seed) % 4096, order: i })
+        records.push(new Record((i * 48271 + seed) % 4096, i))
         i += 1
     }
     records.sort_by_key(fn(record: Record) -> int { return record.key })

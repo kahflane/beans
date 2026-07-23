@@ -174,7 +174,8 @@ is the diff-test for all of this; pointer-slot masks stop at meta bit 60 (≈55 
 - `// ---- section ----` banners divide the large `.cpp` files.
 - Imports are fully resolved. `std.io`/`std.thread` stay wired to builtins; everything else is a real
   package. The **checker does all cross-package resolution once** and writes it into the AST
-  (`Expr::resolved`, `TypeRef::resolved`, `ClassDecl::supers_resolved`); the interpreter and codegen
+  (`Expr::resolved`, `TypeRef::resolved`, `ClassDecl::base_resolved`, and
+  `ClassDecl::interfaces_resolved`); the interpreter and codegen
   consume those annotations instead of re-resolving imports. Their plain-name fallback (`qual()`, the
   current-package prefix) exists for one reason: string-interpolation segments are re-parsed inside
   interp/codegen and never saw the checker — when touching resolution, keep both paths working.

@@ -101,6 +101,7 @@ private:
     // arbitrary strings or host code, so the usual eval() risk doesn't apply.)
     Value eval(const Expr* e, std::shared_ptr<Env>& env, Hint hint = {});
     Value eval_call(const Expr* e, std::shared_ptr<Env>& env, Hint hint);
+    Value eval_new(const Expr* e, std::shared_ptr<Env>& env, Hint hint);
     Value eval_binary(const Expr* e, std::shared_ptr<Env>& env);
     Value eval_init(const Expr* e, std::shared_ptr<Env>& env, Hint hint);
     Value eval_match(const Expr* e, std::shared_ptr<Env>& env, Hint hint);

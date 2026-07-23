@@ -44,6 +44,6 @@ grep -q 'Slice.set requires unsafe' "$tmp/bad"
 grep -q 'Slice.subslice requires unsafe' "$tmp/bad"
 grep -q 'looping over Slice requires unsafe' "$tmp/bad"
 grep -q 'Slice indexing requires unsafe' "$tmp/bad"
-grep -q 'Slice only supports inline scalars, RawPtr, fixed arrays, and @c_layout struct/union values' "$tmp/bad"
+grep -q 'Slice only supports inline scalars, RawPtr, fixed arrays, and extern "C" struct/union values' "$tmp/bad"
 
 echo "ok two-word raw slices, checked access, subviews, iteration, and ABI"

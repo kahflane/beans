@@ -1,39 +1,33 @@
 import std.io
 
-@c_layout
-struct Packet {
+extern "C" struct Packet {
     tag: u8
     count: u32
     ratio: f32
     live: bool
 }
 
-@c_layout
-union Word {
+extern "C" union Word {
     bits: u32
     number: f32
 }
 
-@c_layout
-struct Link {
+extern "C" struct Link {
     code: u32
     next: RawPtr<u8>
 }
 
-@c_layout
-struct Pair {
+extern "C" struct Pair {
     small: u16
     bytes: [u8; 3]
 }
 
-@c_layout
-union AlignedBlock {
+extern "C" union AlignedBlock {
     bytes: [u8; 16]
     word: u64
 }
 
-@c_layout
-struct Frame {
+extern "C" struct Frame {
     pair: Pair
     values: [u32; 2]
     block: AlignedBlock

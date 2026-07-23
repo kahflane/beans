@@ -95,7 +95,7 @@ go through it; `lex`/`parse` stay per-file.
 - **MIR** (`mir.h/.cpp`) — control-flow blocks plus explicit borrow, move, retain, release,
   edge-drop, and allocation operations. Lowering is still being expanded; native match pinning and
   ownership folds already consume it.
-- **C ABI** (`c_abi.h/.cpp`) — recreates checked `@c_layout` extern signatures as C source so
+- **C ABI** (`c_abi.h/.cpp`) — recreates checked `extern "C"` aggregate signatures as C source so
   Clang, not Beans, classifies by-value aggregates for each target ABI. Native links a small wrapper;
   the interpreter compiles and caches the same shape as a trampoline.
 - **interp** (`value.h`) — the **reference implementation**. When the two backends disagree, the
@@ -160,7 +160,7 @@ mid-statement temporaries (`temps`) hold refs. When editing `FnEmit`:
 
 - Temporaries created while emitting a statement go on `temps` via `own()`, are removed by `consume()`
   when ownership transfers, and are released by `flush_temps(mark)` at the statement end.
-- `take local` clears the local's live flag and transfers its reference. Plain assignment
+- `move local` clears the local's live flag and transfers its reference. Plain assignment
   reinitializes that flag. Cleanup must test it on merged control-flow paths.
 - A direct `return local` moves the frame-owned reference by excluding that slot from final cleanup.
 - `Option<T>` uses null as `none` when `T` is a non-enum RC pointer; `some` is the pointer itself.
@@ -199,7 +199,8 @@ is the diff-test for all of this; pointer-slot masks stop at meta bit 60 (≈55 
 - `// ---- section ----` banners divide the large `.cpp` files.
 - Imports are fully resolved. `std.io`/`std.thread` stay wired to builtins; everything else is a real
   package. The **checker does all cross-package resolution once** and writes it into the AST
-  (`Expr::resolved`, `TypeRef::resolved`, `ClassDecl::supers_resolved`); the interpreter and codegen
+  (`Expr::resolved`, `TypeRef::resolved`, `ClassDecl::base_resolved`, and
+  `ClassDecl::interfaces_resolved`); the interpreter and codegen
   consume those annotations instead of re-resolving imports. Their plain-name fallback (`qual()`, the
   current-package prefix) exists for one reason: string-interpolation segments are re-parsed inside
   interp/codegen and never saw the checker — when touching resolution, keep both paths working.

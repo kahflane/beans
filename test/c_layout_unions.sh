@@ -20,7 +20,7 @@ if ./build/beansc check test/cases/c_layout_union_attribute_bad.b >"$tmp/attribu
     echo "c_layout_union_attribute_bad.b unexpectedly passed" >&2
     exit 1
 fi
-grep -q 'union requires @c_layout' "$tmp/attribute"
+grep -q 'union requires extern "C"' "$tmp/attribute"
 if ./build/beansc check test/cases/c_layout_union_bad.b >"$tmp/bad" 2>&1; then
     echo "c_layout_union_bad.b unexpectedly passed" >&2
     exit 1

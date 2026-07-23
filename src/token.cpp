@@ -28,6 +28,11 @@ TokenKind keyword_or_ident(std::string_view w) {
         {"defer", TokenKind::kw_defer},
         {"unsafe", TokenKind::kw_unsafe},
         {"extern", TokenKind::kw_extern},
+        {"new", TokenKind::kw_new},
+        {"extends", TokenKind::kw_extends},
+        {"implements", TokenKind::kw_implements},
+        {"static", TokenKind::kw_static},
+        {"move", TokenKind::kw_move},
         {"take", TokenKind::kw_take},
         {"inout", TokenKind::kw_inout},
         {"self", TokenKind::kw_self},
@@ -69,6 +74,11 @@ const char* to_string(TokenKind k) {
         case TokenKind::kw_defer:    return "defer";
         case TokenKind::kw_unsafe:   return "unsafe";
         case TokenKind::kw_extern:   return "extern";
+        case TokenKind::kw_new:      return "new";
+        case TokenKind::kw_extends:  return "extends";
+        case TokenKind::kw_implements:return "implements";
+        case TokenKind::kw_static:   return "static";
+        case TokenKind::kw_move:     return "move";
         case TokenKind::kw_take:     return "take";
         case TokenKind::kw_inout:    return "inout";
         case TokenKind::kw_self:     return "self";

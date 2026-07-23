@@ -6,15 +6,17 @@ import std.io
 class Node {
     next: Option<Node> = none
     id: int = 0
+
+    fn init(id: int) { self.id = id }
 }
 
 fn main() {
-    var head: Node = Node { id: 0 }
+    var head: Node = new Node(0)
     for i: int in 1..400000 {
-        var n: Node = Node { id: i }
+        var n: Node = new Node(i)
         n.next = some(head)
         head = n
     }
-    head = Node { id: 0 - 1 }
+    head = new Node(0 - 1)
     io.println("alive {head.id}")
 }

@@ -180,7 +180,7 @@ private:
                 emit(id, MirOp::borrow, nullptr, expr, "self");
                 break;
             case Expr::Kind::unary:
-                if (expr->op == TokenKind::kw_take && expr->rhs &&
+                if (expr->op == TokenKind::kw_move && expr->rhs &&
                     expr->rhs->kind == Expr::Kind::ident) {
                     emit(id, MirOp::move, nullptr, expr,
                          std::string(expr->rhs->text));
@@ -189,6 +189,7 @@ private:
                 break;
             case Expr::Kind::list_lit:
             case Expr::Kind::init:
+            case Expr::Kind::new_:
             case Expr::Kind::closure:
                 emit(id, MirOp::allocate, nullptr, expr);
                 break;

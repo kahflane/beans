@@ -17,14 +17,16 @@ struct MutexEdge {
 
 class MutexOwner {
     guard: Mutex<MutexEdge>
+
+    fn init(guard: Mutex<MutexEdge>) { self.guard = guard }
 }
 
 fn share<T>(value: T) -> Shared<T> {
-    return Shared.new(value)
+    return new Shared(value)
 }
 
 fn guard<T>(value: T) -> Mutex<T> {
-    return Mutex.new(value)
+    return new Mutex(value)
 }
 
 fn dead_event() -> Weak<Event> {
@@ -36,9 +38,9 @@ fn dead_event() -> Weak<Event> {
 }
 
 fn make_mutex_cycle() {
-    let target: Box<Option<MutexOwner>> = Box.new(none)
-    let mutex: Mutex<MutexEdge> = Mutex.new(MutexEdge { target: take target })
-    let owner: MutexOwner = MutexOwner { guard: mutex }
+    let target: Box<Option<MutexOwner>> = new Box(none)
+    let mutex: Mutex<MutexEdge> = new Mutex(MutexEdge { target: move target })
+    let owner: MutexOwner = new MutexOwner(mutex)
     owner.guard.with(fn(edge: MutexEdge) {
         edge.target.set(some(owner))
     })
@@ -49,9 +51,9 @@ fn main() {
     let copy: Event = shared.get()
     io.println("shared {copy.label} {copy.value}")
 
-    let array: Shared<[i64; 2]> = Shared.new([7, 8])
+    let array: Shared<[i64; 2]> = new Shared([7, 8])
     let numbers: [i64; 2] = array.get()
-    let amount: Shared<decimal> = Shared.new(19.99)
+    let amount: Shared<decimal> = new Shared(19.99)
     io.println("shared values {numbers[0]} {numbers[1]} {amount.get() + 0.01}")
 
     let weak: Weak<Event> = dead_event()
@@ -62,12 +64,12 @@ fn main() {
         io.println("mutex {value.label} {value.value}")
     })
 
-    let decimal_mutex: Mutex<decimal> = Mutex.new(2.50)
+    let decimal_mutex: Mutex<decimal> = new Mutex(2.50)
     decimal_mutex.with(fn(value: decimal) {
         io.println("mutex decimal {value + 0.25}")
     })
 
-    let result_mutex: Mutex<Result<Pair>> = Mutex.new(err("guarded error"))
+    let result_mutex: Mutex<Result<Pair>> = new Mutex(err("guarded error"))
     result_mutex.with(fn(value: Result<Pair>) {
         match value {
             ok(pair) => { io.println("bad {pair.left}") },

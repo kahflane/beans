@@ -9,11 +9,11 @@ fn banner(title: string) {
 class Cart {
     items: List<money.Money> = []
 
-    fn add(self, m: money.Money) {
+    fn add(m: money.Money) {
         self.items.push(m)
     }
 
-    fn total(self) -> money.Money {
+    fn total() -> money.Money {
         return money.total(self.items)
     }
 }

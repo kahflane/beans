@@ -12,6 +12,8 @@ struct Event {
 
 class BoxOwner {
     inner: Box<Option<BoxOwner>>
+
+    fn init(move inner: Box<Option<BoxOwner>>) { self.inner = move inner }
 }
 
 struct ArenaEdge {
@@ -20,10 +22,12 @@ struct ArenaEdge {
 
 class ArenaOwner {
     inner: Arena<ArenaEdge>
+
+    fn init(move inner: Arena<ArenaEdge>) { self.inner = move inner }
 }
 
 fn boxed<T>(value: T) -> Box<T> {
-    return Box.new(value)
+    return new Box(value)
 }
 
 fn store_one<T>(arena: Arena<T>, value: T) -> int {
@@ -31,12 +35,12 @@ fn store_one<T>(arena: Arena<T>, value: T) -> int {
 }
 
 fn make_cycles() {
-    let seed_box: Box<Option<BoxOwner>> = Box.new(none)
-    let box_owner: BoxOwner = BoxOwner { inner: take seed_box }
+    let seed_box: Box<Option<BoxOwner>> = new Box(none)
+    let box_owner: BoxOwner = new BoxOwner(move seed_box)
     box_owner.inner.set(some(box_owner))
 
-    let seed_arena: Arena<ArenaEdge> = Arena.new(1)
-    let arena_owner: ArenaOwner = ArenaOwner { inner: take seed_arena }
+    let seed_arena: Arena<ArenaEdge> = new Arena(1)
+    let arena_owner: ArenaOwner = new ArenaOwner(move seed_arena)
     arena_owner.inner.put(ArenaEdge { target: arena_owner })
 }
 
@@ -47,12 +51,12 @@ fn main() {
     let second: Event = event_box.get()
     io.println("box {first.label} {first.value} {second.label} {second.value}")
 
-    let array_box: Box<[i64; 2]> = Box.new([7, 8])
+    let array_box: Box<[i64; 2]> = new Box([7, 8])
     let array: [i64; 2] = array_box.get()
-    let decimal_box: Box<decimal> = Box.new(12.50)
+    let decimal_box: Box<decimal> = new Box(12.50)
     io.println("box values {array[0]} {array[1]} {decimal_box.get()}")
 
-    var events: Arena<Event> = Arena.new(1)
+    var events: Arena<Event> = new Arena(1)
     let one: int = store_one(events, Event { label: "one", value: 1 })
     let two: int = events.put(Event { label: "two", value: 2 })
     let read: Event = events.get(one).or(Event { label: "none", value: 0 })
@@ -61,12 +65,12 @@ fn main() {
     events.clear()
     io.println("arena clear {events.len()} {events.get(one).or(Event { label: "missing", value: 0 }).label}")
 
-    var decimals: Arena<decimal> = Arena.new(0)
+    var decimals: Arena<decimal> = new Arena(0)
     decimals.put(1.25)
     decimals.put(2.50)
     io.println("arena decimal {decimals.at(0)} {decimals.get(1).or(0.0)}")
 
-    var results: Arena<Result<Pair>> = Arena.new(1)
+    var results: Arena<Result<Pair>> = new Arena(1)
     results.put(ok(Pair { left: 3, right: 4 }))
     results.put(err("arena error"))
     let result: Result<Pair> = results.at(1)

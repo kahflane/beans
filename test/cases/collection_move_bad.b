@@ -2,7 +2,7 @@ fn give_back(values: List<int>) -> List<int> {
     return values
 }
 
-fn consume(take values: List<int>) -> int {
+fn consume(move values: List<int>) -> int {
     return values.len()
 }
 
@@ -14,16 +14,16 @@ fn captures_inout(inout value: int) {
     let read: fn() -> int = fn() -> int { return value }
 }
 
-@move_only class Packet {
+unique class Packet {
     id: int = 1
 }
 
 interface Edit {
-    fn apply(self, inout value: int)
+    fn apply(inout value: int)
 }
 
-class WrongEdit : Edit {
-    override fn apply(self, value: int) {}
+class WrongEdit implements Edit {
+    override fn apply(value: int) {}
 }
 
 fn main() {
@@ -39,7 +39,7 @@ fn main() {
 
     let stored: fn(List<int>) -> int = consume
 
-    let packet: Packet = {}
+    let packet: Packet = new Packet()
     let packet_copy: Packet = packet
 
     var left: int = 1

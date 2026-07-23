@@ -10,7 +10,7 @@ fn main() {
     fs.write(p, "alpha\nbeta\n\ngamma with spaces\nlast no newline").expect("seed")
 
     let f: File = File.open(p, "r").expect("open")
-    let r: reader.Reader = reader.Reader(f)
+    let r: reader.Reader = new reader.Reader(f)
     var n: int = 0
     var stop: bool = false
     for !stop {
@@ -27,7 +27,7 @@ fn main() {
     io.println("lines: {n}")
 
     // a second reader starts from the top, and the cursor never moved
-    let again: reader.Reader = reader.Reader(f)
+    let again: reader.Reader = new reader.Reader(f)
     io.println(again.read_line().expect("first again").or("?"))
     io.println("{f.tell()}")
     f.close().expect("close")
@@ -42,7 +42,7 @@ fn main() {
     }
     fs.write(p, big).expect("big")
     let fb: File = File.open(p, "r").expect("open big")
-    let rb: reader.Reader = reader.Reader(fb)
+    let rb: reader.Reader = new reader.Reader(fb)
     io.println(rb.read_line().expect("big first").or("?"))
     fb.close().expect("close big")
     var served: int = 0
@@ -62,7 +62,7 @@ fn main() {
     // empty file: none straight away
     fs.write(p, "").expect("empty")
     let fe: File = File.open(p, "r").expect("open empty")
-    match reader.Reader(fe).read_line().expect("eof") {
+    match new reader.Reader(fe).read_line().expect("eof") {
         some(x) => io.println("line in empty?"),
         none => io.println("empty: none"),
     }

@@ -62,7 +62,7 @@ grep -q "RawPtr.free requires unsafe" "$tmp/bad"
 grep -q "Simd4f32.sum requires unsafe" "$tmp/bad"
 grep -q "Simd4f32 arithmetic requires unsafe" "$tmp/bad"
 grep -q "Simd4f32.splat requires unsafe" "$tmp/bad"
-grep -q "RawPtr only supports inline scalars, RawPtr, fixed arrays, and @c_layout struct/union values" "$tmp/bad"
+grep -q 'RawPtr only supports inline scalars, RawPtr, fixed arrays, and extern "C" struct/union values' "$tmp/bad"
 grep -q "load volatile i1" build/unsafe_raw.ll
 grep -q "store volatile i1" build/unsafe_raw.ll
 grep -q "load atomic i64" build/unsafe_raw.ll
@@ -82,11 +82,11 @@ if ./build/beansc check test/cases/ffi_bad.b >"$tmp/ffi.bad" 2>&1; then
     exit 1
 fi
 grep -q "extern C call 'llabs' requires unsafe" "$tmp/ffi.bad"
-grep -q "extern parameter needs an integer, float, bool, RawPtr, @c_layout struct/union, or C callback" "$tmp/ffi.bad"
-grep -q "extern return needs an integer, float, bool, RawPtr, @c_layout struct/union, or no value" "$tmp/ffi.bad"
+grep -q 'extern parameter needs an integer, float, bool, RawPtr, extern "C" struct/union, or C callback' "$tmp/ffi.bad"
+grep -q 'extern return needs an integer, float, bool, RawPtr, extern "C" struct/union, or no value' "$tmp/ffi.bad"
 grep -q "got Plain" "$tmp/ffi.bad"
 grep -Fq "got fn(string) -> i32" "$tmp/ffi.bad"
-grep -q "extern parameters cannot use take or inout" "$tmp/ffi.bad"
+grep -q "extern parameters cannot use move or inout" "$tmp/ffi.bad"
 grep -q "extern functions cannot be generic" "$tmp/ffi.bad"
 grep -q "extern function cannot use the reserved name 'main'" "$tmp/ffi.bad"
 grep -q "cannot be stored as a Beans function value yet" "$tmp/ffi.bad"

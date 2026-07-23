@@ -22,7 +22,7 @@ if ./build/beansc check test/cases/c_layout_attribute_bad.b >"$tmp/attribute" 2>
     echo "c_layout_attribute_bad.b unexpectedly passed" >&2
     exit 1
 fi
-grep -q '@c_layout applies to structs/unions, not classes' "$tmp/attribute"
+grep -q '@c_layout was removed' "$tmp/attribute"
 if ./build/beansc check test/cases/c_layout_struct_bad.b >"$tmp/bad" 2>&1; then
     echo "c_layout_struct_bad.b unexpectedly passed" >&2
     exit 1
@@ -34,6 +34,6 @@ grep -q 'generic structs are not available yet' "$tmp/bad"
 grep -q 'structs cannot inherit' "$tmp/bad"
 grep -q 'struct methods are not available yet' "$tmp/bad"
 grep -q "is a let — its fields can't be reassigned" "$tmp/bad"
-grep -q 'RawPtr only supports inline scalars, RawPtr, fixed arrays, and @c_layout struct/union values' "$tmp/bad"
+grep -q 'RawPtr only supports inline scalars, RawPtr, fixed arrays, and extern "C" struct/union values' "$tmp/bad"
 
 echo "ok inline struct copies, target layout, raw memory, slices, and native ABI"
