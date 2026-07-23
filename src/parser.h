@@ -35,6 +35,19 @@ private:
     bool check(TokenKind k) const { return cur().kind == k; }
     bool at_eof() const { return check(TokenKind::eof); }
     const Token& advance();
+
+    // stamp a node's end_line/end_col to just past the last consumed real
+    // token (skipping trailing inserted newlines). Works for any node with
+    // end_line/end_col fields.
+    template <class N>
+    void stamp_end(N& node) const {
+        size_t i = pos_;
+        while (i > 0 && tokens_[i - 1].kind == TokenKind::newline) i--;
+        const Token& t = tokens_[i > 0 ? i - 1 : 0];
+        node.end_line = t.line;
+        node.end_col = t.col + static_cast<uint32_t>(t.text.size());
+    }
+
     bool accept(TokenKind k);
     bool expect(TokenKind k, const char* what);
     void skip_newlines();

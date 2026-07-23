@@ -290,6 +290,8 @@ ClassDecl Parser::parse_class(bool is_pub, bool is_interface, bool is_move_only,
     c.col = kw.col;
 
     if (check(TokenKind::ident)) {
+        c.name_line = cur().line;
+        c.name_col = cur().col;
         c.name = std::string(cur().text);
         advance();
     } else {
@@ -365,12 +367,15 @@ ClassDecl Parser::parse_class(bool is_pub, bool is_interface, bool is_move_only,
             f.is_pub = member_pub;
             f.line = cur().line;
             f.col = cur().col;
+            f.name_line = cur().line;
+            f.name_col = cur().col;
             f.name = std::string(cur().text);
             advance();
             expect(TokenKind::colon, "':' after field name");
             f.type = parse_type();
             if (accept(TokenKind::assign)) f.def = parse_expr();
             end_stmt();
+            stamp_end(f);
             c.fields.push_back(std::move(f));
         } else {
             error_at(cur(), "expected field or method");
@@ -379,6 +384,7 @@ ClassDecl Parser::parse_class(bool is_pub, bool is_interface, bool is_move_only,
         skip_newlines();
     }
     expect(TokenKind::rbrace, "'}'");
+    stamp_end(c);
     return c;
 }
 
@@ -390,6 +396,8 @@ EnumDecl Parser::parse_enum(bool is_pub) {
     e.col = kw.col;
 
     if (check(TokenKind::ident)) {
+        e.name_line = cur().line;
+        e.name_col = cur().col;
         e.name = std::string(cur().text);
         advance();
     } else {
@@ -409,6 +417,8 @@ EnumDecl Parser::parse_enum(bool is_pub) {
         } else if (check(TokenKind::ident)) {
             EnumVariant v;
             v.doc = mdoc;
+            v.line = cur().line;
+            v.col = cur().col;
             v.name = std::string(cur().text);
             advance();
             if (accept(TokenKind::lparen)) {
@@ -434,6 +444,7 @@ EnumDecl Parser::parse_enum(bool is_pub) {
                 }
                 expect(TokenKind::rparen, "')'");
             }
+            stamp_end(v);
             accept(TokenKind::comma);
             e.variants.push_back(std::move(v));
         } else {
@@ -443,6 +454,7 @@ EnumDecl Parser::parse_enum(bool is_pub) {
         skip_newlines();
     }
     expect(TokenKind::rbrace, "'}'");
+    stamp_end(e);
     return e;
 }
 
@@ -458,6 +470,8 @@ FnDecl Parser::parse_fn(bool is_pub, bool is_override, bool allow_no_body,
     f.col = kw.col;
 
     if (check(TokenKind::ident)) {
+        f.name_line = cur().line;
+        f.name_col = cur().col;
         f.name = std::string(cur().text);
         advance();
     } else if (check(TokenKind::kw_new)) {
@@ -485,6 +499,7 @@ FnDecl Parser::parse_fn(bool is_pub, bool is_override, bool allow_no_body,
     } else {
         error_at(cur(), "expected '{' to start function body");
     }
+    stamp_end(f);
     return f;
 }
 
@@ -590,6 +605,7 @@ TypePtr Parser::parse_type() {
             advance();
         }
         expect(TokenKind::rbracket, "']' in fixed array type");
+        stamp_end(*t);
         return t;
     }
 
@@ -603,6 +619,7 @@ TypePtr Parser::parse_type() {
         }
         expect(TokenKind::rparen, "')'");
         if (accept(TokenKind::arrow)) t->fn_ret = parse_type();
+        stamp_end(*t);
         return t;
     }
 
@@ -628,6 +645,7 @@ TypePtr Parser::parse_type() {
         } while (accept(TokenKind::comma));
         expect_close_angle();
     }
+    stamp_end(*t);
     return t;
 }
 
@@ -640,7 +658,7 @@ std::vector<StmtPtr> Parser::parse_block() {
     while (!check(TokenKind::rbrace) && !at_eof()) {
         size_t before = errors_.size();
         StmtPtr s = parse_stmt();
-        if (s) out.push_back(std::move(s));
+        if (s) { stamp_end(*s); out.push_back(std::move(s)); }
         if (errors_.size() > before) sync_stmt();
         skip_newlines();
     }
@@ -738,6 +756,7 @@ StmtPtr Parser::parse_if_stmt() {
             s->else_body = parse_block();
         }
     }
+    stamp_end(*s);
     return s;
 }
 
@@ -785,6 +804,7 @@ ExprPtr Parser::parse_expr() {
         advance();
         e->lhs = std::move(lhs);
         e->rhs = parse_or();
+        stamp_end(*e);
         return e;
     }
     return lhs;
@@ -800,6 +820,7 @@ ExprPtr Parser::parse_expr() {
             advance();                                                 \
             e->lhs = std::move(lhs);                                   \
             e->rhs = sub();                                            \
+            stamp_end(*e);                                             \
             lhs = std::move(e);                                        \
         }                                                              \
         return lhs;                                                    \
@@ -833,6 +854,7 @@ ExprPtr Parser::parse_cast() {
         c->checked = accept(TokenKind::question);
         c->object = std::move(e);
         c->type = parse_type();
+        stamp_end(*c);
         e = std::move(c);
     }
     return e;
@@ -851,6 +873,7 @@ ExprPtr Parser::parse_unary() {
         }
         advance();
         e->rhs = parse_unary();
+        stamp_end(*e);
         return e;
     }
     return parse_postfix();
@@ -858,6 +881,7 @@ ExprPtr Parser::parse_unary() {
 
 ExprPtr Parser::parse_postfix() {
     ExprPtr e = parse_primary();
+    stamp_end(*e);
     while (true) {
         if (check(TokenKind::dot)) {
             auto f = new_expr(Expr::Kind::field, cur());
@@ -872,12 +896,14 @@ ExprPtr Parser::parse_postfix() {
             } else {
                 error_at(cur(), "expected name after '.'");
             }
+            stamp_end(*f); // ends just past the member name
             f->object = std::move(e);
             e = std::move(f);
         } else if (check(TokenKind::lparen)) {
             auto c = new_expr(Expr::Kind::call, cur());
             advance();
             c->args = parse_call_args();
+            stamp_end(*c);
             c->callee = std::move(e);
             e = std::move(c);
         } else if (check(TokenKind::lbracket)) {
@@ -885,11 +911,13 @@ ExprPtr Parser::parse_postfix() {
             advance();
             i->index_expr = parse_expr();
             expect(TokenKind::rbracket, "']'");
+            stamp_end(*i);
             i->object = std::move(e);
             e = std::move(i);
         } else if (check(TokenKind::question)) {
             auto t = new_expr(Expr::Kind::try_, cur());
             advance();
+            stamp_end(*t);
             t->object = std::move(e);
             e = std::move(t);
         } else {

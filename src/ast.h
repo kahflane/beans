@@ -26,6 +26,7 @@ struct TypeRef {
     enum class Kind { named, fn, fixed_array };
     Kind kind = Kind::named;
     uint32_t line = 0, col = 0;
+    uint32_t end_line = 0, end_col = 0; // 1-past-last token; 0 = unset
 
     // named: Name, pkg.Name, or Name<args>
     std::string name;
@@ -113,6 +114,7 @@ struct Expr {
     };
     Kind kind;
     uint32_t line = 0, col = 0;
+    uint32_t end_line = 0, end_col = 0; // 1-past-last token; 0 = unset
 
     std::string_view text; // literal text / ident name
     bool bool_val = false;
@@ -176,6 +178,7 @@ struct Stmt {
     };
     Kind kind;
     uint32_t line = 0, col = 0;
+    uint32_t end_line = 0, end_col = 0; // 1-past-last token; 0 = unset
 
     bool is_var = false;
     std::string name;
@@ -215,7 +218,9 @@ struct FnDecl {
     std::vector<Param> params; // not counting self
     TypePtr ret;               // null = no return value
     std::vector<StmtPtr> body;
-    uint32_t line = 0, col = 0;
+    uint32_t line = 0, col = 0;             // the leading keyword/modifier
+    uint32_t name_line = 0, name_col = 0;   // the declared name token
+    uint32_t end_line = 0, end_col = 0;     // 1-past-last token
 };
 
 struct FieldDecl {
@@ -224,7 +229,9 @@ struct FieldDecl {
     std::string name;
     TypePtr type;
     ExprPtr def; // default value, may be null
-    uint32_t line = 0, col = 0;
+    uint32_t line = 0, col = 0;             // the name token (fields lead with it)
+    uint32_t name_line = 0, name_col = 0;   // the declared name token
+    uint32_t end_line = 0, end_col = 0;     // 1-past-last token
 };
 
 struct ClassDecl { // also interfaces (is_interface)
@@ -244,13 +251,17 @@ struct ClassDecl { // also interfaces (is_interface)
     mutable std::vector<std::string> interfaces_resolved;
     std::vector<FieldDecl> fields;
     std::vector<FnDecl> methods;
-    uint32_t line = 0, col = 0;
+    uint32_t line = 0, col = 0;             // the leading keyword/modifier
+    uint32_t name_line = 0, name_col = 0;   // the declared name token
+    uint32_t end_line = 0, end_col = 0;     // 1-past-last token
 };
 
 struct EnumVariant {
     std::string doc; // leading `///` doc block, empty if none
     std::string name;
     std::vector<Param> payload;
+    uint32_t line = 0, col = 0;             // the variant name token
+    uint32_t end_line = 0, end_col = 0;     // 1-past-last token
 };
 
 struct EnumDecl {
@@ -261,7 +272,9 @@ struct EnumDecl {
     std::vector<GenericParam> generics;
     std::vector<EnumVariant> variants;
     std::vector<FnDecl> methods;
-    uint32_t line = 0, col = 0;
+    uint32_t line = 0, col = 0;             // the leading keyword/modifier
+    uint32_t name_line = 0, name_col = 0;   // the declared name token
+    uint32_t end_line = 0, end_col = 0;     // 1-past-last token
 };
 
 struct ImportDecl {
