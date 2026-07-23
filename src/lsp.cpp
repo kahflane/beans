@@ -228,6 +228,26 @@ std::string bt_ret(BT ret) {
     return " -> " + bt_name(ret);
 }
 
+// Methods on the scalar types (int/float/decimal). These live inline in the
+// checker rather than the builtin registry, so this mirrors that set — keep it
+// in sync with the numeric branches of Checker::member_of.
+struct ScalarMethod {
+    const char* type;
+    const char* name;
+    const char* sig;
+    const char* doc;
+};
+const std::vector<ScalarMethod>& scalar_methods() {
+    static const std::vector<ScalarMethod> t = {
+        {"int", "abs", "fn abs() -> int", "Absolute value."},
+        {"float", "abs", "fn abs() -> float", "Absolute value."},
+        {"float", "round", "fn round() -> int", "Nearest integer (rounds half away from zero)."},
+        {"decimal", "abs", "fn abs() -> decimal", "Absolute value."},
+        {"decimal", "round", "fn round(places: int) -> decimal", "Rounded to `places` decimal places."},
+    };
+    return t;
+}
+
 // ---- the assembled hover --------------------------------------------------
 
 struct Found {
@@ -625,7 +645,7 @@ bool match_builtin(const std::string& word, Found& out) {
             out = {true, "builtin function",
                    "fn " + std::string(b.module) + "." + b.name +
                        bt_params(b.params) + bt_ret(b.ret),
-                   "", "builtin", false};
+                   b.doc ? b.doc : "", "builtin", false};
             return true;
         }
     for (const BuiltinMethod& b : builtin_methods())
@@ -633,7 +653,7 @@ bool match_builtin(const std::string& word, Found& out) {
             out = {true, "builtin method",
                    "fn " + bt_name(b.recv) + "." + b.name + bt_params(b.params) +
                        bt_ret(b.ret),
-                   "", "builtin", false};
+                   b.doc ? b.doc : "", "builtin", false};
             return true;
         }
     for (const BuiltinStatic& b : builtin_statics())
@@ -641,7 +661,7 @@ bool match_builtin(const std::string& word, Found& out) {
             out = {true, "builtin static",
                    "static fn " + std::string(b.cls) + "." + b.name +
                        bt_params(b.params) + bt_ret(b.ret),
-                   "", "builtin", false};
+                   b.doc ? b.doc : "", "builtin", false};
             return true;
         }
     return false;
@@ -799,13 +819,21 @@ bool find_member_of(const Program& prog, const std::string& type_name,
                     }
             }
         }
+    // scalar (int/float/decimal) methods
+    for (const ScalarMethod& s : scalar_methods())
+        if (member == s.name && type_name == s.type) {
+            // s.sig begins with "fn "; splice the type in after it
+            out = {true, "method", "fn " + type_name + "." + std::string(s.sig + 3),
+                   s.doc, "builtin", false};
+            return true;
+        }
     // builtin type (string/Bytes/...) methods
     for (const BuiltinMethod& b : builtin_methods())
         if (member == b.name && bt_name(b.recv) == type_name) {
             out = {true, "builtin method",
                    "fn " + bt_name(b.recv) + "." + b.name + bt_params(b.params) +
                        bt_ret(b.ret),
-                   "", "builtin", false};
+                   b.doc ? b.doc : "", "builtin", false};
             return true;
         }
     return false;
@@ -979,12 +1007,15 @@ void collect_members(const Program& prog, const std::string& type_name,
                 return;
             }
         }
+    for (const ScalarMethod& s : scalar_methods())
+        if (type_name == s.type && seen.insert(s.name).second)
+            out.push_back({s.name, "method", s.sig, s.doc, "builtin"});
     for (const BuiltinMethod& b : builtin_methods())
         if (bt_name(b.recv) == type_name && seen.insert(b.name).second)
             out.push_back({std::string(b.name), "method",
                            "fn " + std::string(b.name) + bt_params(b.params) +
                                bt_ret(b.ret),
-                           "", "builtin"});
+                           b.doc ? b.doc : "", "builtin"});
 }
 
 void collect_locals(const std::vector<StmtPtr>& body, std::vector<ScopeName>& out) {

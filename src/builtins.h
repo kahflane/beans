@@ -46,6 +46,7 @@ struct BuiltinMethod {
     // the interp side throws BeansPanic with the same message
     bool panics;
     Value (*run)(uint32_t line, uint32_t col, Value& recv, std::vector<Value>& args);
+    const char* doc = nullptr; // one-line hover doc; null = undocumented
 };
 
 struct BuiltinStatic {
@@ -56,6 +57,7 @@ struct BuiltinStatic {
     const char* sym;
     bool panics;
     Value (*run)(uint32_t line, uint32_t col, std::vector<Value>& args);
+    const char* doc = nullptr;
 };
 
 struct BuiltinConstructor {
@@ -65,6 +67,7 @@ struct BuiltinConstructor {
     const char* sym;
     bool panics;
     Value (*run)(uint32_t line, uint32_t col, std::vector<Value>& args);
+    const char* doc = nullptr;
 };
 
 // module-level std functions ("std.os" and friends); println/eprintln stay
@@ -77,6 +80,7 @@ struct BuiltinFn {
     const char* sym;
     bool panics;
     Value (*run)(uint32_t line, uint32_t col, std::vector<Value>& args);
+    const char* doc = nullptr;
 };
 
 const std::vector<BuiltinMethod>& builtin_methods();
